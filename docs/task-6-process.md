@@ -10,12 +10,13 @@ or MCP server.
 
 On `SIGTERM`, the command entrypoint will call `Service.Shutdown` with
 `AGENT_PLATFORM_SHUTDOWN_GRACE`. The service first fails readiness and rejects
-new command admission. Admission and the initial PostgreSQL owner claim share
-the drain lock: a command accepted before the boundary has already been claimed;
-a command after it is rejected without a journal write. The service lets owned
-work finish until the grace deadline, then cancels local work and closes
-long-lived HTTP streams. It does not take over, replay, or hand off interrupted
-runs. Lease expiry remains the existing journal reaper's interruption-only path.
+new command admission. The admission gate is brief: an operation registered
+before the boundary remains counted through its PostgreSQL admission and initial
+claim, while a later command is rejected without a journal write. At the grace
+deadline that in-flight database context is canceled along with owned work. A
+transaction either rolls back or leaves a durable run for the existing
+interruption-only lease reaper; it is never handed off or replayed. The service
+then closes long-lived HTTP streams.
 
 ## Nonsecret ConfigMap
 

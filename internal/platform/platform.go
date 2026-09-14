@@ -86,20 +86,20 @@ func New(runner *agentruntime.Runner, store *journal.Store) *Platform {
 	return p
 }
 
-// Close stops local work. Lease expiry records interruption without transferring
-// execution or claiming that an already dispatched remote call was canceled.
+// Close stops local work without waiting on a blocked database admission.
+// Lease expiry records interruption without transferring execution or claiming
+// that an already dispatched remote call was canceled.
 func (p *Platform) Close() {
 	p.BeginDrain()
 	p.mu.Lock()
 	p.closed = true
 	p.cancel()
 	p.mu.Unlock()
-	p.runs.Wait()
-	p.background.Wait()
 }
 
-// BeginDrain serializes the boundary with admission and initial claiming.
-// Work accepted before this returns is owned; later work is not persisted.
+// BeginDrain closes the admission gate. It does not wait for an already
+// registered database operation: Drain owns the grace-period cancellation for
+// that operation, so a SIGTERM cannot be held behind a row lock.
 func (p *Platform) BeginDrain() {
 	p.mu.Lock()
 	p.draining = true
@@ -148,21 +148,23 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 		return Receipt{}, ErrDraining
 	}
 	p.runs.Add(1)
+	p.mu.Unlock()
 	transferred := false
 	defer func() {
 		if !transferred {
 			p.runs.Done()
 		}
 	}()
-	receipt, fresh, err := p.store.Admit(ctx, c.durable())
+	admissionCtx, cancelAdmission := context.WithCancel(ctx)
+	stopAdmission := context.AfterFunc(p.ctx, cancelAdmission)
+	defer func() { stopAdmission(); cancelAdmission() }()
+	receipt, fresh, err := p.store.Admit(admissionCtx, c.durable())
 	if err != nil {
-		p.mu.Unlock()
 		return Receipt{}, err
 	}
 	if !fresh && c.InteractionID != "" {
-		snapshot, snapshotErr := p.store.Snapshot(ctx, c.ThreadID, c.Principal)
+		snapshot, snapshotErr := p.store.Snapshot(admissionCtx, c.ThreadID, c.Principal)
 		if snapshotErr != nil {
-			p.mu.Unlock()
 			return Receipt{}, snapshotErr
 		}
 		for _, run := range snapshot.Runs {
@@ -174,9 +176,8 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 	if fresh {
 		target := c.TargetJourney
 		if c.InteractionID != "" {
-			snapshot, err := p.store.Snapshot(ctx, c.ThreadID, c.Principal)
+			snapshot, err := p.store.Snapshot(admissionCtx, c.ThreadID, c.Principal)
 			if err != nil {
-				p.mu.Unlock()
 				return Receipt{}, err
 			}
 			for _, run := range snapshot.Runs {
@@ -185,26 +186,22 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 				}
 			}
 		}
-		owner, err := p.store.Claim(ctx, c.durable(), p.ownerID, journal.LeaseDuration)
+		owner, err := p.store.Claim(admissionCtx, c.durable(), p.ownerID, journal.LeaseDuration)
 		if err != nil {
-			p.mu.Unlock()
 			return Receipt{}, err
 		}
 		headers := submission.Headers.Clone()
 		transferred = true
-		p.mu.Unlock()
 		go func() {
 			defer p.runs.Done()
 			// HTTP cancellation cannot revoke committed admission. Credentials remain in
 			// this worker only and are never part of the durable command or journal.
-			runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+			runCtx, cancel := context.WithCancel(context.WithoutCancel(admissionCtx))
 			defer cancel()
 			stop := context.AfterFunc(p.ctx, cancel)
 			defer stop()
 			p.execute(runCtx, owner, c, agentruntime.RunInput{ThreadID: c.ThreadID, RunID: c.RunID, Principal: c.Principal, Text: c.Text, TargetJourney: target, Headers: headers})
 		}()
-	} else {
-		p.mu.Unlock()
 	}
 	return receipt, nil
 }

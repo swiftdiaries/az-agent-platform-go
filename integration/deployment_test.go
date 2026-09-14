@@ -150,3 +150,126 @@ func TestServiceDrainRejectsNewAdmissionAndInterruptsExpiredOwner(t *testing.T) 
 		t.Fatalf("forced drain state = %q, %v", state, err)
 	}
 }
+
+func TestServiceShutdownBoundsBlockedAdmissionAndClaim(t *testing.T) {
+	for _, barrier := range []struct {
+		name    string
+		trigger string
+	}{
+		{"admission", "BEFORE INSERT ON agent_commands"},
+		{"claim", "BEFORE UPDATE ON agent_runs FOR EACH ROW WHEN (NEW.state = 'running')"},
+	} {
+		t.Run(barrier.name, func(t *testing.T) {
+			pool := database(t)
+			root := t.TempDir()
+			registry, err := definitions.Load(writeDefinitionBundle(t, root, "prompt\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			app, err := service.New(service.Dependencies{
+				Pool: pool, Registry: registry, Authenticator: chat.StaticBearerTokens{"token": "alice"},
+				Model: modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+					return agentruntime.ModelResponse{}, nil
+				}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			serveErr := make(chan error, 1)
+			go func() { serveErr <- app.Serve(listener) }()
+			defer func() {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				_ = app.Shutdown(shutdownCtx)
+				<-serveErr
+				app.Close()
+			}()
+
+			gate, err := pool.Acquire(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer gate.Release()
+			if _, err := gate.Exec(t.Context(), "SELECT pg_advisory_lock(784321)"); err != nil {
+				t.Fatal(err)
+			}
+			defer gate.Exec(t.Context(), "SELECT pg_advisory_unlock(784321)")
+			if _, err := pool.Exec(t.Context(), `CREATE FUNCTION deployment_shutdown_barrier() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(784321); RETURN NEW; END $$;`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(t.Context(), "CREATE TRIGGER deployment_shutdown_barrier "+barrier.trigger+" EXECUTE FUNCTION deployment_shutdown_barrier()"); err != nil {
+				t.Fatal(err)
+			}
+
+			body, _ := json.Marshal(aguitypes.RunAgentInput{ThreadID: "thread", RunID: barrier.name, Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan"}}})
+			request, _ := http.NewRequest(http.MethodPost, "http://"+listener.Addr().String()+"/agent", bytes.NewReader(body))
+			request.Header.Set("Authorization", "Bearer token")
+			postDone := make(chan error, 1)
+			go func() {
+				response, err := http.DefaultClient.Do(request)
+				if response != nil {
+					response.Body.Close()
+				}
+				postDone <- err
+			}()
+			waitDatabase(t, pool, "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted)")
+
+			beginDone := make(chan struct{})
+			go func() { app.BeginDrain(); close(beginDone) }()
+			select {
+			case <-beginDone:
+			case <-time.After(250 * time.Millisecond):
+				if _, err := gate.Exec(t.Context(), "SELECT pg_advisory_unlock(784321)"); err != nil {
+					t.Fatal(err)
+				}
+				<-beginDone
+				t.Fatal("drain transition waited for blocked submission")
+			}
+			ready := httptest.NewRecorder()
+			app.Handler().ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+			if ready.Code != http.StatusServiceUnavailable {
+				t.Fatalf("readiness after drain = %d", ready.Code)
+			}
+
+			graceCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			shutdownDone := make(chan error, 1)
+			go func() { shutdownDone <- app.Shutdown(graceCtx) }()
+			select {
+			case err := <-shutdownDone:
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("shutdown error = %v", err)
+				}
+			case <-time.After(250 * time.Millisecond):
+				if _, err := gate.Exec(t.Context(), "SELECT pg_advisory_unlock(784321)"); err != nil {
+					t.Fatal(err)
+				}
+				<-shutdownDone
+				t.Fatal("shutdown exceeded grace while submission was blocked")
+			}
+			if _, err := gate.Exec(t.Context(), "SELECT pg_advisory_unlock(784321)"); err != nil {
+				t.Fatal(err)
+			}
+			<-postDone
+
+			if _, err := pool.Exec(t.Context(), "UPDATE agent_runs SET lease_until=clock_timestamp()-interval '1 second' WHERE state IN ('pending','running')"); err != nil {
+				t.Fatal(err)
+			}
+			if err := journal.New(pool).Reap(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			var live int
+			if err := pool.QueryRow(t.Context(), "SELECT count(*) FROM agent_runs WHERE state IN ('pending','running')").Scan(&live); err != nil || live != 0 {
+				t.Fatalf("live run after forced drain = %d, %v", live, err)
+			}
+			var nonInterrupted int
+			if err := pool.QueryRow(t.Context(), "SELECT count(*) FROM agent_runs WHERE state <> 'interrupted'").Scan(&nonInterrupted); err != nil || nonInterrupted != 0 {
+				t.Fatalf("blocked receipt disposition = %d non-interrupted runs, %v", nonInterrupted, err)
+			}
+		})
+	}
+}
