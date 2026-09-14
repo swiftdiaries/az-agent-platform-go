@@ -1,0 +1,27 @@
+package maf_hitl
+
+import (
+	"context"
+	"errors"
+
+	"github.com/microsoft/agent-framework-go/tool"
+)
+
+var ErrOutcomeUnknown = errors.New("effectful tool outcome unknown; continuation blocked")
+
+// ClassifyEffectful conservatively maps any Go error from an outward
+// effectful tool to outcome_unknown. MCP business-error payloads are successful
+// transport responses and do not pass through this error branch.
+func ClassifyEffectful(fn tool.FuncTool) tool.FuncTool { return classifiedFunc{FuncTool: fn} }
+
+type classifiedFunc struct {
+	tool.FuncTool
+}
+
+func (g classifiedFunc) Call(ctx context.Context, args string) (any, error) {
+	result, err := g.FuncTool.Call(ctx, args)
+	if err != nil {
+		return nil, errors.Join(ErrOutcomeUnknown, err)
+	}
+	return result, nil
+}

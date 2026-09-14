@@ -1,0 +1,174 @@
+package maf_hitl
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+var (
+	ErrAlreadyConsumed = errors.New("pending interaction already consumed")
+	ErrWrongPrincipal  = errors.New("pending interaction belongs to another principal")
+	ErrWrongKind       = errors.New("pending interaction has a different kind")
+)
+
+type Pending struct {
+	ThreadID   string          `json:"thread_id"`
+	Kind       string          `json:"kind"`
+	RequestID  string          `json:"request_id"`
+	CallID     string          `json:"call_id,omitempty"`
+	ToolName   string          `json:"tool_name,omitempty"`
+	Arguments  json.RawMessage `json:"arguments,omitempty"`
+	Principal  string          `json:"principal"`
+	Question   string          `json:"question,omitempty"`
+	Options    []string        `json:"options,omitempty"`
+	Session    json.RawMessage `json:"session"`
+	ClaimedBy  string          `json:"claimed_by,omitempty"`
+	ConsumedAt *time.Time      `json:"consumed_at,omitempty"`
+}
+
+type Store struct{ db *sql.DB }
+
+func OpenStore(ctx context.Context, databaseURL string) (*Store, error) {
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Store{db: db}, nil
+}
+
+func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) Ensure(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS maf_hitl_spike_pending (
+                thread_id text PRIMARY KEY,
+                kind text NOT NULL,
+                request_id text NOT NULL,
+                call_id text NOT NULL DEFAULT '',
+                tool_name text NOT NULL DEFAULT '',
+                arguments jsonb,
+                principal text NOT NULL,
+                question text NOT NULL DEFAULT '',
+                options jsonb NOT NULL DEFAULT '[]'::jsonb,
+                session_json jsonb NOT NULL,
+                claimed_by text,
+                consumed_at timestamptz
+        )`)
+	return err
+}
+
+func (s *Store) Reset(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `TRUNCATE maf_hitl_spike_pending`)
+	return err
+}
+
+func (s *Store) Put(ctx context.Context, p Pending) error {
+	options, err := json.Marshal(p.Options)
+	if err != nil {
+		return err
+	}
+	var args any
+	if len(p.Arguments) > 0 {
+		args = []byte(p.Arguments)
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO maf_hitl_spike_pending
+                (thread_id, kind, request_id, call_id, tool_name, arguments, principal, question, options, session_json)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		p.ThreadID, p.Kind, p.RequestID, p.CallID, p.ToolName, args, p.Principal, p.Question, options, []byte(p.Session))
+	return err
+}
+
+// Claim is the adapter's only resume admission point. The conditional UPDATE
+// makes duplicate concurrent replies visible without relying on process memory.
+func (s *Store) Claim(ctx context.Context, threadID, requestID, principal, kind, claimant string) (Pending, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return Pending{}, err
+	}
+	defer tx.Rollback()
+	var p Pending
+	var args, options, session []byte
+	var claimedBy sql.NullString
+	var consumedAt sql.NullTime
+	err = tx.QueryRowContext(ctx, `SELECT thread_id, kind, request_id, call_id, tool_name,
+                COALESCE(arguments, '{}'::jsonb), principal, question, options, session_json, claimed_by, consumed_at
+                FROM maf_hitl_spike_pending WHERE thread_id=$1 AND request_id=$2 FOR UPDATE`, threadID, requestID).
+		Scan(&p.ThreadID, &p.Kind, &p.RequestID, &p.CallID, &p.ToolName, &args, &p.Principal, &p.Question, &options, &session, &claimedBy, &consumedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Pending{}, ErrAlreadyConsumed
+	}
+	if err != nil {
+		return Pending{}, err
+	}
+	if p.Principal != principal {
+		return Pending{}, ErrWrongPrincipal
+	}
+	if p.Kind != kind {
+		return Pending{}, ErrWrongKind
+	}
+	if consumedAt.Valid {
+		return Pending{}, ErrAlreadyConsumed
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE maf_hitl_spike_pending SET claimed_by=$1, consumed_at=clock_timestamp()
+		WHERE thread_id=$2 AND request_id=$3 AND consumed_at IS NULL`, claimant, threadID, requestID)
+	if err != nil {
+		return Pending{}, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return Pending{}, err
+	}
+	if rows != 1 {
+		return Pending{}, ErrAlreadyConsumed
+	}
+	p.Arguments = append(p.Arguments[:0], args...)
+	p.Session = append(p.Session[:0], session...)
+	if claimedBy.Valid {
+		p.ClaimedBy = claimedBy.String
+	}
+	if consumedAt.Valid {
+		p.ConsumedAt = &consumedAt.Time
+	}
+	if err := json.Unmarshal(options, &p.Options); err != nil {
+		return Pending{}, fmt.Errorf("decode options: %w", err)
+	}
+	p.ClaimedBy = claimant
+	if err := tx.Commit(); err != nil {
+		return Pending{}, err
+	}
+	return p, nil
+}
+
+func (s *Store) Get(ctx context.Context, threadID string) (Pending, error) {
+	var p Pending
+	var args, options, session []byte
+	var claimedBy sql.NullString
+	var consumedAt sql.NullTime
+	err := s.db.QueryRowContext(ctx, `SELECT thread_id, kind, request_id, call_id, tool_name,
+                COALESCE(arguments, '{}'::jsonb), principal, question, options, session_json, claimed_by, consumed_at
+                FROM maf_hitl_spike_pending WHERE thread_id=$1`, threadID).
+		Scan(&p.ThreadID, &p.Kind, &p.RequestID, &p.CallID, &p.ToolName, &args, &p.Principal, &p.Question, &options, &session, &claimedBy, &consumedAt)
+	if err != nil {
+		return Pending{}, err
+	}
+	p.Arguments, p.Session = args, session
+	if claimedBy.Valid {
+		p.ClaimedBy = claimedBy.String
+	}
+	if consumedAt.Valid {
+		p.ConsumedAt = &consumedAt.Time
+	}
+	if err := json.Unmarshal(options, &p.Options); err != nil {
+		return Pending{}, err
+	}
+	return p, nil
+}

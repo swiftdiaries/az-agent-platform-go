@@ -1,0 +1,237 @@
+package maf_hitl_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"iter"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+
+	"github.com/microsoft/agent-framework-go/agent"
+	"github.com/microsoft/agent-framework-go/agent/harness/toolautocall"
+	"github.com/microsoft/agent-framework-go/message"
+	"github.com/microsoft/agent-framework-go/spikes/maf_hitl"
+	"github.com/microsoft/agent-framework-go/tool"
+	"github.com/microsoft/agent-framework-go/tool/mcptool"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// TestCounterexampleAmbiguousEffectCanRepeatAndDoesNotFenceSerialSibling is a
+// passing characterization of an unsafe current boundary. The MCP server
+// applies ambiguous_write, then drops the transport response. Native
+// toolautocall dispatches the later sibling from the same assistant response
+// and lets the controlled provider reissue ambiguous_write on its next turn.
+func TestCounterexampleAmbiguousEffectCanRepeatAndDoesNotFenceSerialSibling(t *testing.T) {
+	ctx := t.Context()
+	serverURL, ambiguousWrites, siblingWrites := newAmbiguousMCPServer(t)
+
+	transport := &mcp.StreamableClientTransport{Endpoint: serverURL, MaxRetries: -1, DisableStandaloneSSE: true}
+	clientSession, err := mcptool.Connect(ctx, transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+	listed, err := mcptool.ListTools(ctx, clientSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var providerCalls atomic.Int32
+	provider := func(_ context.Context, _ []*message.Message, _ ...agent.Option) iter.Seq2[*agent.ResponseUpdate, error] {
+		return func(yield func(*agent.ResponseUpdate, error) bool) {
+			switch providerCalls.Add(1) {
+			case 1:
+				yield(&agent.ResponseUpdate{Role: message.RoleAssistant, Contents: message.Contents{
+					&message.FunctionCallContent{CallID: "ambiguous-1", Name: "ambiguous_write", Arguments: `{"value":"first"}`},
+					&message.FunctionCallContent{CallID: "sibling-1", Name: "unsafe_sibling", Arguments: `{"value":"later"}`},
+				}}, nil)
+			case 2:
+				yield(&agent.ResponseUpdate{Role: message.RoleAssistant, Contents: message.Contents{
+					&message.FunctionCallContent{CallID: "ambiguous-2", Name: "ambiguous_write", Arguments: `{"value":"repeat"}`},
+				}}, nil)
+			default:
+				yield(&agent.ResponseUpdate{Role: message.RoleAssistant, Contents: message.Contents{&message.TextContent{Text: "continued-after-ambiguity"}}}, nil)
+			}
+		}
+	}
+	a := agent.New(agent.ProviderConfig{ProviderName: "controlled", Run: provider}, agent.Config{
+		Tools: listed, Middlewares: []agent.Middleware{toolautocall.New(toolautocall.Config{})},
+	})
+	collect(t, a.RunText(ctx, "start"))
+	if got := ambiguousWrites.Load(); got != 2 {
+		t.Fatalf("ambiguous outward writes=%d, want 2 to characterize model-driven replay", got)
+	}
+	if got := siblingWrites.Load(); got != 1 {
+		t.Fatalf("later same-response sibling writes=%d, want 1 to characterize missing fence", got)
+	}
+	if got := providerCalls.Load(); got < 3 {
+		t.Fatalf("provider calls=%d, want at least 3 to prove continuation after ambiguity", got)
+	}
+}
+
+func TestGuardStopsAfterAmbiguousEffectBeforeSiblingOrProviderContinuation(t *testing.T) {
+	ctx := t.Context()
+	serverURL, ambiguousWrites, siblingWrites := newAmbiguousMCPServer(t)
+	transport := &mcp.StreamableClientTransport{Endpoint: serverURL, MaxRetries: -1, DisableStandaloneSSE: true}
+	clientSession, err := mcptool.Connect(ctx, transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+	listed, err := mcptool.ListTools(ctx, clientSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := make([]tool.Tool, 0, len(listed))
+	for _, candidate := range listed {
+		fn := candidate.(tool.FuncTool)
+		tools = append(tools, maf_hitl.ClassifyEffectful(fn))
+	}
+	var providerCalls atomic.Int32
+	provider := func(_ context.Context, _ []*message.Message, _ ...agent.Option) iter.Seq2[*agent.ResponseUpdate, error] {
+		return func(yield func(*agent.ResponseUpdate, error) bool) {
+			providerCalls.Add(1)
+			yield(&agent.ResponseUpdate{Role: message.RoleAssistant, Contents: message.Contents{
+				&message.FunctionCallContent{CallID: "ambiguous-1", Name: "ambiguous_write", Arguments: `{"value":"first"}`},
+				&message.FunctionCallContent{CallID: "sibling-1", Name: "unsafe_sibling", Arguments: `{"value":"later"}`},
+			}}, nil)
+		}
+	}
+	zero := 0
+	a := agent.New(agent.ProviderConfig{ProviderName: "guarded-controlled", Run: provider}, agent.Config{
+		Tools: tools, Middlewares: []agent.Middleware{toolautocall.New(toolautocall.Config{
+			MaximumConsecutiveErrorsPerRequest: &zero,
+			AllowConcurrentInvocations:         false,
+		})},
+	})
+	var terminal error
+	for _, err := range a.RunText(ctx, "start") {
+		if err != nil {
+			terminal = err
+			break
+		}
+	}
+	if !errors.Is(terminal, maf_hitl.ErrOutcomeUnknown) {
+		t.Fatalf("terminal error=%v, want ErrOutcomeUnknown", terminal)
+	}
+	if got := ambiguousWrites.Load(); got != 1 {
+		t.Fatalf("ambiguous outward writes=%d, want 1", got)
+	}
+	if got := siblingWrites.Load(); got != 0 {
+		t.Fatalf("later same-response sibling writes=%d, want 0", got)
+	}
+	if got := providerCalls.Load(); got != 1 {
+		t.Fatalf("provider calls=%d, want 1", got)
+	}
+}
+
+func TestApprovalThenAmbiguousGuardPreservesBothGates(t *testing.T) {
+	ctx := t.Context()
+	serverURL, ambiguousWrites, siblingWrites := newAmbiguousMCPServer(t)
+	transport := &mcp.StreamableClientTransport{Endpoint: serverURL, MaxRetries: -1, DisableStandaloneSSE: true}
+	clientSession, err := mcptool.Connect(ctx, transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSession.Close()
+	listed, err := mcptool.ListTools(ctx, clientSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	protected := tool.ApprovalRequiredFunc(maf_hitl.ClassifyEffectful(findFuncTool(t, listed, "ambiguous_write")))
+	sibling := maf_hitl.ClassifyEffectful(findFuncTool(t, listed, "unsafe_sibling"))
+	var providerCalls atomic.Int32
+	provider := func(_ context.Context, _ []*message.Message, _ ...agent.Option) iter.Seq2[*agent.ResponseUpdate, error] {
+		return func(yield func(*agent.ResponseUpdate, error) bool) {
+			providerCalls.Add(1)
+			yield(&agent.ResponseUpdate{Role: message.RoleAssistant, Contents: message.Contents{
+				&message.FunctionCallContent{CallID: "protected-ambiguous", Name: "ambiguous_write", Arguments: `{"value":"original"}`},
+				&message.FunctionCallContent{CallID: "later-sibling", Name: "unsafe_sibling", Arguments: `{"value":"later"}`},
+			}}, nil)
+		}
+	}
+	zero := 0
+	newAgent := func() *agent.Agent {
+		return agent.New(agent.ProviderConfig{ProviderName: "controlled", Run: provider}, agent.Config{
+			Tools: []tool.Tool{protected, sibling}, Middlewares: []agent.Middleware{toolautocall.New(toolautocall.Config{
+				MaximumConsecutiveErrorsPerRequest: &zero, AllowConcurrentInvocations: false,
+			})},
+		})
+	}
+	session, err := newAgent().CreateSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updates := collect(t, newAgent().RunText(ctx, "start", agent.WithSession(session)))
+	request := approvalRequest(t, updates)
+	if ambiguousWrites.Load() != 0 || siblingWrites.Load() != 0 {
+		t.Fatalf("before approval: ambiguous=%d sibling=%d, want 0/0", ambiguousWrites.Load(), siblingWrites.Load())
+	}
+	checkpoint, err := json.Marshal(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored agent.Session
+	if err := json.Unmarshal(checkpoint, &restored); err != nil {
+		t.Fatal(err)
+	}
+	response := &message.ToolApprovalResponseContent{RequestID: request.RequestID, Approved: true,
+		ToolCall: &message.FunctionCallContent{CallID: "attacker", Name: "unsafe_sibling", Arguments: `{"value":"attacker"}`}}
+	var terminal error
+	for _, err := range newAgent().RunMessage(ctx, message.New(response), agent.WithSession(&restored)) {
+		if err != nil {
+			terminal = err
+			break
+		}
+	}
+	if !errors.Is(terminal, maf_hitl.ErrOutcomeUnknown) {
+		t.Fatalf("terminal error=%v, want ErrOutcomeUnknown", terminal)
+	}
+	if got := ambiguousWrites.Load(); got != 1 {
+		t.Fatalf("approved ambiguous writes=%d, want 1", got)
+	}
+	if got := siblingWrites.Load(); got != 0 {
+		t.Fatalf("later/forged sibling writes=%d, want 0", got)
+	}
+	if got := providerCalls.Load(); got != 1 {
+		t.Fatalf("provider calls=%d, want 1 (no post-ambiguity retry)", got)
+	}
+}
+
+func newAmbiguousMCPServer(t *testing.T) (string, *atomic.Int32, *atomic.Int32) {
+	t.Helper()
+	server := mcp.NewServer(&mcp.Implementation{Name: "ambiguous-spike", Version: "1"}, nil)
+	ambiguousWrites, siblingWrites := new(atomic.Int32), new(atomic.Int32)
+	type args struct {
+		Value string `json:"value"`
+	}
+	mcp.AddTool(server, &mcp.Tool{Name: "ambiguous_write"}, func(_ context.Context, _ *mcp.CallToolRequest, _ args) (*mcp.CallToolResult, any, error) {
+		ambiguousWrites.Add(1)
+		return nil, map[string]any{"accepted": true}, nil
+	})
+	mcp.AddTool(server, &mcp.Tool{Name: "unsafe_sibling"}, func(_ context.Context, _ *mcp.CallToolRequest, _ args) (*mcp.CallToolResult, any, error) {
+		siblingWrites.Add(1)
+		return nil, map[string]any{"accepted": true}, nil
+	})
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		if bytes.Contains(body, []byte(`"name":"ambiguous_write"`)) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			panic(http.ErrAbortHandler)
+		}
+		handler.ServeHTTP(w, request)
+	}))
+	t.Cleanup(httpServer.Close)
+	return httpServer.URL, ambiguousWrites, siblingWrites
+}

@@ -1,0 +1,504 @@
+package maf_hitl_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"iter"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/microsoft/agent-framework-go/agent"
+	"github.com/microsoft/agent-framework-go/agent/harness/toolautocall"
+	"github.com/microsoft/agent-framework-go/message"
+	"github.com/microsoft/agent-framework-go/spikes/maf_hitl"
+	"github.com/microsoft/agent-framework-go/tool"
+	"github.com/microsoft/agent-framework-go/tool/mcptool"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+type observedCall struct {
+	Authorization string
+	Body          string
+}
+
+type observationLog struct {
+	mu    sync.Mutex
+	calls []observedCall
+}
+
+func (l *observationLog) add(r *http.Request, body []byte) {
+	if !bytes.Contains(body, []byte(`"method":"tools/call"`)) {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls = append(l.calls, observedCall{Authorization: r.Header.Get("Authorization"), Body: string(body)})
+}
+
+func (l *observationLog) snapshot() []observedCall {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]observedCall(nil), l.calls...)
+}
+
+func TestFreshProcessesRestoreMAFSessionAndRaceOneApproval(t *testing.T) {
+	databaseURL := requireDatabase(t)
+	store := freshStore(t, databaseURL)
+	serverURL, observations := startHTTPMCPServer(t)
+
+	threadID := "durable-approval"
+	runHelper(t, map[string]string{
+		"MAF_SPIKE_MODE": "approval-start", "MAF_SPIKE_THREAD": threadID,
+		"MAF_SPIKE_MCP_URL": serverURL, "MAF_SPIKE_CREDENTIAL": "credential-A",
+		"MAF_SPIKE_PRINCIPAL": "alice",
+	}, "OUTCOME=awaiting-approval")
+	pending, err := store.Get(t.Context(), threadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arguments := strings.ReplaceAll(string(pending.Arguments), " ", "")
+	if pending.Kind != "approval" || pending.CallID != "write-call" || pending.ToolName != "write_record" || arguments != `{"value":"approved-original"}` {
+		t.Fatalf("stored approval snapshot = %#v", pending)
+	}
+	durable, _ := json.Marshal(pending)
+	if bytes.Contains(durable, []byte("credential-A")) || bytes.Contains(durable, []byte("credential-B")) {
+		t.Fatalf("credential leaked into durable checkpoint: %s", durable)
+	}
+
+	runHelper(t, map[string]string{
+		"MAF_SPIKE_MODE": "approval-resume", "MAF_SPIKE_THREAD": threadID,
+		"MAF_SPIKE_REQUEST": pending.RequestID, "MAF_SPIKE_PRINCIPAL": "mallory",
+		"MAF_SPIKE_MCP_URL": serverURL, "MAF_SPIKE_CREDENTIAL": "credential-B",
+	}, "OUTCOME=wrong-principal")
+
+	baseEnv := map[string]string{
+		"MAF_SPIKE_MODE": "approval-resume", "MAF_SPIKE_THREAD": threadID,
+		"MAF_SPIKE_REQUEST": pending.RequestID, "MAF_SPIKE_PRINCIPAL": "alice",
+		"MAF_SPIKE_MCP_URL": serverURL, "MAF_SPIKE_CREDENTIAL": "credential-B",
+		// Deliberately attacker-controlled fields: helper never trusts them when
+		// constructing the MAF response; it uses the PostgreSQL snapshot.
+		"MAF_SPIKE_CLIENT_TOOL": "attacker_write", "MAF_SPIKE_CLIENT_ARGS": `{"value":"attacker"}`,
+	}
+	results := runHelpersConcurrently(t, baseEnv, 2)
+	var resumed, duplicate int
+	for _, result := range results {
+		if strings.Contains(result, "OUTCOME=resumed text=done") {
+			resumed++
+		} else if strings.Contains(result, "OUTCOME=duplicate") {
+			duplicate++
+		} else {
+			t.Errorf("unexpected resume result: %s", result)
+		}
+	}
+	if resumed != 1 || duplicate != 1 {
+		t.Fatalf("resume outcomes: resumed=%d duplicate=%d", resumed, duplicate)
+	}
+
+	calls := observations.snapshot()
+	assertObservedCall(t, calls, "read_record", "Bearer credential-A", 1)
+	assertObservedCall(t, calls, "write_record", "Bearer credential-B", 1)
+	assertObservedCall(t, calls, "attacker_write", "", 0)
+	afterResume, err := store.Get(t.Context(), threadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durableAfterResume, _ := json.Marshal(afterResume)
+	if bytes.Contains(durableAfterResume, []byte("credential-A")) || bytes.Contains(durableAfterResume, []byte("credential-B")) {
+		t.Fatalf("credential leaked into durable row after resume: %s", durableAfterResume)
+	}
+}
+
+func TestFreshProcessDeniedApprovalDoesNotDispatch(t *testing.T) {
+	databaseURL := requireDatabase(t)
+	store := freshStore(t, databaseURL)
+	serverURL, observations := startHTTPMCPServer(t)
+	threadID := "denied-approval"
+	runHelper(t, map[string]string{
+		"MAF_SPIKE_MODE": "approval-start", "MAF_SPIKE_THREAD": threadID,
+		"MAF_SPIKE_MCP_URL": serverURL, "MAF_SPIKE_CREDENTIAL": "credential-A", "MAF_SPIKE_PRINCIPAL": "alice",
+	}, "OUTCOME=awaiting-approval")
+	pending, err := store.Get(t.Context(), threadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runHelper(t, map[string]string{
+		"MAF_SPIKE_MODE": "approval-resume", "MAF_SPIKE_THREAD": threadID,
+		"MAF_SPIKE_REQUEST": pending.RequestID, "MAF_SPIKE_PRINCIPAL": "alice",
+		"MAF_SPIKE_MCP_URL": serverURL, "MAF_SPIKE_CREDENTIAL": "credential-B", "MAF_SPIKE_APPROVED": "false",
+	}, "OUTCOME=denied")
+	assertObservedCall(t, observations.snapshot(), "write_record", "", 0)
+}
+
+func TestFreshProcessClarificationPreservesOptionsAndCannotAuthorizeWrite(t *testing.T) {
+	databaseURL := requireDatabase(t)
+	store := freshStore(t, databaseURL)
+	serverURL, observations := startHTTPMCPServer(t)
+	threadID := "durable-question"
+	runHelper(t, map[string]string{
+		"MAF_SPIKE_MODE": "question-start", "MAF_SPIKE_THREAD": threadID,
+		"MAF_SPIKE_MCP_URL": serverURL, "MAF_SPIKE_CREDENTIAL": "credential-A", "MAF_SPIKE_PRINCIPAL": "alice",
+	}, "OUTCOME=awaiting-question")
+	pending, err := store.Get(t.Context(), threadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.Kind != "question" || pending.Question != "Which region?" || strings.Join(pending.Options, ",") != "east,west" {
+		t.Fatalf("stored question = %#v", pending)
+	}
+	if _, err := store.Claim(t.Context(), threadID, pending.RequestID, "alice", "approval", "wrong-kind"); !errors.Is(err, maf_hitl.ErrWrongKind) {
+		t.Fatalf("claim question as approval error=%v, want ErrWrongKind", err)
+	}
+	runHelper(t, map[string]string{
+		"MAF_SPIKE_MODE": "question-resume", "MAF_SPIKE_THREAD": threadID,
+		"MAF_SPIKE_REQUEST": pending.RequestID, "MAF_SPIKE_PRINCIPAL": "alice",
+		"MAF_SPIKE_MCP_URL": serverURL, "MAF_SPIKE_CREDENTIAL": "credential-B", "MAF_SPIKE_ANSWER": "central (custom)",
+	}, "OUTCOME=answered text=answer:central (custom)")
+	assertObservedCall(t, observations.snapshot(), "read_record", "Bearer credential-A", 1)
+	assertObservedCall(t, observations.snapshot(), "write_record", "", 0)
+}
+
+func TestMAFSpikeHelperProcess(t *testing.T) {
+	mode := os.Getenv("MAF_SPIKE_MODE")
+	if mode == "" {
+		return
+	}
+	ctx := context.Background()
+	store, err := maf_hitl.OpenStore(ctx, os.Getenv("MAF_SPIKE_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	threadID, principal := os.Getenv("MAF_SPIKE_THREAD"), os.Getenv("MAF_SPIKE_PRINCIPAL")
+	switch mode {
+	case "approval-start":
+		a, session, closeMCP := helperAgent(t, ctx, approvalProvider)
+		defer closeMCP()
+		updates := collect(t, a.RunText(ctx, "start", agent.WithSession(session)))
+		request := approvalRequest(t, updates)
+		toolCall, ok := request.ToolCall.(*message.FunctionCallContent)
+		if !ok {
+			t.Fatalf("approval tool call is %T, want FunctionCallContent", request.ToolCall)
+		}
+		checkpoint, err := json.Marshal(session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Put(ctx, maf_hitl.Pending{ThreadID: threadID, Kind: "approval", RequestID: request.RequestID,
+			CallID: toolCall.CallID, ToolName: toolCall.Name, Arguments: json.RawMessage(toolCall.Arguments),
+			Principal: principal, Session: checkpoint}); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Println("OUTCOME=awaiting-approval")
+	case "approval-resume":
+		pending, err := store.Claim(ctx, threadID, os.Getenv("MAF_SPIKE_REQUEST"), principal, "approval", fmt.Sprintf("pid-%d", os.Getpid()))
+		if errors.Is(err, maf_hitl.ErrAlreadyConsumed) {
+			fmt.Println("OUTCOME=duplicate")
+			return
+		}
+		if errors.Is(err, maf_hitl.ErrWrongPrincipal) {
+			fmt.Println("OUTCOME=wrong-principal")
+			return
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		approved := os.Getenv("MAF_SPIKE_APPROVED") != "false"
+		a, _, closeMCP := helperAgent(t, ctx, approvalProvider)
+		defer closeMCP()
+		var session agent.Session
+		if err := json.Unmarshal(pending.Session, &session); err != nil {
+			t.Fatal(err)
+		}
+		response := &message.ToolApprovalResponseContent{RequestID: pending.RequestID, Approved: approved,
+			ToolCall: &message.FunctionCallContent{CallID: pending.CallID, Name: pending.ToolName, Arguments: string(pending.Arguments)}}
+		updates := collect(t, a.RunMessage(ctx, message.New(response), agent.WithSession(&session)))
+		if !approved {
+			fmt.Println("OUTCOME=denied")
+			return
+		}
+		fmt.Printf("OUTCOME=resumed text=%s\n", textFromUpdates(updates))
+	case "question-start":
+		a, session, closeMCP := helperAgent(t, ctx, questionProvider)
+		defer closeMCP()
+		updates := collect(t, a.RunText(ctx, "start", agent.WithSession(session)))
+		toolCall := functionCall(t, updates, "request_clarification")
+		var question struct {
+			Question string   `json:"question"`
+			Options  []string `json:"options"`
+		}
+		if err := json.Unmarshal([]byte(toolCall.Arguments), &question); err != nil {
+			t.Fatal(err)
+		}
+		checkpoint, err := json.Marshal(session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Put(ctx, maf_hitl.Pending{ThreadID: threadID, Kind: "question", RequestID: "question-1",
+			CallID: toolCall.CallID, ToolName: toolCall.Name, Arguments: json.RawMessage(toolCall.Arguments),
+			Principal: principal, Question: question.Question, Options: question.Options, Session: checkpoint}); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Println("OUTCOME=awaiting-question")
+	case "question-resume":
+		pending, err := store.Claim(ctx, threadID, os.Getenv("MAF_SPIKE_REQUEST"), principal, "question", fmt.Sprintf("pid-%d", os.Getpid()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, _, closeMCP := helperAgent(t, ctx, questionProvider)
+		defer closeMCP()
+		var session agent.Session
+		if err := json.Unmarshal(pending.Session, &session); err != nil {
+			t.Fatal(err)
+		}
+		answer := os.Getenv("MAF_SPIKE_ANSWER")
+		answerMessage := &message.Message{Role: message.RoleTool, Contents: message.Contents{&message.FunctionResultContent{CallID: pending.CallID, Result: answer}}}
+		updates := collect(t, a.RunMessage(ctx, answerMessage, agent.WithSession(&session)))
+		fmt.Printf("OUTCOME=answered text=%s\n", textFromUpdates(updates))
+	default:
+		t.Fatalf("unknown helper mode %q", mode)
+	}
+}
+
+func helperAgent(t *testing.T, ctx context.Context, provider agent.RunFunc) (*agent.Agent, *agent.Session, func()) {
+	t.Helper()
+	httpClient := &http.Client{Transport: authTransport{credential: os.Getenv("MAF_SPIKE_CREDENTIAL")}}
+	transport := &mcp.StreamableClientTransport{Endpoint: os.Getenv("MAF_SPIKE_MCP_URL"), HTTPClient: httpClient, MaxRetries: -1, DisableStandaloneSSE: true}
+	clientSession, err := mcptool.Connect(ctx, transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := mcptool.ListTools(ctx, clientSession)
+	if err != nil {
+		clientSession.Close()
+		t.Fatal(err)
+	}
+	readTool := findFuncTool(t, listed, "read_record")
+	writeTool := tool.ApprovalRequiredFunc(maf_hitl.ClassifyEffectful(findFuncTool(t, listed, "write_record")))
+	attackerTool := findFuncTool(t, listed, "attacker_write")
+	askUser := questionSchemaTool{}
+	a := agent.New(agent.ProviderConfig{ProviderName: "controlled", Run: provider}, agent.Config{
+		ID: "durable-spike-agent", Tools: []tool.Tool{readTool, writeTool, attackerTool, askUser},
+		Middlewares: []agent.Middleware{toolautocall.New(toolautocall.Config{})},
+	})
+	session, err := a.CreateSession(ctx)
+	if err != nil {
+		clientSession.Close()
+		t.Fatal(err)
+	}
+	return a, session, func() { _ = clientSession.Close() }
+}
+
+func approvalProvider(_ context.Context, messages []*message.Message, _ ...agent.Option) iter.Seq2[*agent.ResponseUpdate, error] {
+	return func(yield func(*agent.ResponseUpdate, error) bool) {
+		if hasFunctionResult(messages, "write-call") {
+			if !hasFunctionCall(messages, "write-call", "write_record", `{"value":"approved-original"}`) || !hasFunctionResult(messages, "read-call") {
+				yield(nil, errors.New("restored MAF protocol history incomplete"))
+				return
+			}
+			yield(&agent.ResponseUpdate{Role: message.RoleAssistant, Contents: message.Contents{&message.TextContent{Text: "done"}}}, nil)
+			return
+		}
+		if hasFunctionResult(messages, "read-call") {
+			yield(&agent.ResponseUpdate{Role: message.RoleAssistant, Contents: message.Contents{&message.FunctionCallContent{CallID: "write-call", Name: "write_record", Arguments: `{"value":"approved-original"}`}}}, nil)
+			return
+		}
+		yield(&agent.ResponseUpdate{Role: message.RoleAssistant, Contents: message.Contents{&message.FunctionCallContent{CallID: "read-call", Name: "read_record", Arguments: `{}`}}}, nil)
+	}
+}
+
+func questionProvider(_ context.Context, messages []*message.Message, _ ...agent.Option) iter.Seq2[*agent.ResponseUpdate, error] {
+	return func(yield func(*agent.ResponseUpdate, error) bool) {
+		if answer, ok := functionResultString(messages, "question-call"); ok {
+			if !hasFunctionCall(messages, "question-call", "request_clarification", `{"question":"Which region?","options":["east","west"]}`) || !hasFunctionResult(messages, "question-read") {
+				yield(nil, errors.New("restored question protocol history incomplete"))
+				return
+			}
+			yield(&agent.ResponseUpdate{Role: message.RoleAssistant, Contents: message.Contents{&message.TextContent{Text: "answer:" + answer}}}, nil)
+			return
+		}
+		if hasFunctionResult(messages, "question-read") {
+			yield(&agent.ResponseUpdate{Role: message.RoleAssistant, Contents: message.Contents{&message.FunctionCallContent{
+				CallID: "question-call", Name: "request_clarification", Arguments: `{"question":"Which region?","options":["east","west"]}`,
+			}}}, nil)
+			return
+		}
+		yield(&agent.ResponseUpdate{Role: message.RoleAssistant, Contents: message.Contents{&message.FunctionCallContent{CallID: "question-read", Name: "read_record", Arguments: `{}`}}}, nil)
+	}
+}
+
+type authTransport struct{ credential string }
+
+func (t authTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	clone := request.Clone(request.Context())
+	clone.Header.Set("Authorization", "Bearer "+t.credential)
+	return http.DefaultTransport.RoundTrip(clone)
+}
+
+func startHTTPMCPServer(t *testing.T) (string, *observationLog) {
+	t.Helper()
+	server := mcp.NewServer(&mcp.Implementation{Name: "durable-spike", Version: "1"}, nil)
+	mcp.AddTool(server, &mcp.Tool{Name: "read_record"}, func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, any, error) {
+		return nil, map[string]any{"value": "before"}, nil
+	})
+	type writeArgs struct {
+		Value string `json:"value"`
+	}
+	mcp.AddTool(server, &mcp.Tool{Name: "write_record"}, func(_ context.Context, _ *mcp.CallToolRequest, args writeArgs) (*mcp.CallToolResult, any, error) {
+		return nil, map[string]any{"value": args.Value}, nil
+	})
+	mcp.AddTool(server, &mcp.Tool{Name: "attacker_write"}, func(_ context.Context, _ *mcp.CallToolRequest, args writeArgs) (*mcp.CallToolResult, any, error) {
+		return nil, map[string]any{"value": args.Value}, nil
+	})
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})
+	observations := new(observationLog)
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		observations.add(request, body)
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		handler.ServeHTTP(w, request)
+	}))
+	t.Cleanup(httpServer.Close)
+	return httpServer.URL, observations
+}
+
+func requireDatabase(t *testing.T) string {
+	t.Helper()
+	url := os.Getenv("MAF_SPIKE_DATABASE_URL")
+	if url == "" {
+		t.Skip("MAF_SPIKE_DATABASE_URL unavailable")
+	}
+	return url
+}
+
+func freshStore(t *testing.T, databaseURL string) *maf_hitl.Store {
+	t.Helper()
+	store, err := maf_hitl.OpenStore(t.Context(), databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Ensure(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reset(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+func runHelper(t *testing.T, extra map[string]string, want string) string {
+	t.Helper()
+	cmd := helperCommand(extra)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helper failed: %v\n%s", err, out)
+	}
+	result := strings.TrimSpace(string(out))
+	if !strings.Contains(result, want) {
+		t.Fatalf("helper output %q does not contain %q", result, want)
+	}
+	return result
+}
+
+func runHelpersConcurrently(t *testing.T, env map[string]string, count int) []string {
+	t.Helper()
+	start := make(chan struct{})
+	results := make(chan string, count)
+	var wg sync.WaitGroup
+	for range count {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			out, err := helperCommand(env).CombinedOutput()
+			if err != nil {
+				results <- "process-error:" + err.Error() + ":" + string(out)
+				return
+			}
+			results <- strings.TrimSpace(string(out))
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	var out []string
+	for result := range results {
+		out = append(out, result)
+	}
+	return out
+}
+
+func helperCommand(extra map[string]string) *exec.Cmd {
+	cmd := exec.Command(os.Args[0], "-test.run=TestMAFSpikeHelperProcess")
+	cmd.Env = os.Environ()
+	for key, value := range extra {
+		cmd.Env = append(cmd.Env, key+"="+value)
+	}
+	return cmd
+}
+
+func assertObservedCall(t *testing.T, calls []observedCall, toolName, authorization string, want int) {
+	t.Helper()
+	var got int
+	for _, call := range calls {
+		if strings.Contains(call.Body, `"name":"`+toolName+`"`) {
+			got++
+			if authorization != "" && call.Authorization != authorization {
+				t.Errorf("%s authorization=%q, want %q", toolName, call.Authorization, authorization)
+			}
+		}
+	}
+	if got != want {
+		t.Errorf("%s outward calls=%d, want %d; all calls=%#v", toolName, got, want, calls)
+	}
+}
+
+type questionSchemaTool struct{}
+
+func (questionSchemaTool) Name() string        { return "request_clarification" }
+func (questionSchemaTool) Description() string { return "Request a typed question from the user." }
+func (questionSchemaTool) Schema() any {
+	return map[string]any{"type": "object", "properties": map[string]any{
+		"question": map[string]any{"type": "string"},
+		"options":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+	}}
+}
+func (questionSchemaTool) ReturnSchema() any { return map[string]any{"type": "string"} }
+
+func functionCall(t *testing.T, updates []*agent.ResponseUpdate, name string) *message.FunctionCallContent {
+	t.Helper()
+	for _, update := range updates {
+		for _, content := range update.Contents {
+			if call, ok := content.(*message.FunctionCallContent); ok && call.Name == name {
+				return call
+			}
+		}
+	}
+	t.Fatalf("function call %q not found", name)
+	return nil
+}
+
+func functionResultString(messages []*message.Message, callID string) (string, bool) {
+	for _, msg := range messages {
+		for _, content := range msg.Contents {
+			if result, ok := content.(*message.FunctionResultContent); ok && result.CallID == callID {
+				value, ok := result.Result.(string)
+				return value, ok
+			}
+		}
+	}
+	return "", false
+}

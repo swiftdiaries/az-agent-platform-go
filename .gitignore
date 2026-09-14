@@ -1,0 +1,3 @@
+# Local planning and execution artifacts
+.cache/
+.worktrees/
