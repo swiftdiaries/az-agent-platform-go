@@ -38,18 +38,26 @@ type ToolResult struct {
 type Handoff struct{ JourneyID, Text string }
 
 type ModelRequest struct {
-	Handoff          Handoff
-	Context          []string
-	History          json.RawMessage
-	PendingCommands  []journal.Input
-	Instructions     string
-	Messages         []string
+	Handoff         Handoff
+	Context         []string
+	History         json.RawMessage
+	PendingCommands []journal.Input
+	Instructions    string
+	Messages        []string
+	// ProviderMessages is the exact MAF history for this turn. It is transient:
+	// providers must not replace the product-owned durable history with a
+	// provider session.
+	ProviderMessages []*message.Message
 	Tools            []ModelTool
 	ToolResults      []ToolResult
 	DefinitionDigest string
 	SkillCatalog     []SkillMetadata
 	SkillMaterial    []platformskills.Material
 	Provenance       RequestProvenance
+	// OnDispatch commits materialization at the final provider request boundary.
+	// A provider must call it at most once, after constructing the exact request
+	// and immediately before its transport sends it.
+	OnDispatch func(context.Context) error
 }
 
 // SkillMetadata is the metadata-only skill catalog exposed to the provider.
@@ -181,6 +189,7 @@ func modelRun(parent context.Context, model Model, callBase string, before func(
 				schema, _ := candidate.(tool.SchemaTool)
 				request.Tools = append(request.Tools, ModelTool{Name: candidate.Name(), Description: candidate.Description(), Schema: schemaValue(schema)})
 			}
+			request.ProviderMessages = messages
 			for _, msg := range messages {
 				if text := msg.String(); text != "" {
 					request.Messages = append(request.Messages, text)
@@ -199,15 +208,28 @@ func modelRun(parent context.Context, model Model, callBase string, before func(
 				yield(nil, err)
 				return
 			}
+			observedOnce := false
+			request.OnDispatch = func(context.Context) error {
+				if observedOnce {
+					return nil
+				}
+				if err := observed(ctx); err != nil {
+					return err
+				}
+				observedOnce = true
+				return nil
+			}
 			modelCtx, span := otel.Tracer("az-agent-platform/runtime").Start(ctx, "model.call")
 			span.SetAttributes(attribute.String("call.id", callBase))
 			response, err := model.Complete(modelCtx, request)
 			span.End()
-			if observedErr := observed(ctx); observedErr != nil {
-				yield(nil, observedErr)
+			if err != nil {
+				yield(nil, err)
 				return
 			}
-			if err != nil {
+			// Test and local models have no HTTP transport callback. Their successful
+			// completion is the observable request boundary.
+			if err := request.OnDispatch(ctx); err != nil {
 				yield(nil, err)
 				return
 			}
