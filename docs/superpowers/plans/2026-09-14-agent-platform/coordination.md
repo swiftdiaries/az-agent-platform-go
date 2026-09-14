@@ -102,3 +102,8 @@ Keep independent review and verification. Split a deliverable only when its impl
 - Red evidence: definition tests first failed on absent digest/version/skill APIs; skill tests failed on the absent controlled source; version tests failed on absent PostgreSQL current-pointer APIs; provider tests failed on absent pinned material and provenance. The first full suite exposed an old temp-config fixture that omitted newly declared package roots; copying the declared planner package repaired it.
 - Final checks on PostgreSQL 16.13 with no skips: `go test ./... -count=1 -timeout=90s`; `go test -race ./internal/... ./integration -run 'TestJourneyDefinition|TestSkill|TestContext|TestVersion' -count=1 -timeout=90s`; `go vet ./...`; `git diff --check`.
 - Next: independent reviewers inspect the exact submitted commit. Task 6 remains pending and no real provider, identity, ingress or deployment integration is claimed here.
+
+## Task 5 repair after specification review
+
+- Specification review failed `7ee9b0c4b8695e1e044086c0c270aac91d1082ed` on four exact boundaries. The repair commit containing this entry atomically selects and pins the current definition under the rollout lock, moves inference keywords/default/priority into journey configuration, records the structured provider-visible clarification or denial reply with its communication ID and digest, and rejects package or intermediate ancestor symlink replacement through rooted reads.
+- Direct red tests reproduced all four findings. The repaired focused suite, full suite, required race suite, `go vet ./...`, and `git diff --check` pass against PostgreSQL 16.13 without skips. Independent specification and quality reviews of the repair remain pending.

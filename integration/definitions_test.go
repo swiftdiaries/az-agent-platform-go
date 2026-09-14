@@ -11,6 +11,8 @@ import (
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
+	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
+	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
 func writeDefinitionBundle(t *testing.T, root, prompt string) string {
@@ -68,18 +70,22 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 	if err != nil || resolved != oldJourney.Digest {
 		t.Fatalf("old current resolution = %q, %v", resolved, err)
 	}
-	if _, err := store.Start(ctx, owner, "planner", resolved); err != nil {
+	if err := store.ActivateDefinition(ctx, "planner", oldJourney.Digest, newJourney.Digest, registry.HasDigest); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := store.Start(ctx, owner, "planner", resolved); err != nil {
+		t.Fatalf("binding winner did not stay pinned through activation: %v", err)
 	}
 	if err := store.Finish(ctx, owner, journal.RunCompleted, []byte(`[]`), "done", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := store.ActivateDefinition(ctx, "planner", oldJourney.Digest, newJourney.Digest, registry.HasDigest); err != nil {
-		t.Fatal(err)
-	}
 	if resolved, err = store.ResolveDefinition(ctx, "old-thread", "planner", newJourney.Digest); err != nil || resolved != oldJourney.Digest {
 		t.Fatalf("completed session fell forward = %q, %v", resolved, err)
+	}
+	newCommand := journal.Command{ThreadID: "new-thread", RunID: "new-run", CommunicationID: "new-command", Principal: "alice", Text: "plan"}
+	if _, _, err := store.Admit(ctx, newCommand); err != nil {
+		t.Fatal(err)
 	}
 	if resolved, err = store.ResolveDefinition(ctx, "new-thread", "planner", oldJourney.Digest); err != nil || resolved != newJourney.Digest {
 		t.Fatalf("new session ignored current = %q, %v", resolved, err)
@@ -101,6 +107,40 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 	if ready, err := store.DefinitionsReady(ctx, registry.HasDigest); err != nil || !ready {
 		t.Fatalf("complete retained bundle readiness = %v, %v", ready, err)
 	}
+}
+
+func TestDeclarativeJourneyRouting(t *testing.T) {
+	root := t.TempDir()
+	path := writeTwoJourneyBundle(t, root, "http://example")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := strings.ReplaceAll(string(data), `"id":"vacation-planner"`, `"id":"alpha"`)
+	config = strings.ReplaceAll(config, `"id":"shift-swap"`, `"id":"beta"`)
+	config = strings.Replace(config, `"routing":{"keywords":["shift","swap"],"priority":10}`, `"routing":{"keywords":["quasar"],"priority":7}`, 1)
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := definitions.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), nil)
+	store := journal.New(database(t))
+	bind := func(thread, text, target, want string) {
+		command := journal.Command{ThreadID: thread, RunID: thread, CommunicationID: thread, Principal: "alice", Text: text, TargetJourney: target}
+		if _, _, err := store.Admit(t.Context(), command); err != nil {
+			t.Fatal(err)
+		}
+		got, _, err := runner.Binding(t.Context(), agentruntime.RunInput{Store: store, ThreadID: thread, Text: text, TargetJourney: target})
+		if err != nil || got != want {
+			t.Fatalf("route %q = %q, %v", text, got, err)
+		}
+	}
+	bind("inferred", "please quasar now", "", "beta")
+	bind("default", "unmatched", "", "alpha")
+	bind("explicit", "please quasar now", "alpha", "alpha")
 }
 
 func TestDefinitionCompilationIsImmutableAndContentAddressed(t *testing.T) {

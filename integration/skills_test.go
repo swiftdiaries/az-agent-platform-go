@@ -2,6 +2,8 @@ package integration_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -104,6 +106,62 @@ func TestSkillPolicyFailsClosed(t *testing.T) {
 	}
 }
 
+func TestSkillReadRejectsReplacedAncestors(t *testing.T) {
+	t.Run("package", func(t *testing.T) {
+		root := t.TempDir()
+		registry, err := definitions.Load(writeDefinitionBundle(t, root, "prompt\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		journey, _ := registry.Journey("planner")
+		packagePath := filepath.Join(root, "skills/planner")
+		realPath := filepath.Join(root, "skills/planner-real")
+		if err := os.Rename(packagePath, realPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(realPath, packagePath); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := platformskills.New(journey).Read("planner", "SKILL.md"); !errors.Is(err, platformskills.ErrChanged) {
+			t.Fatalf("replaced package read = %v", err)
+		}
+	})
+	t.Run("intermediate", func(t *testing.T) {
+		root := t.TempDir()
+		path := writeDefinitionBundle(t, root, "prompt\n")
+		if err := os.Mkdir(filepath.Join(root, "skills/planner/reference"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(filepath.Join(root, "skills/planner/guide.md"), filepath.Join(root, "skills/planner/reference/guide.md")); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = []byte(strings.Replace(string(data), `"supporting_files":["guide.md"]`, `"supporting_files":["reference/guide.md"]`, 1))
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		registry, err := definitions.Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		journey, _ := registry.Journey("planner")
+		intermediate := filepath.Join(root, "skills/planner/reference")
+		real := filepath.Join(root, "skills/planner/reference-real")
+		if err := os.Rename(intermediate, real); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(real, intermediate); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := platformskills.New(journey).Read("planner", "reference/guide.md"); !errors.Is(err, platformskills.ErrChanged) {
+			t.Fatalf("replaced intermediate read = %v", err)
+		}
+	})
+}
+
 func writeTwoJourneyBundle(t *testing.T, root, endpoint string) string {
 	t.Helper()
 	for _, dir := range []string{"prompts", "skills/planner", "skills/shift-swap"} {
@@ -121,7 +179,7 @@ func writeTwoJourneyBundle(t *testing.T, root, endpoint string) string {
 			t.Fatal(err)
 		}
 	}
-	config := fmt.Sprintf(`{"mcp_servers":[{"id":"s","endpoint":%q,"tools":["lookup_destination","lookup_shift"],"policies":{"lookup_destination":{"class":"read_only"},"lookup_shift":{"class":"read_only"}}}],"skill_packages":[{"name":"planner","root":"skills/planner"},{"name":"shift-swap","root":"skills/shift-swap"}],"journeys":[{"id":"vacation-planner","description":"travel","system_prompt":"prompts/planner.md","mcp":{"server":"s","tools":["lookup_destination"]},"skills":["planner"]},{"id":"shift-swap","description":"exchange work time","system_prompt":"prompts/shift-swap.md","mcp":{"server":"s","tools":["lookup_shift"]},"skills":["shift-swap"]}]}`, endpoint)
+	config := fmt.Sprintf(`{"mcp_servers":[{"id":"s","endpoint":%q,"tools":["lookup_destination","lookup_shift"],"policies":{"lookup_destination":{"class":"read_only"},"lookup_shift":{"class":"read_only"}}}],"skill_packages":[{"name":"planner","root":"skills/planner"},{"name":"shift-swap","root":"skills/shift-swap"}],"journeys":[{"id":"vacation-planner","description":"travel","routing":{"default":true},"system_prompt":"prompts/planner.md","mcp":{"server":"s","tools":["lookup_destination"]},"skills":["planner"]},{"id":"shift-swap","description":"exchange work time","routing":{"keywords":["shift","swap"],"priority":10},"system_prompt":"prompts/shift-swap.md","mcp":{"server":"s","tools":["lookup_shift"]},"skills":["shift-swap"]}]}`, endpoint)
 	path := filepath.Join(root, "journeys.yaml")
 	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
 		t.Fatal(err)
@@ -202,6 +260,9 @@ func TestJourneyDefinitionRoutesAndMaterializesContext(t *testing.T) {
 		t.Fatalf("selected prior context = %#v", requests[1].Context)
 	}
 	input := agentruntime.RunInput{Store: store, ThreadID: "new", Text: "swap", TargetJourney: "vacation-planner"}
+	if _, _, err := store.Admit(t.Context(), journal.Command{ThreadID: "new", RunID: "new", CommunicationID: "new", Principal: "alice", Text: "swap", TargetJourney: "vacation-planner"}); err != nil {
+		t.Fatal(err)
+	}
 	if journey, _, err := runner.Binding(t.Context(), input); err != nil || journey != "vacation-planner" {
 		t.Fatalf("explicit route = %q, %v", journey, err)
 	}
@@ -293,6 +354,12 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 	awaitState(t, replacement, "fresh", "fresh", journal.RunCompleted)
 	if len(requests) != 3 {
 		t.Fatalf("provider request count = %d", len(requests))
+	}
+	clarification := requests[1].Provenance
+	clarificationPayload, _ := json.Marshal(journal.Reply{Answers: map[string]journal.Answer{"choice": {Option: "A"}}})
+	clarificationDigest := fmt.Sprintf("%x", sha256.Sum256(clarificationPayload))
+	if len(clarification.Pending) != 1 || len(clarification.IncludedInput) != 1 || clarification.Pending[0] != clarification.IncludedInput[0] || clarification.Pending[0].ID != "reply" || clarification.Pending[0].Digest != clarificationDigest || !json.Valid(requests[1].PendingCommands[0].Payload) {
+		t.Fatalf("clarification reply provenance = %#v", clarification)
 	}
 	for _, request := range requests[:2] {
 		if request.DefinitionDigest != oldJourney.Digest || request.Instructions != "old system" || len(request.SkillMaterial) != 1 || !strings.Contains(string(request.SkillMaterial[0].Body), "old skill body") {

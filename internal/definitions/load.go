@@ -50,6 +50,13 @@ type Journey struct {
 	Skills       []SkillPackage        `json:"-"`
 	Policies     map[string]ToolPolicy `json:"-"`
 	Digest       string                `json:"-"`
+	Routing      Routing               `json:"routing,omitempty"`
+}
+
+type Routing struct {
+	Default  bool     `json:"default,omitempty"`
+	Keywords []string `json:"keywords,omitempty"`
+	Priority int      `json:"priority,omitempty"`
 }
 
 type SkillDeclaration struct {
@@ -61,8 +68,8 @@ type SkillDeclaration struct {
 }
 
 type SkillFile struct {
-	Name, Path, Digest string
-	Data               []byte
+	Name, Path, Root, Relative, Digest string
+	Data                               []byte
 }
 
 type SkillPackage struct {
@@ -206,6 +213,15 @@ func loadOne(path string) (*Registry, error) {
 		if _, exists := registry.journeys[journey.ID]; exists {
 			return nil, fmt.Errorf("duplicate journey %q", journey.ID)
 		}
+		seenKeywords := map[string]bool{}
+		for i, keyword := range journey.Routing.Keywords {
+			keyword = strings.ToLower(strings.TrimSpace(keyword))
+			if keyword == "" || seenKeywords[keyword] {
+				return nil, fmt.Errorf("journey %q has invalid routing keyword", journey.ID)
+			}
+			seenKeywords[keyword] = true
+			journey.Routing.Keywords[i] = keyword
+		}
 		server, exists := registry.servers[journey.MCP.Server]
 		if !exists {
 			return nil, fmt.Errorf("journey %q references unknown MCP server %q", journey.ID, journey.MCP.Server)
@@ -251,10 +267,11 @@ func loadOne(path string) (*Registry, error) {
 			Tools                           []string
 			Policies                        map[string]ToolPolicy
 			Skills                          []skillIdentity
+			Routing                         Routing
 		}{
 			ID: journey.ID, Description: journey.Description, Server: journey.MCP.Server,
 			Prompt: journey.Prompt, Tools: append([]string(nil), journey.MCP.Tools...), Policies: clonePolicies(journey.Policies),
-			Skills: skillIdentities(journey.Skills),
+			Skills: skillIdentities(journey.Skills), Routing: cloneRouting(journey.Routing),
 		})
 		if err != nil {
 			return nil, err

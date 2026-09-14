@@ -2,12 +2,18 @@ package journal
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 )
 
-type Input struct{ CommunicationID, Text string }
+type Input struct {
+	CommunicationID, Text, Digest string
+	Payload                       json.RawMessage
+	Materialized                  bool
+}
 type Inbox struct {
 	Commands []Input
 	Context  []string
@@ -37,6 +43,29 @@ func (s *Store) Pending(ctx context.Context, o Owner) (Inbox, error) {
 				return err
 			}
 			in.Text = c.Text
+			if c.Text != "" {
+				in.Payload, err = json.Marshal(c.Text)
+				in.Materialized = true
+			} else if c.ReplyKind == "clarification" {
+				var reply Reply
+				if err = DecodeStrict([]byte(c.ReplyJSON), &reply); err == nil {
+					in.Payload, err = json.Marshal(reply)
+				}
+				in.Materialized = err == nil
+			} else if c.ReplyKind == "approval" {
+				var reply Reply
+				if err = DecodeStrict([]byte(c.ReplyJSON), &reply); err == nil && reply.Decision == "deny" {
+					in.Payload, err = json.Marshal(map[string]string{"error": "approval_denied"})
+					in.Materialized = err == nil
+				}
+			}
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			if in.Materialized {
+				in.Digest = fmt.Sprintf("%x", sha256.Sum256(in.Payload))
+			}
 			inbox.Commands = append(inbox.Commands, in)
 		}
 		rows.Close()

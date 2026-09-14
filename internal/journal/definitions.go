@@ -7,22 +7,34 @@ import (
 )
 
 func (s *Store) ResolveDefinition(ctx context.Context, thread, journey, bootstrap string) (string, error) {
-	var digest string
-	err := s.pool.QueryRow(ctx, "SELECT definition_digest FROM agent_sessions WHERE thread_id=$1 AND journey_id=$2", thread, journey).Scan(&digest)
-	if err == nil {
-		return digest, nil
-	}
-	if err != pgx.ErrNoRows {
-		return "", err
-	}
 	if len(bootstrap) != 64 {
 		return "", ErrDefinition
 	}
-	_, err = s.pool.Exec(ctx, "INSERT INTO agent_definition_current(journey_id,definition_digest) VALUES($1,$2) ON CONFLICT DO NOTHING", journey, bootstrap)
-	if err != nil {
-		return "", err
-	}
-	return s.CurrentDefinition(ctx, journey)
+	var digest string
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(789134628)"); err != nil {
+			return err
+		}
+		err := tx.QueryRow(ctx, "SELECT definition_digest FROM agent_sessions WHERE thread_id=$1 AND journey_id=$2", thread, journey).Scan(&digest)
+		if err == nil {
+			return nil
+		}
+		if err != pgx.ErrNoRows {
+			return err
+		}
+		err = tx.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current WHERE journey_id=$1", journey).Scan(&digest)
+		if err == pgx.ErrNoRows {
+			digest = bootstrap
+			if _, err = tx.Exec(ctx, "INSERT INTO agent_definition_current(journey_id,definition_digest) VALUES($1,$2)", journey, digest); err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, "INSERT INTO agent_sessions(thread_id,journey_id,definition_digest) VALUES($1,$2,$3)", thread, journey, digest)
+		return err
+	})
+	return digest, err
 }
 
 func (s *Store) CurrentDefinition(ctx context.Context, journey string) (string, error) {

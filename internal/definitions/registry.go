@@ -43,7 +43,7 @@ func compileSkill(configRoot string, declaration SkillDeclaration) (SkillPackage
 	compiled := SkillPackage{
 		Name: name, Description: description, Disabled: declaration.Disabled,
 		AllowSupportingFiles: declaration.AllowSupportingFiles,
-		Instructions:         snapshotFile("SKILL.md", instructionPath, instructions),
+		Instructions:         snapshotFile("SKILL.md", configRoot, instructionPath, instructions),
 		Supporting:           make(map[string]SkillFile, len(declaration.SupportingFiles)),
 	}
 	seen := make(map[string]bool)
@@ -60,7 +60,7 @@ func compileSkill(configRoot string, declaration SkillDeclaration) (SkillPackage
 		if err != nil {
 			return SkillPackage{}, fmt.Errorf("supporting file %q: %w", name, err)
 		}
-		compiled.Supporting[name] = snapshotFile(name, path, data)
+		compiled.Supporting[name] = snapshotFile(name, configRoot, path, data)
 	}
 	canonical, err := json.Marshal(struct {
 		Name, Description              string
@@ -122,8 +122,9 @@ func readLimited(path string, limit int) ([]byte, error) {
 	return data, nil
 }
 
-func snapshotFile(name, path string, data []byte) SkillFile {
-	return SkillFile{Name: name, Path: path, Digest: fmt.Sprintf("%x", sha256.Sum256(data)), Data: bytes.Clone(data)}
+func snapshotFile(name, root, path string, data []byte) SkillFile {
+	relative, _ := filepath.Rel(root, path)
+	return SkillFile{Name: name, Path: path, Root: root, Relative: relative, Digest: fmt.Sprintf("%x", sha256.Sum256(data)), Data: bytes.Clone(data)}
 }
 
 func supportingBytes(files map[string]SkillFile) map[string][]byte {
@@ -178,12 +179,18 @@ func cloneJourney(in Journey) Journey {
 	out := in
 	out.MCP.Tools = append([]string(nil), in.MCP.Tools...)
 	out.SkillNames = append([]string(nil), in.SkillNames...)
+	out.Routing = cloneRouting(in.Routing)
 	out.Policies = clonePolicies(in.Policies)
 	out.Skills = make([]SkillPackage, len(in.Skills))
 	for i, skill := range in.Skills {
 		out.Skills[i] = cloneSkill(skill)
 	}
 	return out
+}
+
+func cloneRouting(in Routing) Routing {
+	in.Keywords = append([]string(nil), in.Keywords...)
+	return in
 }
 
 func cloneServer(in MCPServer) MCPServer {
@@ -205,4 +212,31 @@ func (r *Registry) Version(digest string) (Journey, bool) {
 func (r *Registry) HasDigest(digest string) bool {
 	_, ok := r.versions[digest]
 	return ok
+}
+
+func (r *Registry) Infer(text string) (Journey, bool) {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if text == "" {
+		return Journey{}, false
+	}
+	bestPriority, bestIndex := 0, -1
+	for index, id := range r.order {
+		journey := r.journeys[id]
+		matched := false
+		for _, keyword := range journey.Routing.Keywords {
+			matched = matched || strings.Contains(text, keyword)
+		}
+		if matched && (bestIndex < 0 || journey.Routing.Priority > bestPriority) {
+			bestPriority, bestIndex = journey.Routing.Priority, index
+		}
+	}
+	if bestIndex >= 0 {
+		return cloneJourney(r.journeys[r.order[bestIndex]]), true
+	}
+	for _, id := range r.order {
+		if r.journeys[id].Routing.Default {
+			return cloneJourney(r.journeys[id]), true
+		}
+	}
+	return r.DefaultJourney()
 }

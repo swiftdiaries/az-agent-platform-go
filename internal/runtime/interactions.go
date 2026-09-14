@@ -95,11 +95,12 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 			History:    MaterialProvenance{ID: in.ThreadID + "/" + journey.ID, Digest: digestValue(req.History)},
 		}
 		for _, command := range req.PendingCommands {
-			item := MaterialProvenance{ID: command.CommunicationID, Digest: digestValue(command)}
-			req.Provenance.Pending = append(req.Provenance.Pending, item)
-			if command.Text != "" {
-				req.Provenance.IncludedInput = append(req.Provenance.IncludedInput, item)
+			if !command.Materialized {
+				continue
 			}
+			item := MaterialProvenance{ID: command.CommunicationID, Digest: command.Digest}
+			req.Provenance.Pending = append(req.Provenance.Pending, item)
+			req.Provenance.IncludedInput = append(req.Provenance.IncludedInput, item)
 		}
 		return in.Store.Check(ctx, in.Owner)
 	}, func(ctx context.Context) error { return in.Store.Included(ctx, in.Owner, pending) })}, agent.Config{ID: "journey:" + journey.ID, Name: journey.ID, Description: journey.Description, Tools: tools, RunOptions: []agent.Option{agent.WithInstructions(journey.Prompt)}})

@@ -3,6 +3,7 @@ package integration_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -439,8 +440,11 @@ func TestApprovalFreshCredentialsAndRejectedReplies(t *testing.T) {
 			mock := newMockMCP(t)
 			backend := httptest.NewServer(mock)
 			defer backend.Close()
+			var resumed *agentruntime.ModelRequest
 			p := platform.New(policyRunner(t, backend.URL, "effectful", modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 				if len(r.ToolResults) > 0 {
+					copy := r
+					resumed = &copy
 					return agentruntime.ModelResponse{Text: "done"}, nil
 				}
 				return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "write", Name: "lookup_destination", Arguments: json.RawMessage(`{"amount":9007199254740993}`)}}, nil
@@ -484,6 +488,12 @@ func TestApprovalFreshCredentialsAndRejectedReplies(t *testing.T) {
 				}
 			} else if len(calls) != 0 {
 				t.Fatal("non-approval dispatched")
+			}
+			if decision == "deny" {
+				denialDigest := fmt.Sprintf("%x", sha256.Sum256([]byte(`{"error":"approval_denied"}`)))
+				if resumed == nil || len(resumed.Provenance.Pending) != 1 || len(resumed.Provenance.IncludedInput) != 1 || resumed.Provenance.Pending[0] != resumed.Provenance.IncludedInput[0] || resumed.Provenance.Pending[0].ID != "reply" || resumed.Provenance.Pending[0].Digest != denialDigest || !json.Valid(resumed.PendingCommands[0].Payload) {
+					t.Fatalf("denial reply provenance = %#v", resumed)
+				}
 			}
 			var persisted string
 			if err := pool.QueryRow(t.Context(), "SELECT concat((SELECT jsonb_agg(to_jsonb(c))::text FROM agent_commands c),(SELECT jsonb_agg(to_jsonb(i))::text FROM agent_interactions i),(SELECT jsonb_agg(to_jsonb(s))::text FROM agent_sessions s))").Scan(&persisted); err != nil {

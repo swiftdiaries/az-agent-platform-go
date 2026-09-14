@@ -3,7 +3,6 @@ package runtime
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"go.opentelemetry.io/otel"
 
@@ -20,13 +19,8 @@ func (r *Runner) route(ctx context.Context, target, text string) (definitions.Jo
 		}
 		return journey, nil
 	}
-	if strings.Contains(strings.ToLower(text), "shift") || strings.Contains(strings.ToLower(text), "swap") {
-		if journey, ok := r.definitions.Journey("shift-swap"); ok {
-			return journey, nil
-		}
-	}
-	journey, ok := r.definitions.DefaultJourney()
-	if !ok || strings.TrimSpace(text) == "" {
+	journey, ok := r.definitions.Infer(text)
+	if !ok {
 		return definitions.Journey{}, fmt.Errorf("no journey matches request")
 	}
 	return journey, nil

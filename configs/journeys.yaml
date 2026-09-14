@@ -21,6 +21,7 @@
     {
       "id": "vacation-planner",
       "description": "Plan a vacation using the configured read-only destination lookup",
+      "routing": {"default":true},
       "system_prompt": "prompts/planner.md",
       "mcp": {
         "server": "java-monolith",
@@ -31,6 +32,7 @@
     {
       "id": "shift-swap",
       "description": "Review available work shifts and request an explicit swap",
+      "routing": {"keywords":["shift", "swap"], "priority":10},
       "system_prompt": "prompts/shift-swap.md",
       "mcp": {
         "server": "java-monolith",
