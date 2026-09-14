@@ -2,12 +2,14 @@ package integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
@@ -66,7 +68,7 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	owner := claimForTest(t, store, command, true)
-	resolved, err := store.ResolveDefinition(ctx, command.ThreadID, "planner", newJourney.Digest)
+	resolved, err := store.ResolveDefinition(ctx, owner, "planner", newJourney.Digest)
 	if err != nil || resolved != oldJourney.Digest {
 		t.Fatalf("old current resolution = %q, %v", resolved, err)
 	}
@@ -80,14 +82,20 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if resolved, err = store.ResolveDefinition(ctx, "old-thread", "planner", newJourney.Digest); err != nil || resolved != oldJourney.Digest {
+	continued := journal.Command{ThreadID: "old-thread", RunID: "old-next", CommunicationID: "old-next", Principal: "alice", Text: "again"}
+	if _, _, err := store.Admit(ctx, continued); err != nil {
+		t.Fatal(err)
+	}
+	continuedOwner := claimForTest(t, store, continued, false)
+	if resolved, err = store.ResolveDefinition(ctx, continuedOwner, "planner", newJourney.Digest); err != nil || resolved != oldJourney.Digest {
 		t.Fatalf("completed session fell forward = %q, %v", resolved, err)
 	}
 	newCommand := journal.Command{ThreadID: "new-thread", RunID: "new-run", CommunicationID: "new-command", Principal: "alice", Text: "plan"}
 	if _, _, err := store.Admit(ctx, newCommand); err != nil {
 		t.Fatal(err)
 	}
-	if resolved, err = store.ResolveDefinition(ctx, "new-thread", "planner", oldJourney.Digest); err != nil || resolved != newJourney.Digest {
+	newOwner := claimForTest(t, store, newCommand, false)
+	if resolved, err = store.ResolveDefinition(ctx, newOwner, "planner", oldJourney.Digest); err != nil || resolved != newJourney.Digest {
 		t.Fatalf("new session ignored current = %q, %v", resolved, err)
 	}
 	if err := store.ActivateDefinition(ctx, "planner", oldJourney.Digest, oldJourney.Digest, registry.HasDigest); !errors.Is(err, journal.ErrDefinition) {
@@ -133,7 +141,8 @@ func TestDeclarativeJourneyRouting(t *testing.T) {
 		if _, _, err := store.Admit(t.Context(), command); err != nil {
 			t.Fatal(err)
 		}
-		got, _, err := runner.Binding(t.Context(), agentruntime.RunInput{Store: store, ThreadID: thread, Text: text, TargetJourney: target})
+		owner := claimForTest(t, store, command, false)
+		got, _, err := runner.Binding(t.Context(), agentruntime.RunInput{Store: store, Owner: owner, ThreadID: thread, Text: text, TargetJourney: target})
 		if err != nil || got != want {
 			t.Fatalf("route %q = %q, %v", text, got, err)
 		}
@@ -141,6 +150,49 @@ func TestDeclarativeJourneyRouting(t *testing.T) {
 	bind("inferred", "please quasar now", "", "beta")
 	bind("default", "unmatched", "", "alpha")
 	bind("explicit", "please quasar now", "alpha", "alpha")
+}
+
+func TestResolveDefinitionRejectsOwnerExpiredWhileWaitingForRollout(t *testing.T) {
+	pool := database(t)
+	store := journal.New(pool)
+	command := journal.Command{ThreadID: "definition-owner", RunID: "definition-owner", CommunicationID: "definition-owner", Principal: "alice", Text: "plan"}
+	if _, _, err := store.Admit(t.Context(), command); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := store.Claim(t.Context(), command, "stale-owner", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, err := pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Rollback(t.Context())
+	if _, err := gate.Exec(t.Context(), "SELECT pg_advisory_xact_lock(789134628)"); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := store.ResolveDefinition(context.Background(), owner, "planner", strings.Repeat("a", 64))
+		done <- err
+	}()
+	waitDatabase(t, pool, "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted)")
+	if _, err := pool.Exec(t.Context(), "UPDATE agent_runs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", command.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reap(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, journal.ErrOwnership) {
+		t.Fatalf("stale definition pin = %v", err)
+	}
+	var sessions int
+	if err := pool.QueryRow(t.Context(), "SELECT count(*) FROM agent_sessions WHERE thread_id=$1", command.ThreadID).Scan(&sessions); err != nil || sessions != 0 {
+		t.Fatalf("stale owner inserted %d sessions: %v", sessions, err)
+	}
 }
 
 func TestDefinitionCompilationIsImmutableAndContentAddressed(t *testing.T) {
@@ -220,6 +272,84 @@ func TestDefinitionCompilationRejectsUnsafePackages(t *testing.T) {
 			test.edit(t, root)
 			if _, err := definitions.Load(path); err == nil {
 				t.Fatal(fmt.Sprintf("accepted %s", test.name))
+			}
+		})
+	}
+}
+
+func TestDefinitionRetainsVersionServerBinding(t *testing.T) {
+	oldPath := writeDefinitionBundle(t, t.TempDir(), "old prompt\n")
+	newPath := writeDefinitionBundle(t, t.TempDir(), "new prompt\n")
+	for path, name := range map[string]string{oldPath: "legacy", newPath: "current"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = []byte(strings.ReplaceAll(string(data), `"id":"s"`, fmt.Sprintf(`"id":%q`, name)))
+		data = []byte(strings.ReplaceAll(string(data), `"server":"s"`, fmt.Sprintf(`"server":%q`, name)))
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old, err := definitions.Load(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldJourney, _ := old.Journey("planner")
+	registry, err := definitions.Load(newPath, oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, ok := registry.ServerFor(oldJourney.Digest)
+	if !ok || server.ID != "legacy" || !registry.HasDigest(oldJourney.Digest) {
+		t.Fatalf("retained binding = %#v, %v", server, ok)
+	}
+}
+
+func TestDefinitionRejectsAggregateSkillLimits(t *testing.T) {
+	for _, test := range []struct {
+		name, body string
+		files      int
+	}{
+		{name: "bytes", files: 9, body: strings.Repeat("x", definitions.MaxSupportingBytes)},
+		{name: "file count", files: definitions.MaxCompiledSkillFiles + 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(root, "skills", "planner"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "prompt.md"), []byte("prompt"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "skills", "planner", "SKILL.md"), []byte("---\nname: planner\ndescription: Plan\n---\nbody\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			files := make([]string, test.files)
+			for i := range files {
+				files[i] = fmt.Sprintf("file-%04d.txt", i)
+				if err := os.WriteFile(filepath.Join(root, "skills", "planner", files[i]), []byte(test.body), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			config, err := json.Marshal(struct {
+				MCPServers    []definitions.MCPServer        `json:"mcp_servers"`
+				SkillPackages []definitions.SkillDeclaration `json:"skill_packages"`
+				Journeys      []definitions.Journey          `json:"journeys"`
+			}{
+				MCPServers:    []definitions.MCPServer{{ID: "s", Endpoint: "http://example", Tools: []string{"lookup"}}},
+				SkillPackages: []definitions.SkillDeclaration{{Name: "planner", Root: "skills/planner", SupportingFiles: files, AllowSupportingFiles: true}},
+				Journeys:      []definitions.Journey{{ID: "planner", Description: "Plan", SystemPrompt: "prompt.md", MCP: definitions.MCPBinding{Server: "s", Tools: []string{"lookup"}}, SkillNames: []string{"planner"}}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(root, "journeys.json")
+			if err := os.WriteFile(path, config, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := definitions.Load(path); err == nil {
+				t.Fatal("aggregate skill limit accepted")
 			}
 		})
 	}

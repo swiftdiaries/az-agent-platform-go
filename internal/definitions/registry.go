@@ -16,6 +16,14 @@ type skillIdentity struct {
 	Disabled, AllowSupportingFiles bool
 }
 
+func skillFootprint(skill SkillPackage) (int, int) {
+	bytes := len(skill.Instructions.Data)
+	for _, file := range skill.Supporting {
+		bytes += len(file.Data)
+	}
+	return bytes, 1 + len(skill.Supporting)
+}
+
 func compileSkill(configRoot string, declaration SkillDeclaration) (SkillPackage, error) {
 	packageRoot, err := confinedPath(configRoot, declaration.Root)
 	if err != nil {
@@ -210,8 +218,14 @@ func (r *Registry) Version(digest string) (Journey, bool) {
 }
 
 func (r *Registry) HasDigest(digest string) bool {
-	_, ok := r.versions[digest]
-	return ok
+	_, versionOK := r.versions[digest]
+	_, serverOK := r.versionServers[digest]
+	return versionOK && serverOK
+}
+
+func (r *Registry) ServerFor(digest string) (MCPServer, bool) {
+	server, ok := r.versionServers[digest]
+	return cloneServer(server), ok
 }
 
 func (r *Registry) Infer(text string) (Journey, bool) {

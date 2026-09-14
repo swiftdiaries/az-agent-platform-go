@@ -263,6 +263,12 @@ func TestJourneyDefinitionRoutesAndMaterializesContext(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if id == "vacation" {
+			steering := journal.Command{ThreadID: "thread", RunID: "vacation-correction", CommunicationID: "vacation-correction", Principal: "alice", Text: "Kyoto instead", TargetJourney: target}
+			if receipt, fresh, err := store.Admit(t.Context(), steering); err != nil || fresh || receipt.ExecutionRunID != id {
+				t.Fatalf("steering admission = %#v, %v, %v", receipt, fresh, err)
+			}
+		}
 		output, err := runner.Run(t.Context(), input)
 		if err != nil {
 			t.Fatal(err)
@@ -276,32 +282,40 @@ func TestJourneyDefinitionRoutesAndMaterializesContext(t *testing.T) {
 	if len(requests) != 2 {
 		t.Fatalf("provider requests = %d", len(requests))
 	}
-	wants := []struct{ journey, prompt, skill, body, tool string }{
-		{"vacation-planner", "vacation system", "planner", "vacation skill body", "lookup_destination"},
-		{"shift-swap", "shift system", "shift-swap", "shift skill body", "lookup_shift"},
+	wants := []struct{ journey, prompt, skill, tool string }{
+		{"vacation-planner", "vacation system", "planner", "lookup_destination"},
+		{"shift-swap", "shift system", "shift-swap", "lookup_shift"},
 	}
 	for i, want := range wants {
 		request := requests[i]
-		if request.Handoff.JourneyID != want.journey || request.Instructions != want.prompt || !slices.Equal(toolNames(request.Tools), []string{want.tool, "request_user_input"}) {
+		if request.Handoff.JourneyID != want.journey || request.Instructions != want.prompt || !slices.Equal(toolNames(request.Tools), []string{want.tool, "request_user_input", "load_skill", "read_skill_resource"}) {
 			t.Fatalf("journey %d isolation: %#v", i, request)
 		}
-		if len(request.SkillCatalog) != 1 || request.SkillCatalog[0].Name != want.skill || len(request.SkillMaterial) != 1 || !strings.Contains(string(request.SkillMaterial[0].Body), want.body) {
+		if len(request.SkillCatalog) != 1 || request.SkillCatalog[0].Name != want.skill || len(request.SkillMaterial) != 0 {
 			t.Fatalf("journey %d skills: %#v %#v", i, request.SkillCatalog, request.SkillMaterial)
 		}
-		if request.DefinitionDigest == "" || request.Provenance.Definition.ID != want.journey || request.Provenance.Definition.Digest != request.DefinitionDigest || request.Provenance.System.Digest == "" || request.Provenance.Handoff.Digest == "" || request.Provenance.Catalog.Digest == "" || request.Provenance.Context.Digest == "" || request.Provenance.History.Digest == "" || len(request.Provenance.Pending) != 1 || request.Provenance.Pending[0].ID == "" || len(request.Provenance.IncludedInput) != 1 || request.Provenance.IncludedInput[0] != request.Provenance.Pending[0] {
+		wantPending := 1
+		if i == 0 {
+			wantPending = 2
+		}
+		if request.DefinitionDigest == "" || request.Provenance.Definition.ID != want.journey || request.Provenance.Definition.Digest != request.DefinitionDigest || request.Provenance.System.Digest == "" || request.Provenance.Handoff.Digest == "" || request.Provenance.Catalog.Digest == "" || request.Provenance.Context.Digest == "" || request.Provenance.History.Digest == "" || len(request.Provenance.Pending) != wantPending || request.Provenance.Pending[0].ID == "" || len(request.Provenance.IncludedInput) != wantPending || request.Provenance.IncludedInput[0] != request.Provenance.Pending[0] {
 			t.Fatalf("journey %d provenance: %#v", i, request.Provenance)
 		}
 	}
 	if requests[0].DefinitionDigest == requests[1].DefinitionDigest {
 		t.Fatal("journeys share a definition digest")
 	}
-	if !slices.Equal(requests[1].Context, []string{"plan Kyoto", "vacation-planner answer"}) {
+	if !slices.Equal(requests[1].Context, []string{"plan Kyoto", "Kyoto instead", "vacation-planner answer"}) {
 		t.Fatalf("selected prior context = %#v", requests[1].Context)
 	}
-	input := agentruntime.RunInput{Store: store, ThreadID: "new", Text: "swap", TargetJourney: "vacation-planner"}
-	if _, _, err := store.Admit(t.Context(), journal.Command{ThreadID: "new", RunID: "new", CommunicationID: "new", Principal: "alice", Text: "swap", TargetJourney: "vacation-planner"}); err != nil {
+	if got := requests[1].Provenance.ContextInputs; len(got) != 2 || got[0].ID != "vacation" || got[1].ID != "vacation-correction" || got[0].Digest == "" || got[1].Digest == "" {
+		t.Fatalf("selected context provenance = %#v", got)
+	}
+	command := journal.Command{ThreadID: "new", RunID: "new", CommunicationID: "new", Principal: "alice", Text: "swap", TargetJourney: "vacation-planner"}
+	if _, _, err := store.Admit(t.Context(), command); err != nil {
 		t.Fatal(err)
 	}
+	input := agentruntime.RunInput{Store: store, Owner: claimForTest(t, store, command, false), ThreadID: "new", Text: "swap", TargetJourney: "vacation-planner"}
 	if journey, _, err := runner.Binding(t.Context(), input); err != nil || journey != "vacation-planner" {
 		t.Fatalf("explicit route = %q, %v", journey, err)
 	}
@@ -314,7 +328,7 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 	})
 	endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return sdk }, nil))
 	t.Cleanup(endpoint.Close)
-	makeVersion := func(prompt, body string) string {
+	makeVersion := func(serverName, prompt, body string) string {
 		root := t.TempDir()
 		path := writeDefinitionBundle(t, root, prompt)
 		config, err := os.ReadFile(path)
@@ -322,6 +336,8 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 			t.Fatal(err)
 		}
 		config = []byte(strings.Replace(string(config), "http://example", endpoint.URL, 1))
+		config = []byte(strings.ReplaceAll(string(config), `"id":"s"`, fmt.Sprintf(`"id":%q`, serverName)))
+		config = []byte(strings.ReplaceAll(string(config), `"server":"s"`, fmt.Sprintf(`"server":%q`, serverName)))
 		if err := os.WriteFile(path, config, 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -336,7 +352,7 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 		}
 		return path
 	}
-	oldPath, newPath := makeVersion("old system\n", "old skill body"), makeVersion("new system\n", "new skill body")
+	oldPath, newPath := makeVersion("legacy", "old system\n", "old skill body"), makeVersion("current", "new system\n", "new skill body")
 	oldRegistry, err := definitions.Load(oldPath)
 	if err != nil {
 		t.Fatal(err)
@@ -401,12 +417,76 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 		t.Fatalf("clarification reply provenance = %#v", clarification)
 	}
 	for _, request := range requests[:2] {
-		if request.DefinitionDigest != oldJourney.Digest || request.Instructions != "old system" || len(request.SkillMaterial) != 1 || !strings.Contains(string(request.SkillMaterial[0].Body), "old skill body") {
+		if request.DefinitionDigest != oldJourney.Digest || request.Instructions != "old system" || len(request.SkillCatalog) != 1 || request.SkillCatalog[0].Name != "planner" || len(request.SkillMaterial) != 0 {
 			t.Fatalf("awaiting session fell forward: %#v", request)
 		}
 	}
 	request := requests[2]
-	if request.DefinitionDigest != newJourney.Digest || request.Instructions != "new system" || len(request.SkillMaterial) != 1 || !strings.Contains(string(request.SkillMaterial[0].Body), "new skill body") {
+	if request.DefinitionDigest != newJourney.Digest || request.Instructions != "new system" || len(request.SkillCatalog) != 1 || request.SkillCatalog[0].Name != "planner" || len(request.SkillMaterial) != 0 {
 		t.Fatalf("new session missed current: %#v", request)
+	}
+}
+
+func TestSkillRuntimeLoadsOnlySelectedMaterial(t *testing.T) {
+	sdk := mcp.NewServer(&mcp.Implementation{Name: "skill-selection", Version: "1"}, nil)
+	mcp.AddTool(sdk, &mcp.Tool{Name: "lookup"}, func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
+		return nil, struct{}{}, nil
+	})
+	endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return sdk }, nil))
+	t.Cleanup(endpoint.Close)
+	root := t.TempDir()
+	path := writeDefinitionBundle(t, root, "prompt\n")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Replace(string(data), "http://example", endpoint.URL, 1)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := definitions.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requests []agentruntime.ModelRequest
+	model := modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+		requests = append(requests, request)
+		switch len(requests) {
+		case 1:
+			if len(request.SkillCatalog) != 1 || len(request.SkillMaterial) != 0 {
+				t.Fatalf("initial skill payload = %#v %#v", request.SkillCatalog, request.SkillMaterial)
+			}
+			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "load", Name: "load_skill", Arguments: json.RawMessage(`{"skillName":"planner"}`)}}, nil
+		case 2:
+			if len(request.SkillMaterial) != 1 || request.SkillMaterial[0].Resource != "SKILL.md" || !strings.Contains(string(request.SkillMaterial[0].Body), "Use the destination tool") || len(request.Provenance.Skills) != 1 {
+				t.Fatalf("selected instructions = %#v %#v", request.SkillMaterial, request.Provenance.Skills)
+			}
+			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "resource", Name: "read_skill_resource", Arguments: json.RawMessage(`{"skillName":"planner","resourceName":"guide.md"}`)}}, nil
+		default:
+			if len(request.SkillMaterial) != 2 || request.SkillMaterial[1].Resource != "guide.md" || string(request.SkillMaterial[1].Body) != "Prefer direct routes.\n" || len(request.Provenance.Skills) != 2 {
+				t.Fatalf("selected resource = %#v %#v", request.SkillMaterial, request.Provenance.Skills)
+			}
+			return agentruntime.ModelResponse{Text: "done"}, nil
+		}
+	})
+	store := journal.New(database(t))
+	command := journal.Command{ThreadID: "skill-select", RunID: "skill-select", CommunicationID: "skill-select", Principal: "alice", Text: "plan"}
+	if _, _, err := store.Admit(t.Context(), command); err != nil {
+		t.Fatal(err)
+	}
+	owner := claimForTest(t, store, command, false)
+	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model)
+	input := agentruntime.RunInput{Store: store, Owner: owner, ThreadID: command.ThreadID, RunID: command.RunID, Text: command.Text}
+	journey, digest, err := runner.Binding(t.Context(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.TargetJourney, input.DefinitionDigest = journey, digest
+	input.History, err = store.Start(t.Context(), owner, journey, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := runner.Run(t.Context(), input)
+	if err != nil || output.Answer != "done" || len(requests) != 3 {
+		t.Fatalf("skill selection run = %#v requests=%d err=%v", output, len(requests), err)
 	}
 }

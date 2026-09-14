@@ -21,6 +21,30 @@ func (questionTool) Name() string { return "request_user_input" }
 func (questionTool) Description() string {
 	return "Ask one to three structured clarification questions. An answer never approves a business action."
 }
+
+type loadSkillTool struct{}
+
+func (loadSkillTool) Name() string        { return "load_skill" }
+func (loadSkillTool) Description() string { return "Load the instructions for one available skill." }
+func (loadSkillTool) ReturnSchema() any   { return nil }
+func (loadSkillTool) Schema() any {
+	var schema any
+	_ = json.Unmarshal([]byte(`{"type":"object","additionalProperties":false,"required":["skillName"],"properties":{"skillName":{"type":"string"}}}`), &schema)
+	return schema
+}
+
+type readSkillResourceTool struct{}
+
+func (readSkillResourceTool) Name() string { return "read_skill_resource" }
+func (readSkillResourceTool) Description() string {
+	return "Read one declared supporting file from an available skill."
+}
+func (readSkillResourceTool) ReturnSchema() any { return nil }
+func (readSkillResourceTool) Schema() any {
+	var schema any
+	_ = json.Unmarshal([]byte(`{"type":"object","additionalProperties":false,"required":["skillName","resourceName"],"properties":{"skillName":{"type":"string"},"resourceName":{"type":"string"}}}`), &schema)
+	return schema
+}
 func (questionTool) ReturnSchema() any { return nil }
 func (questionTool) Schema() any {
 	var schema any
@@ -64,20 +88,17 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 	}()
 	var pending []journal.Input
 	var selected []string
+	var selectedInputs []journal.Input
 	var requestHistory json.RawMessage
 	skillSource := platformskills.New(journey)
 	skillCatalog := skillSource.Catalog()
 	var skillMaterial []platformskills.Material
-	for _, metadata := range skillCatalog {
-		material, err := skillSource.Read(metadata.Name, "SKILL.md")
-		if err != nil {
-			return RunOutput{}, err
-		}
-		skillMaterial = append(skillMaterial, material)
-	}
 	// The pinned graph resumes each outstanding tool result separately. The product
 	// owns batching and durable waiting; a bare MAF agent handles one provider turn.
 	tools := append(funcsAsTools(bound.Tools()), tool.Tool(questionTool{}))
+	if len(skillCatalog) > 0 {
+		tools = append(tools, loadSkillTool{}, readSkillResourceTool{})
+	}
 	inner := agent.New(agent.ProviderConfig{ProviderName: "configured-model", Run: modelRun(ctx, r.model, stableCallID(in.ThreadID, in.RunID), func(ctx context.Context, req *ModelRequest) error {
 		req.Handoff = Handoff{JourneyID: journey.ID, Text: in.Text}
 		req.Context = selected
@@ -101,6 +122,12 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 			item := MaterialProvenance{ID: command.CommunicationID, Digest: command.Digest}
 			req.Provenance.Pending = append(req.Provenance.Pending, item)
 			req.Provenance.IncludedInput = append(req.Provenance.IncludedInput, item)
+		}
+		for _, input := range selectedInputs {
+			req.Provenance.ContextInputs = append(req.Provenance.ContextInputs, MaterialProvenance{ID: input.CommunicationID, Digest: input.Digest})
+		}
+		for _, material := range req.SkillMaterial {
+			req.Provenance.Skills = append(req.Provenance.Skills, MaterialProvenance{ID: material.Name + "/" + material.Resource, Digest: material.FileDigest})
 		}
 		return in.Store.Check(ctx, in.Owner)
 	}, func(ctx context.Context) error { return in.Store.Included(ctx, in.Owner, pending) })}, agent.Config{ID: "journey:" + journey.ID, Name: journey.ID, Description: journey.Description, Tools: tools, RunOptions: []agent.Option{agent.WithInstructions(journey.Prompt)}})
@@ -141,6 +168,7 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 		}
 		pending = inbox.Commands
 		selected = inbox.Context
+		selectedInputs = inbox.ContextInputs
 		requestHistory, err = json.Marshal(history)
 		if err != nil {
 			return nil, err
@@ -187,6 +215,22 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 		}
 		for index, call := range calls {
 			callNumber++
+			if call.Name == "load_skill" || call.Name == "read_skill_resource" {
+				var arguments struct {
+					SkillName    string `json:"skillName"`
+					ResourceName string `json:"resourceName,omitempty"`
+				}
+				if err := journal.DecodeStrict([]byte(call.Arguments), &arguments); err != nil || arguments.SkillName == "" || call.Name == "read_skill_resource" && arguments.ResourceName == "" || call.Name == "load_skill" && arguments.ResourceName != "" {
+					return RunOutput{}, journal.ErrState
+				}
+				material, err := skillSource.Read(arguments.SkillName, arguments.ResourceName)
+				if err != nil {
+					return RunOutput{}, err
+				}
+				skillMaterial = append(skillMaterial, material)
+				history = append(history, resultMessage(call.CallID, string(material.Body)))
+				continue
+			}
 			binding, err := journal.ActionBinding(call.Name, []byte(call.Arguments))
 			if err != nil {
 				return RunOutput{}, err

@@ -6,7 +6,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func (s *Store) ResolveDefinition(ctx context.Context, thread, journey, bootstrap string) (string, error) {
+func (s *Store) ResolveDefinition(ctx context.Context, o Owner, journey, bootstrap string) (string, error) {
 	if len(bootstrap) != 64 {
 		return "", ErrDefinition
 	}
@@ -15,6 +15,10 @@ func (s *Store) ResolveDefinition(ctx context.Context, thread, journey, bootstra
 		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(789134628)"); err != nil {
 			return err
 		}
+		if err := lockOwner(ctx, tx, o); err != nil {
+			return err
+		}
+		thread := o.Command.ThreadID
 		err := tx.QueryRow(ctx, "SELECT definition_digest FROM agent_sessions WHERE thread_id=$1 AND journey_id=$2", thread, journey).Scan(&digest)
 		if err == nil {
 			return nil

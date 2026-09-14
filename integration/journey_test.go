@@ -110,7 +110,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	}
 	model := modelFunc(func(_ context.Context, req agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		if len(req.ToolResults) == 0 {
-			if got := toolNames(req.Tools); !slices.Equal(got, []string{"lookup_destination", "request_user_input"}) {
+			if got := toolNames(req.Tools); !slices.Equal(got, []string{"lookup_destination", "request_user_input", "load_skill", "read_skill_resource"}) {
 				t.Fatalf("model tools = %v", got)
 			}
 			if slices.Contains(req.Messages, "hello") {

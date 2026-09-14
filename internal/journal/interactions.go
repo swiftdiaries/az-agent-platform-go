@@ -312,8 +312,19 @@ func (s *Store) reply(ctx context.Context, c Command) (Receipt, bool, error) {
 		if err = appendEvent(ctx, tx, c.ThreadID, Event{RunID: oldRun, Type: "interaction.consumed"}); err != nil {
 			return err
 		}
+		if err = appendEvent(ctx, tx, c.ThreadID, Event{RunID: c.RunID, Type: "command.accepted", CommunicationID: c.CommunicationID}); err != nil {
+			return err
+		}
+		if i.Kind == "approval" && answer.Decision == "approve" {
+			if _, err = tx.Exec(ctx, "UPDATE agent_commands SET terminal_reason='consumed' WHERE thread_id=$1 AND communication_id=$2", c.ThreadID, c.CommunicationID); err != nil {
+				return err
+			}
+			if err = appendEvent(ctx, tx, c.ThreadID, Event{RunID: c.RunID, Type: "command.consumed", CommunicationID: c.CommunicationID}); err != nil {
+				return err
+			}
+		}
 		fresh = true
-		return appendEvent(ctx, tx, c.ThreadID, Event{RunID: c.RunID, Type: "command.accepted", CommunicationID: c.CommunicationID})
+		return nil
 	})
 	if err == nil && expired {
 		err = ErrConflict

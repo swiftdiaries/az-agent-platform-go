@@ -54,7 +54,7 @@ type ModelRequest struct {
 
 type RequestProvenance struct {
 	Definition, System, Handoff, Catalog, Context, History MaterialProvenance
-	Pending, IncludedInput                                 []MaterialProvenance
+	Pending, IncludedInput, ContextInputs, Skills          []MaterialProvenance
 }
 
 type MaterialProvenance struct{ ID, Digest string }
@@ -117,7 +117,7 @@ func (r *Runner) Binding(ctx context.Context, in RunInput) (string, string, erro
 	if in.Store == nil {
 		return "", "", journal.ErrDefinition
 	}
-	digest, err := in.Store.ResolveDefinition(ctx, in.ThreadID, journey.ID, journey.Digest)
+	digest, err := in.Store.ResolveDefinition(ctx, in.Owner, journey.ID, journey.Digest)
 	if err != nil {
 		return "", "", err
 	}
@@ -138,7 +138,7 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 		attribute.String("journey.id", journey.ID),
 	)
 	defer span.End()
-	server, ok := r.definitions.Server(journey.MCP.Server)
+	server, ok := r.definitions.ServerFor(input.DefinitionDigest)
 	if !ok {
 		return RunOutput{}, fmt.Errorf("journey MCP server is unavailable")
 	}
@@ -255,23 +255,4 @@ func cloneSkillMaterial(in []platformskills.Material) []platformskills.Material 
 		out[i].Body = append([]byte(nil), material.Body...)
 	}
 	return out
-}
-
-// TransientHeaders copies only names approved for the selected MCP server.
-func (r *Runner) TransientHeaders(ctx context.Context, target, text string, inbound http.Header) http.Header {
-	result := make(http.Header)
-	journey, err := r.route(ctx, target, text)
-	if err != nil {
-		return result
-	}
-	server, ok := r.definitions.Server(journey.MCP.Server)
-	if !ok {
-		return result
-	}
-	for _, name := range server.ForwardHeaders {
-		for _, value := range inbound.Values(name) {
-			result.Add(name, value)
-		}
-	}
-	return result
 }

@@ -13,11 +13,13 @@ import (
 )
 
 const (
-	MaxPromptBytes     = 256 << 10
-	MaxConfigBytes     = 1 << 20
-	MaxSkillBytes      = 256 << 10
-	MaxSkillMetadata   = 8 << 10
-	MaxSupportingBytes = 1 << 20
+	MaxPromptBytes        = 256 << 10
+	MaxConfigBytes        = 1 << 20
+	MaxSkillBytes         = 256 << 10
+	MaxSkillMetadata      = 8 << 10
+	MaxSupportingBytes    = 1 << 20
+	MaxCompiledSkillBytes = 8 << 20
+	MaxCompiledSkillFiles = 256
 )
 
 type MCPServer struct {
@@ -81,11 +83,13 @@ type SkillPackage struct {
 }
 
 type Registry struct {
-	servers   map[string]MCPServer
-	journeys  map[string]Journey
-	versions  map[string]Journey
-	canonical map[string][]byte
-	order     []string
+	servers                map[string]MCPServer
+	journeys               map[string]Journey
+	versions               map[string]Journey
+	versionServers         map[string]MCPServer
+	canonical              map[string][]byte
+	order                  []string
+	skillBytes, skillFiles int
 }
 
 // Load compiles one candidate configuration and optional retained configurations.
@@ -100,12 +104,29 @@ func Load(path string, retained ...string) (*Registry, error) {
 		if err != nil {
 			return nil, err
 		}
+		retain := false
+		for digest := range old.versions {
+			_, exists := registry.versions[digest]
+			retain = retain || !exists
+		}
+		if retain && (registry.skillBytes > MaxCompiledSkillBytes-old.skillBytes || registry.skillFiles > MaxCompiledSkillFiles-old.skillFiles) {
+			return nil, fmt.Errorf("retained skill bundles exceed aggregate limits")
+		}
+		if retain {
+			registry.skillBytes += old.skillBytes
+			registry.skillFiles += old.skillFiles
+		}
 		for digest, journey := range old.versions {
+			server, ok := old.versionServers[digest]
+			if !ok {
+				return nil, fmt.Errorf("definition %s has no MCP server binding", digest)
+			}
 			if existing, ok := registry.canonical[digest]; ok && !bytes.Equal(existing, old.canonical[digest]) {
 				return nil, fmt.Errorf("definition digest collision %s", digest)
 			}
 			if _, ok := registry.versions[digest]; !ok {
 				registry.versions[digest] = journey
+				registry.versionServers[digest] = cloneServer(server)
 				registry.canonical[digest] = bytes.Clone(old.canonical[digest])
 			}
 		}
@@ -132,7 +153,7 @@ func loadOne(path string) (*Registry, error) {
 		return nil, fmt.Errorf("decode journey config: trailing value")
 	}
 
-	registry := &Registry{servers: make(map[string]MCPServer), journeys: make(map[string]Journey), versions: make(map[string]Journey), canonical: make(map[string][]byte)}
+	registry := &Registry{servers: make(map[string]MCPServer), journeys: make(map[string]Journey), versions: make(map[string]Journey), versionServers: make(map[string]MCPServer), canonical: make(map[string][]byte)}
 	for _, server := range raw.MCPServers {
 		if server.ID == "" || server.Endpoint == "" {
 			return nil, fmt.Errorf("MCP server id and endpoint are required")
@@ -204,6 +225,12 @@ func loadOne(path string) (*Registry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("skill %q: %w", declaration.Name, err)
 		}
+		compiledBytes, compiledFiles := skillFootprint(compiled)
+		if registry.skillBytes > MaxCompiledSkillBytes-compiledBytes || registry.skillFiles > MaxCompiledSkillFiles-compiledFiles {
+			return nil, fmt.Errorf("compiled skill bundles exceed aggregate limits")
+		}
+		registry.skillBytes += compiledBytes
+		registry.skillFiles += compiledFiles
 		packages[declaration.Name] = compiled
 	}
 	for _, journey := range raw.Journeys {
@@ -260,7 +287,7 @@ func loadOne(path string) (*Registry, error) {
 				return nil, fmt.Errorf("journey %q references missing or duplicate skill %q", journey.ID, name)
 			}
 			seenSkills[name] = true
-			journey.Skills = append(journey.Skills, cloneSkill(skill))
+			journey.Skills = append(journey.Skills, skill)
 		}
 		canonical, err := json.Marshal(struct {
 			ID, Description, Server, Prompt string
@@ -282,6 +309,7 @@ func loadOne(path string) (*Registry, error) {
 			return nil, fmt.Errorf("definition digest collision %s", journey.Digest)
 		}
 		registry.versions[journey.Digest] = journey
+		registry.versionServers[journey.Digest] = cloneServer(server)
 		registry.canonical[journey.Digest] = bytes.Clone(canonical)
 		registry.order = append(registry.order, journey.ID)
 	}

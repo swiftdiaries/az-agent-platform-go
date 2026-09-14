@@ -486,6 +486,15 @@ func TestApprovalFreshCredentialsAndRejectedReplies(t *testing.T) {
 				if len(calls) != 1 || calls[0].authorization != "fresh-live-auth" {
 					t.Fatal("approval did not use fresh owner credentials")
 				}
+				var included bool
+				var reason string
+				if err := pool.QueryRow(t.Context(), "SELECT included,terminal_reason FROM agent_commands WHERE communication_id=$1", reply.CommunicationID).Scan(&included, &reason); err != nil || included || reason != "consumed" {
+					t.Fatalf("approval input disposition included=%v reason=%q err=%v", included, reason, err)
+				}
+				var includedEvents, consumedEvents int
+				if err := pool.QueryRow(t.Context(), "SELECT count(*) FILTER (WHERE kind='command.included'),count(*) FILTER (WHERE kind='command.consumed') FROM agent_events WHERE communication_id=$1", reply.CommunicationID).Scan(&includedEvents, &consumedEvents); err != nil || includedEvents != 0 || consumedEvents != 1 {
+					t.Fatalf("approval input events included=%d consumed=%d err=%v", includedEvents, consumedEvents, err)
+				}
 			} else if len(calls) != 0 {
 				t.Fatal("non-approval dispatched")
 			}

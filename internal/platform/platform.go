@@ -132,7 +132,7 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 				}
 			}
 		}
-		headers := p.runner.TransientHeaders(ctx, target, c.Text, submission.Headers)
+		headers := submission.Headers.Clone()
 		transferred = true
 		go func() {
 			defer p.workers.Done()
