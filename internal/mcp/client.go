@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"slices"
 
@@ -40,7 +41,7 @@ func (c *Client) Bind(ctx context.Context, server definitions.MCPServer, allowed
 	}
 	httpClient := &http.Client{
 		Transport: &headerTransport{
-			base: http.DefaultTransport, headers: forwarded, callIDHeader: server.CallIDHeader,
+			base: http.DefaultTransport, headers: forwarded, callIDHeader: server.CallIDHeader, lifetime: ctx,
 		},
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -102,13 +103,20 @@ func (b *Bound) Close() error { return b.session.Close() }
 type callIDKey struct{}
 
 type headerTransport struct {
+	lifetime     context.Context
 	base         http.RoundTripper
 	headers      http.Header
 	callIDHeader string
 }
 
 func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	clone := req.Clone(req.Context())
+	ctx, cancel := context.WithCancel(req.Context())
+	stop := context.AfterFunc(t.lifetime, cancel)
+	if t.lifetime.Err() != nil {
+		cancel()
+	}
+	release := func() { stop(); cancel() }
+	clone := req.Clone(ctx)
 	clone.Header = req.Header.Clone()
 	for name, values := range t.headers {
 		clone.Header.Del(name)
@@ -122,9 +130,26 @@ func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 	response, err := t.base.RoundTrip(clone)
+	if err != nil {
+		release()
+	} else {
+		response.Body = &sessionBody{ReadCloser: response.Body, release: release}
+	}
 	if err == nil && (response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) {
 		response.Body.Close()
 		return nil, ErrAuthRequired
 	}
 	return response, err
+}
+
+// SDK session cleanup/reconnect can outlive the request context. Keep HTTP bodies
+// usable until Close, but cancel every session request when the owning run ends.
+type sessionBody struct {
+	io.ReadCloser
+	release func()
+}
+
+func (b *sessionBody) Close() error {
+	defer b.release()
+	return b.ReadCloser.Close()
 }

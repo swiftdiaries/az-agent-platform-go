@@ -7,18 +7,12 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func (s *Store) Start(ctx context.Context, c Command, journey, digest string) (json.RawMessage, error) {
+func (s *Store) Start(ctx context.Context, o Owner, journey, digest string) (json.RawMessage, error) {
+	c := o.Command
 	var history json.RawMessage
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := lockConversation(ctx, tx, c.ThreadID, c.Principal); err != nil {
+		if err := lockOwner(ctx, tx, o); err != nil {
 			return err
-		}
-		var state RunState
-		if err := tx.QueryRow(ctx, "SELECT state FROM agent_runs WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID).Scan(&state); err != nil {
-			return err
-		}
-		if state != RunPending {
-			return ErrState
 		}
 		if _, err := tx.Exec(ctx, "INSERT INTO agent_sessions(thread_id,journey_id,definition_digest) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", c.ThreadID, journey, digest); err != nil {
 			return err
@@ -30,31 +24,41 @@ func (s *Store) Start(ctx context.Context, c Command, journey, digest string) (j
 		if pinned != digest {
 			return ErrDefinition
 		}
-		if _, err := tx.Exec(ctx, "UPDATE agent_runs SET state='running',journey_id=$3,definition_digest=$4 WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID, journey, digest); err != nil {
+		result, err := tx.Exec(ctx, "UPDATE agent_runs SET journey_id=$3,definition_digest=$4 WHERE thread_id=$1 AND id=$2 AND (journey_id IS NULL OR journey_id=$3 AND definition_digest=$4)", c.ThreadID, c.RunID, journey, digest)
+		if err != nil {
 			return err
 		}
-		return appendEvent(ctx, tx, c.ThreadID, Event{RunID: c.RunID, Type: "run.started"})
+		if result.RowsAffected() != 1 {
+			return ErrDefinition
+		}
+		return nil
 	})
 	return history, err
 }
 
 // Finish atomically stores provider history and terminal lifecycle events. External
-// calls never occur in this transaction. Task 3 adds epoch and lease fencing.
-func (s *Store) Finish(ctx context.Context, c Command, state RunState, history json.RawMessage, answer, callID, tool string) error {
+// calls never occur in this transaction. Admission shares this conversation lock.
+func (s *Store) Finish(ctx context.Context, o Owner, state RunState, history json.RawMessage, answer, callID, tool string) error {
+	c := o.Command
 	if state != RunCompleted && state != RunFailed && state != RunAuthRequired {
 		return ErrState
 	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := lockConversation(ctx, tx, c.ThreadID, c.Principal); err != nil {
+		if err := lockOwner(ctx, tx, o); err != nil {
 			return err
 		}
-		var current RunState
 		var journey string
-		if err := tx.QueryRow(ctx, "SELECT state,COALESCE(journey_id,'') FROM agent_runs WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID).Scan(&current, &journey); err != nil {
+		if err := tx.QueryRow(ctx, "SELECT COALESCE(journey_id,'') FROM agent_runs WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID).Scan(&journey); err != nil {
 			return err
 		}
-		if current != RunRunning && !(current == RunPending && state != RunCompleted) {
-			return ErrState
+		if state == RunCompleted {
+			var pending bool
+			if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM agent_commands WHERE thread_id=$1 AND execution_run_id=$2 AND NOT included)", c.ThreadID, c.RunID).Scan(&pending); err != nil {
+				return err
+			}
+			if pending {
+				return ErrPending
+			}
 		}
 		if state == RunCompleted {
 			if _, err := tx.Exec(ctx, "UPDATE agent_sessions SET history=$3 WHERE thread_id=$1 AND journey_id=$2", c.ThreadID, journey, history); err != nil {

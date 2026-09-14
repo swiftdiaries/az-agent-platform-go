@@ -9,6 +9,8 @@ import (
 )
 
 var (
+	ErrOwnership  = errors.New("run ownership lost")
+	ErrPending    = errors.New("pending commands require another provider request")
 	ErrConflict   = errors.New("communication ID conflicts with accepted command")
 	ErrForbidden  = errors.New("conversation is unavailable to principal")
 	ErrBusy       = errors.New("conversation already has a live run")
@@ -19,6 +21,7 @@ var (
 type RunState string
 
 const (
+	RunInterrupted  RunState = "interrupted"
 	RunPending      RunState = "pending"
 	RunRunning      RunState = "running"
 	RunCompleted    RunState = "completed"
@@ -29,14 +32,18 @@ const (
 type Command struct{ ThreadID, RunID, CommunicationID, Principal, Text, TargetJourney string }
 type Receipt struct {
 	ThreadID, RunID, CommunicationID string
+	ExecutionRunID                   string
 	State                            RunState
 	Answer                           string
 }
 type Event struct {
 	Sequence                              int64
 	Type, RunID, CallID, ToolName, Answer string
+	CommunicationID                       string
 }
 type Run struct {
+	CommandRunIDs     []string
+	PendingCommands   int
 	RunID             string
 	State             RunState
 	JourneyID, Answer string
@@ -67,6 +74,6 @@ func appendEvent(ctx context.Context, tx pgx.Tx, thread string, e Event) error {
 	if err := tx.QueryRow(ctx, "UPDATE agent_conversations SET sequence=sequence+1 WHERE id=$1 RETURNING sequence", thread).Scan(&sequence); err != nil {
 		return err
 	}
-	_, err := tx.Exec(ctx, "INSERT INTO agent_events(thread_id,sequence,run_id,kind,call_id,tool_name,answer) VALUES($1,$2,$3,$4,$5,$6,$7)", thread, sequence, e.RunID, e.Type, e.CallID, e.ToolName, e.Answer)
+	_, err := tx.Exec(ctx, "INSERT INTO agent_events(thread_id,sequence,run_id,kind,call_id,tool_name,answer,communication_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)", thread, sequence, e.RunID, e.Type, e.CallID, e.ToolName, e.Answer, e.CommunicationID)
 	return err
 }

@@ -1,0 +1,14 @@
+ALTER TABLE agent_conversations ADD COLUMN owner_epoch bigint NOT NULL DEFAULT 0;
+ALTER TABLE agent_runs DROP CONSTRAINT agent_runs_state_check;
+ALTER TABLE agent_runs ADD CHECK (state IN ('pending','running','completed','failed','auth_required','interrupted'));
+ALTER TABLE agent_runs ADD COLUMN owner_id text NOT NULL DEFAULT '';
+ALTER TABLE agent_runs ADD COLUMN owner_epoch bigint NOT NULL DEFAULT 0;
+ALTER TABLE agent_runs ADD COLUMN lease_until timestamptz NOT NULL DEFAULT clock_timestamp() + interval '15 seconds';
+ALTER TABLE agent_commands ADD COLUMN execution_run_id text;
+UPDATE agent_commands SET execution_run_id=run_id;
+ALTER TABLE agent_commands ALTER COLUMN execution_run_id SET NOT NULL;
+ALTER TABLE agent_commands ADD FOREIGN KEY (thread_id,execution_run_id) REFERENCES agent_runs(thread_id,id) DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE agent_commands ADD COLUMN ordinal bigint GENERATED ALWAYS AS IDENTITY;
+ALTER TABLE agent_commands ADD COLUMN included boolean NOT NULL DEFAULT false;
+UPDATE agent_commands SET included=true FROM agent_runs WHERE agent_runs.id=agent_commands.run_id AND agent_runs.state IN ('completed','failed','auth_required');
+ALTER TABLE agent_events ADD COLUMN communication_id text NOT NULL DEFAULT '';

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -132,12 +133,13 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	snapshot := observation.Snapshot
 	var current platform.Run
 	for _, candidate := range snapshot.Runs {
-		if candidate.RunID == run {
+		if candidate.RunID == run || slices.Contains(candidate.CommandRunIDs, run) {
+			run = candidate.RunID
 			current = candidate
 			break
 		}
 	}
-	if !emit(events.NewStateSnapshotEvent(map[string]any{"threadId": input.ThreadID, "watermark": snapshot.Watermark, "journeyId": current.JourneyID, "runState": current.State, "answer": current.Answer}), max(cursor, snapshot.Watermark)) {
+	if !emit(events.NewStateSnapshotEvent(map[string]any{"threadId": input.ThreadID, "watermark": snapshot.Watermark, "journeyId": current.JourneyID, "runState": current.State, "pendingCommands": current.PendingCommands, "answer": current.Answer}), max(cursor, snapshot.Watermark)) {
 		return
 	}
 	terminal := func(e platform.Event, sequence int64) bool {
@@ -148,15 +150,19 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case "run.completed":
 			emit(events.NewRunFinishedEvent(input.ThreadID, input.RunID), sequence)
 			return true
-		case "run.failed", "auth_required":
+		case "run.failed", "auth_required", "run.interrupted":
 			code := "internal_error"
+			if e.Type == "run.interrupted" {
+				code = "interrupted"
+			}
 			if e.Type == "auth_required" {
 				code = "auth_required"
 			}
 			emit(events.NewRunErrorEvent("run could not complete", events.WithErrorCode(code), events.WithRunID(input.RunID)), sequence)
 			return true
+		default:
+			return !emit(events.NewCustomEvent(e.Type, events.WithValue(map[string]any{"communicationId": e.CommunicationID})), sequence)
 		}
-		return false
 	}
 	// Project completed state directly from Agent run records, not replay events.
 	if current.Answer != "" {
@@ -167,6 +173,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch current.State {
 	case platform.RunCompleted:
 		terminal(platform.Event{Type: "run.completed"}, 0)
+		return
+	case platform.RunInterrupted:
+		terminal(platform.Event{Type: "run.interrupted"}, 0)
 		return
 	case platform.RunFailed:
 		terminal(platform.Event{Type: "run.failed"}, 0)

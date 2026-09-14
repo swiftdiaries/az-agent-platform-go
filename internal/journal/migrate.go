@@ -25,29 +25,34 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		if err := tx.QueryRow(ctx, "SELECT COALESCE(max(version),0) FROM agent_schema_migrations").Scan(&version); err != nil {
 			return err
 		}
-		if version > 1 {
+		names := []string{"000001_conversations.sql", "000002_ownership.sql"}
+		if version > len(names) {
 			return fmt.Errorf("database schema is newer than this binary")
 		}
-		data, err := migrations.ReadFile("migrations/000001_conversations.sql")
-		if err != nil {
-			return err
-		}
-		checksum := fmt.Sprintf("%x", sha256.Sum256(data))
-		var existing string
-		err = tx.QueryRow(ctx, "SELECT checksum FROM agent_schema_migrations WHERE version=1").Scan(&existing)
-		if err == nil {
-			if existing != checksum {
-				return fmt.Errorf("migration 1 checksum changed")
+		for i, name := range names {
+			data, err := migrations.ReadFile("migrations/" + name)
+			if err != nil {
+				return err
 			}
-			return nil
+			checksum := fmt.Sprintf("%x", sha256.Sum256(data))
+			var existing string
+			err = tx.QueryRow(ctx, "SELECT checksum FROM agent_schema_migrations WHERE version=$1", i+1).Scan(&existing)
+			if err == nil {
+				if existing != checksum {
+					return fmt.Errorf("migration %d checksum changed", i+1)
+				}
+				continue
+			}
+			if err != pgx.ErrNoRows {
+				return err
+			}
+			if _, err = tx.Exec(ctx, string(data)); err != nil {
+				return err
+			}
+			if _, err = tx.Exec(ctx, "INSERT INTO agent_schema_migrations VALUES($1,$2)", i+1, checksum); err != nil {
+				return err
+			}
 		}
-		if err != pgx.ErrNoRows {
-			return err
-		}
-		if _, err = tx.Exec(ctx, string(data)); err != nil {
-			return err
-		}
-		_, err = tx.Exec(ctx, "INSERT INTO agent_schema_migrations VALUES(1,$1)", checksum)
-		return err
+		return nil
 	})
 }

@@ -16,13 +16,13 @@ func (s *Store) Snapshot(ctx context.Context, thread, principal string) (Snapsho
 			}
 			return err
 		}
-		rows, err := tx.Query(ctx, "SELECT id,state,COALESCE(journey_id,''),answer FROM agent_runs WHERE thread_id=$1", thread)
+		rows, err := tx.Query(ctx, "SELECT id,state,COALESCE(journey_id,''),answer,ARRAY(SELECT run_id FROM agent_commands c WHERE c.thread_id=r.thread_id AND c.execution_run_id=r.id ORDER BY ordinal),(SELECT count(*) FROM agent_commands c WHERE c.thread_id=r.thread_id AND c.execution_run_id=r.id AND NOT included) FROM agent_runs r WHERE thread_id=$1", thread)
 		if err != nil {
 			return err
 		}
 		for rows.Next() {
 			var run Run
-			if err := rows.Scan(&run.RunID, &run.State, &run.JourneyID, &run.Answer); err != nil {
+			if err := rows.Scan(&run.RunID, &run.State, &run.JourneyID, &run.Answer, &run.CommandRunIDs, &run.PendingCommands); err != nil {
 				rows.Close()
 				return err
 			}
@@ -68,7 +68,7 @@ type querier interface {
 }
 
 func readEvents(ctx context.Context, q querier, thread string, after int64) ([]Event, error) {
-	rows, err := q.Query(ctx, "SELECT sequence,kind,run_id,call_id,tool_name,answer FROM agent_events WHERE thread_id=$1 AND sequence>$2 ORDER BY sequence", thread, after)
+	rows, err := q.Query(ctx, "SELECT sequence,kind,run_id,call_id,tool_name,answer,communication_id FROM agent_events WHERE thread_id=$1 AND sequence>$2 ORDER BY sequence", thread, after)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +76,7 @@ func readEvents(ctx context.Context, q querier, thread string, after int64) ([]E
 	result := []Event{}
 	for rows.Next() {
 		var e Event
-		if err = rows.Scan(&e.Sequence, &e.Type, &e.RunID, &e.CallID, &e.ToolName, &e.Answer); err != nil {
+		if err = rows.Scan(&e.Sequence, &e.Type, &e.RunID, &e.CallID, &e.ToolName, &e.Answer, &e.CommunicationID); err != nil {
 			return nil, err
 		}
 		result = append(result, e)

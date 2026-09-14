@@ -1,9 +1,9 @@
-// Package platform executes committed conversation commands in one development
-// process. PostgreSQL owns durable truth; Task 3 adds recoverable owner leases.
+// Package platform coordinates local execution against PostgreSQL owner leases.
 package platform
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -26,6 +26,7 @@ var (
 type RunState = journal.RunState
 
 const (
+	RunInterrupted  = journal.RunInterrupted
 	RunPending      = journal.RunPending
 	RunRunning      = journal.RunRunning
 	RunCompleted    = journal.RunCompleted
@@ -51,6 +52,7 @@ type Snapshot = journal.Snapshot
 type Run = journal.Run
 
 type Platform struct {
+	ownerID string
 	runner  *agentruntime.Runner
 	store   *journal.Store
 	ctx     context.Context
@@ -62,11 +64,26 @@ type Platform struct {
 
 func New(runner *agentruntime.Runner, store *journal.Store) *Platform {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Platform{runner: runner, store: store, ctx: ctx, cancel: cancel}
+	p := &Platform{runner: runner, store: store, ctx: ctx, cancel: cancel, ownerID: rand.Text()}
+	p.workers.Go(func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := store.Reap(ctx); err != nil && ctx.Err() == nil {
+					slog.ErrorContext(ctx, "run interruption check failed")
+				}
+			}
+		}
+	})
+	return p
 }
 
-// Close cancels local execution, leaving interrupted running records durable.
-// It provides no restart/takeover guarantee; interrupted owners belong to Task 3.
+// Close stops local work. Lease expiry records interruption without transferring
+// execution or claiming that an already dispatched remote call was canceled.
 func (p *Platform) Close() { p.mu.Lock(); p.closed = true; p.cancel(); p.mu.Unlock(); p.workers.Wait() }
 func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, error) {
 	c := submission.Command
@@ -101,37 +118,76 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 			defer cancel()
 			stop := context.AfterFunc(p.ctx, cancel)
 			defer stop()
-			p.execute(runCtx, c, headers)
+			p.execute(runCtx, c, agentruntime.RunInput{ThreadID: c.ThreadID, RunID: c.RunID, Principal: c.Principal, Text: c.Text, TargetJourney: c.TargetJourney, Headers: headers})
 		}()
 	}
 	return receipt, nil
 }
-func (p *Platform) execute(ctx context.Context, c Command, headers http.Header) {
-	in := agentruntime.RunInput{ThreadID: c.ThreadID, RunID: c.RunID, Principal: c.Principal, Text: c.Text, TargetJourney: c.TargetJourney, Headers: headers}
-	journey, digest, err := p.runner.Binding(ctx, in)
-	if err == nil {
-		in.History, err = p.store.Start(ctx, c.durable(), journey, digest)
-	}
-	var output agentruntime.RunOutput
-	if err == nil {
-		output, err = p.runner.Run(ctx, in)
-	}
-	if ctx.Err() != nil {
+func (p *Platform) execute(ctx context.Context, c Command, in agentruntime.RunInput) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	owner, err := p.store.Claim(ctx, c.durable(), p.ownerID, journal.LeaseDuration)
+	if err != nil {
 		return
 	}
-	state := RunCompleted
-	if err != nil {
-		state = RunFailed
-		if errors.Is(err, platformmcp.ErrAuthRequired) {
-			state = RunAuthRequired
+	renewalDone := make(chan struct{})
+	defer func() { cancel(); <-renewalDone }()
+	go func() {
+		defer close(renewalDone)
+		ticker := time.NewTicker(journal.LeaseDuration / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				renewCtx, stop := context.WithTimeout(ctx, journal.LeaseDuration/3)
+				err := p.store.Renew(renewCtx, owner, journal.LeaseDuration)
+				stop()
+				if err != nil {
+					cancel()
+					return
+				}
+			}
 		}
+	}()
+	in.Store = p.store
+	in.Owner = owner
+	journey, digest, err := p.runner.Binding(ctx, in)
+	if err == nil {
+		in.History, err = p.store.Start(ctx, owner, journey, digest)
+		in.TargetJourney = journey
 	}
-	// If this commit fails, the last committed state remains running. No answer is
-	// emitted until committed; durable recovery is explicitly outside this slice.
-	if err := p.store.Finish(ctx, c.durable(), state, output.History, output.Answer, output.CallID, output.ToolName); err != nil {
-		slog.ErrorContext(ctx, "run completion commit failed", "run.id", c.RunID)
+	for {
+		var output agentruntime.RunOutput
+		if err == nil {
+			output, err = p.runner.Run(ctx, in)
+		}
+		if ctx.Err() != nil || errors.Is(err, journal.ErrOwnership) {
+			return
+		}
+		state := RunCompleted
+		if err != nil {
+			state = RunFailed
+			if errors.Is(err, platformmcp.ErrAuthRequired) {
+				state = RunAuthRequired
+			}
+		}
+		finishErr := p.store.Finish(ctx, owner, state, output.History, output.Answer, output.CallID, output.ToolName)
+		if errors.Is(finishErr, journal.ErrPending) {
+			// Admission won the final-drain race. Continue with this live owner's
+			// credentials and in-memory history; no other replica can claim this run.
+			in.History = output.History
+			in.Iteration++
+			continue
+		}
+		if finishErr != nil {
+			slog.ErrorContext(ctx, "run completion commit failed", "run.id", c.RunID)
+		}
+		return
 	}
 }
+
 func (p *Platform) Snapshot(ctx context.Context, thread, principal string) (Snapshot, error) {
 	return p.store.Snapshot(ctx, thread, principal)
 }

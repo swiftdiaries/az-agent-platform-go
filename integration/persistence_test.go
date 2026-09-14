@@ -50,8 +50,8 @@ func TestAdmissionConcurrentDuplicates(t *testing.T) {
 	}
 	command.CommunicationID = "second"
 	command.RunID = "second"
-	if _, _, err := store.Admit(ctx, command); !errors.Is(err, journal.ErrBusy) {
-		t.Fatalf("second live run admitted: %v", err)
+	if receipt, fresh, err := store.Admit(ctx, command); err != nil || fresh || receipt.ExecutionRunID != "run" {
+		t.Fatalf("steering receipt: %+v %v %v", receipt, fresh, err)
 	}
 }
 
@@ -63,8 +63,9 @@ func TestPersistenceAtomicCompletion(t *testing.T) {
 	if _, _, err := store.Admit(ctx, c); err != nil {
 		t.Fatal(err)
 	}
+	owner := claimForTest(t, store, c, true)
 	digest := strings.Repeat("a", 64)
-	if history, err := store.Start(ctx, c, "planner", digest); err != nil || string(history) != "[]" {
+	if history, err := store.Start(ctx, owner, "planner", digest); err != nil || string(history) != "[]" {
 		t.Fatalf("start history %s: %v", history, err)
 	}
 	before, _ := store.Snapshot(ctx, "t", "alice")
@@ -83,7 +84,7 @@ func TestPersistenceAtomicCompletion(t *testing.T) {
 		return result
 	}
 	beforeFingerprint := fingerprint()
-	if err := store.Finish(ctx, c, journal.RunCompleted, []byte(`{}`), "answer", "", ""); err == nil {
+	if err := store.Finish(ctx, owner, journal.RunCompleted, []byte(`{}`), "answer", "", ""); err == nil {
 		t.Fatal("non-array history committed")
 	}
 	after, _ := store.Snapshot(ctx, "t", "alice")
@@ -98,7 +99,7 @@ func TestPersistenceAtomicCompletion(t *testing.T) {
  CREATE TRIGGER reject_completion BEFORE UPDATE ON agent_runs FOR EACH ROW EXECUTE FUNCTION reject_completion()`); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Finish(ctx, c, journal.RunCompleted, []byte(`[{"role":"assistant"}]`), "answer", "call", "tool"); err == nil {
+	if err := store.Finish(ctx, owner, journal.RunCompleted, []byte(`[{"role":"assistant"}]`), "answer", "call", "tool"); err == nil {
 		t.Fatal("injected completion failure accepted")
 	}
 	if beforeFingerprint != fingerprint() {
@@ -107,11 +108,11 @@ func TestPersistenceAtomicCompletion(t *testing.T) {
 	if _, err := pool.Exec(ctx, "DROP TRIGGER reject_completion ON agent_runs; DROP FUNCTION reject_completion()"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Finish(ctx, c, journal.RunCompleted, []byte(`[{"role":"assistant"}]`), "answer", "call", "tool"); err != nil {
+	if err := store.Finish(ctx, owner, journal.RunCompleted, []byte(`[{"role":"assistant"}]`), "answer", "call", "tool"); err != nil {
 		t.Fatal(err)
 	}
 	after, _ = store.Snapshot(ctx, "t", "alice")
-	if after.RunState != journal.RunCompleted || after.Answer != "answer" || after.Watermark != 5 {
+	if after.RunState != journal.RunCompleted || after.Answer != "answer" || after.Watermark != 6 {
 		t.Fatalf("completion: %+v", after)
 	}
 	receipt, fresh, err := store.Admit(ctx, c)
@@ -123,10 +124,11 @@ func TestPersistenceAtomicCompletion(t *testing.T) {
 	if _, _, err := store.Admit(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Start(ctx, c, "planner", strings.Repeat("b", 64)); !errors.Is(err, journal.ErrDefinition) {
+	owner = claimForTest(t, store, c, true)
+	if _, err := store.Start(ctx, owner, "planner", strings.Repeat("b", 64)); !errors.Is(err, journal.ErrDefinition) {
 		t.Fatalf("changed definition bound: %v", err)
 	}
-	if history, err := store.Start(ctx, c, "planner", digest); err != nil || !bytes.Contains(history, []byte("assistant")) {
+	if history, err := store.Start(ctx, owner, "planner", digest); err != nil || !bytes.Contains(history, []byte("assistant")) {
 		t.Fatalf("restored history: %s %v", history, err)
 	}
 }

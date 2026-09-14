@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 )
 
@@ -31,11 +32,17 @@ type ToolResult struct {
 	Value  any
 }
 
+type Handoff struct{ JourneyID, Text string }
+
 type ModelRequest struct {
-	Instructions string
-	Messages     []string
-	Tools        []ModelTool
-	ToolResults  []ToolResult
+	Handoff         Handoff
+	Context         []string
+	History         json.RawMessage
+	PendingCommands []journal.Input
+	Instructions    string
+	Messages        []string
+	Tools           []ModelTool
+	ToolResults     []ToolResult
 }
 
 type ToolCall struct {
@@ -60,6 +67,9 @@ type Runner struct {
 }
 
 type RunInput struct {
+	Store         *journal.Store
+	Owner         journal.Owner
+	Iteration     int
 	History       json.RawMessage
 	ThreadID      string
 	RunID         string
@@ -112,16 +122,31 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 	if !ok {
 		return RunOutput{}, fmt.Errorf("journey MCP server is unavailable")
 	}
+	if err := input.Store.Check(ctx, input.Owner); err != nil {
+		return RunOutput{}, err
+	}
 	bound, err := r.mcp.Bind(ctx, server, journey.MCP.Tools, input.Headers)
 	if err != nil {
 		return RunOutput{}, err
 	}
 	defer bound.Close()
 
-	productCallID := stableCallID(input.ThreadID, input.RunID)
+	if err := input.Store.Check(ctx, input.Owner); err != nil {
+		return RunOutput{}, err
+	}
+	productCallID := stableCallID(input.ThreadID, fmt.Sprintf("%s/%d", input.RunID, input.Iteration))
+	var pending []journal.Input
+	var selected []string
+	var requestHistory json.RawMessage
 	mafAgent := agent.New(agent.ProviderConfig{
 		ProviderName: "configured-model",
-		Run:          modelRun(r.model, productCallID),
+		Run: modelRun(r.model, productCallID, func(ctx context.Context, request *ModelRequest) error {
+			request.Handoff = Handoff{JourneyID: journey.ID, Text: input.Text}
+			request.Context = selected
+			request.History = requestHistory
+			request.PendingCommands = pending
+			return input.Store.Check(ctx, input.Owner)
+		}, func(ctx context.Context) error { return input.Store.Included(ctx, input.Owner, pending) }),
 	}, agent.Config{
 		ID:          "journey:" + journey.ID,
 		Name:        journey.ID,
@@ -129,18 +154,31 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 		Tools:       funcsAsTools(bound.Tools()),
 		RunOptions:  []agent.Option{agent.WithInstructions(journey.Prompt)},
 	})
-	session, err := mafAgent.CreateSession(ctx)
-	if err != nil {
-		return RunOutput{}, fmt.Errorf("create model session: %w", err)
-	}
 	var history []*message.Message
 	if len(input.History) > 0 {
 		if err := json.Unmarshal(input.History, &history); err != nil {
 			return RunOutput{}, fmt.Errorf("decode provider history: %w", err)
 		}
 	}
-	history = append(history, &message.Message{Role: message.RoleUser, Contents: message.Contents{&message.TextContent{Text: input.Text}}})
-	response, err := mafAgent.Run(ctx, history, agent.WithSession(session)).Collect()
+	// MAF sessions remain reconstructable: pass the complete authoritative history
+	// to each invocation, including the inbox drained at this provider boundary.
+	invoke := func() (*agent.Response, error) {
+		inbox, err := input.Store.Pending(ctx, input.Owner)
+		if err != nil {
+			return nil, err
+		}
+		pending = inbox.Commands
+		selected = inbox.Context
+		requestHistory, err = json.Marshal(history)
+		if err != nil {
+			return nil, err
+		}
+		for _, command := range pending {
+			history = append(history, &message.Message{Role: message.RoleUser, Contents: message.Contents{&message.TextContent{Text: command.Text}}})
+		}
+		return mafAgent.Run(ctx, history).Collect()
+	}
+	response, err := invoke()
 	if err != nil {
 		return RunOutput{}, fmt.Errorf("model request failed: %w", err)
 	}
@@ -156,7 +194,13 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 	if !json.Valid([]byte(call.Arguments)) {
 		return RunOutput{}, fmt.Errorf("model returned invalid tool arguments")
 	}
+	if err := input.Store.Check(ctx, input.Owner); err != nil {
+		return RunOutput{}, err
+	}
 	result, err := bound.Call(ctx, productCallID, call.Name, []byte(call.Arguments))
+	if checkErr := input.Store.Check(ctx, input.Owner); checkErr != nil {
+		return RunOutput{}, checkErr
+	}
 	if err != nil {
 		return RunOutput{}, err
 	}
@@ -166,7 +210,8 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 			CallID: call.CallID, Result: result,
 		}},
 	}
-	final, err := mafAgent.RunMessage(ctx, toolMessage, agent.WithSession(session)).Collect()
+	history = append(history, toolMessage)
+	final, err := invoke()
 	if err != nil {
 		return RunOutput{}, fmt.Errorf("model request failed: %w", err)
 	}
@@ -176,13 +221,12 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 	if final.String() == "" {
 		return RunOutput{}, fmt.Errorf("model returned no answer")
 	}
-	history = append(history, toolMessage)
 	history = append(history, final.Messages...)
 	serialized, err := json.Marshal(history)
 	return RunOutput{JourneyID: journey.ID, Answer: final.String(), CallID: productCallID, ToolName: call.Name, History: serialized}, err
 }
 
-func modelRun(model Model, callBase string) agent.RunFunc {
+func modelRun(model Model, callBase string, before func(context.Context, *ModelRequest) error, observed func(context.Context) error) agent.RunFunc {
 	return func(ctx context.Context, messages []*message.Message, options ...agent.Option) iter.Seq2[*agent.ResponseUpdate, error] {
 		return func(yield func(*agent.ResponseUpdate, error) bool) {
 			request := ModelRequest{}
@@ -203,10 +247,22 @@ func modelRun(model Model, callBase string) agent.RunFunc {
 					}
 				}
 			}
+			if err := before(ctx, &request); err != nil {
+				yield(nil, err)
+				return
+			}
+			if err := ctx.Err(); err != nil {
+				yield(nil, err)
+				return
+			}
 			modelCtx, span := otel.Tracer("az-agent-platform/runtime").Start(ctx, "model.call")
 			span.SetAttributes(attribute.String("call.id", callBase))
 			response, err := model.Complete(modelCtx, request)
 			span.End()
+			if observedErr := observed(ctx); observedErr != nil {
+				yield(nil, observedErr)
+				return
+			}
 			if err != nil {
 				yield(nil, err)
 				return

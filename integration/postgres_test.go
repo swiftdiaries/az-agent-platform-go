@@ -151,7 +151,7 @@ func TestPostgresMigrationDrift(t *testing.T) {
 	if err := journal.Migrate(ctx, pool); err == nil {
 		t.Fatal("modified migration accepted")
 	}
-	if _, err := pool.Exec(ctx, "INSERT INTO agent_schema_migrations VALUES(2,'future')"); err != nil {
+	if _, err := pool.Exec(ctx, "INSERT INTO agent_schema_migrations VALUES(999,'future')"); err != nil {
 		t.Fatal(err)
 	}
 	if err := journal.Migrate(ctx, pool); err == nil {

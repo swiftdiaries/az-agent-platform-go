@@ -196,14 +196,22 @@ func TestReplayCursorAndPolling(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer obs.Close()
-	if _, err := store.Start(ctx, c, "planner", strings.Repeat("a", 64)); err != nil {
+	owner := claimForTest(t, store, c, false)
+	if _, err := store.Start(ctx, owner, "planner", strings.Repeat("a", 64)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Finish(ctx, c, journal.RunCompleted, []byte(`[]`), "done", "", ""); err != nil {
+	inbox, err := store.Pending(ctx, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Included(ctx, owner, inbox.Commands); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Finish(ctx, owner, journal.RunCompleted, []byte(`[]`), "done", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	seen := map[int64]bool{}
-	for len(seen) < 3 {
+	for len(seen) < 4 {
 		select {
 		case e := <-obs.Events:
 			if e.Sequence <= 1 || seen[e.Sequence] {
@@ -231,7 +239,8 @@ func TestReplaySnapshotConcurrentCommit(t *testing.T) {
 	if _, _, err := store.Admit(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Start(ctx, c, "planner", strings.Repeat("a", 64)); err != nil {
+	owner := claimForTest(t, store, c, false)
+	if _, err := store.Start(ctx, owner, "planner", strings.Repeat("a", 64)); err != nil {
 		t.Fatal(err)
 	}
 	writer, err := pool.Begin(ctx)
