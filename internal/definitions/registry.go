@@ -223,6 +223,14 @@ func (r *Registry) HasDigest(digest string) bool {
 	return versionOK && serverOK
 }
 
+// JourneyIDForDigest returns the immutable definition identity only when the
+// complete bundle is available to this replica.
+func (r *Registry) JourneyIDForDigest(digest string) (string, bool) {
+	journey, versionOK := r.versions[digest]
+	_, serverOK := r.versionServers[digest]
+	return journey.ID, versionOK && serverOK
+}
+
 func (r *Registry) ServerFor(digest string) (MCPServer, bool) {
 	server, ok := r.versionServers[digest]
 	return cloneServer(server), ok

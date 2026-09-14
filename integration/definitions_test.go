@@ -59,7 +59,7 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 	newJourney, _ := registry.Journey("planner")
 	pool := database(t)
 	store := journal.New(pool)
-	if err := store.ActivateDefinition(ctx, "planner", "", oldJourney.Digest, oldRegistry.HasDigest); err != nil {
+	if err := store.ActivateDefinition(ctx, "planner", "", oldJourney.Digest, oldRegistry.JourneyIDForDigest); err != nil {
 		t.Fatal(err)
 	}
 
@@ -68,11 +68,11 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	owner := claimForTest(t, store, command, true)
-	resolved, err := store.ResolveDefinition(ctx, owner, "planner", newJourney.Digest)
+	resolved, err := store.ResolveDefinition(ctx, owner, "planner", newJourney.Digest, registry.JourneyIDForDigest)
 	if err != nil || resolved != oldJourney.Digest {
 		t.Fatalf("old current resolution = %q, %v", resolved, err)
 	}
-	if err := store.ActivateDefinition(ctx, "planner", oldJourney.Digest, newJourney.Digest, registry.HasDigest); err != nil {
+	if err := store.ActivateDefinition(ctx, "planner", oldJourney.Digest, newJourney.Digest, registry.JourneyIDForDigest); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.Start(ctx, owner, "planner", resolved); err != nil {
@@ -87,7 +87,7 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	continuedOwner := claimForTest(t, store, continued, false)
-	if resolved, err = store.ResolveDefinition(ctx, continuedOwner, "planner", newJourney.Digest); err != nil || resolved != oldJourney.Digest {
+	if resolved, err = store.ResolveDefinition(ctx, continuedOwner, "planner", newJourney.Digest, registry.JourneyIDForDigest); err != nil || resolved != oldJourney.Digest {
 		t.Fatalf("completed session fell forward = %q, %v", resolved, err)
 	}
 	newCommand := journal.Command{ThreadID: "new-thread", RunID: "new-run", CommunicationID: "new-command", Principal: "alice", Text: "plan"}
@@ -95,10 +95,10 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	newOwner := claimForTest(t, store, newCommand, false)
-	if resolved, err = store.ResolveDefinition(ctx, newOwner, "planner", oldJourney.Digest); err != nil || resolved != newJourney.Digest {
+	if resolved, err = store.ResolveDefinition(ctx, newOwner, "planner", oldJourney.Digest, registry.JourneyIDForDigest); err != nil || resolved != newJourney.Digest {
 		t.Fatalf("new session ignored current = %q, %v", resolved, err)
 	}
-	if err := store.ActivateDefinition(ctx, "planner", oldJourney.Digest, oldJourney.Digest, registry.HasDigest); !errors.Is(err, journal.ErrDefinition) {
+	if err := store.ActivateDefinition(ctx, "planner", oldJourney.Digest, oldJourney.Digest, registry.JourneyIDForDigest); !errors.Is(err, journal.ErrDefinition) {
 		t.Fatalf("stale activation = %v", err)
 	}
 	if current, err := store.CurrentDefinition(ctx, "planner"); err != nil || current != newJourney.Digest {
@@ -109,11 +109,74 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ready, err := store.DefinitionsReady(ctx, candidateOnly.HasDigest); err != nil || ready {
+	if ready, err := store.DefinitionsReady(ctx, candidateOnly.JourneyIDForDigest); err != nil || ready {
 		t.Fatalf("missing retained bundle readiness = %v, %v", ready, err)
 	}
-	if ready, err := store.DefinitionsReady(ctx, registry.HasDigest); err != nil || !ready {
+	if ready, err := store.DefinitionsReady(ctx, registry.JourneyIDForDigest); err != nil || !ready {
 		t.Fatalf("complete retained bundle readiness = %v, %v", ready, err)
+	}
+}
+
+func TestCrossJourneyActivationCannotMutateCurrentOrPin(t *testing.T) {
+	ctx := context.Background()
+	oldRoot, currentRoot, secondJourneyRoot := t.TempDir(), t.TempDir(), t.TempDir()
+	oldPath := writeDefinitionBundle(t, oldRoot, "old prompt\n")
+	currentPath := writeDefinitionBundle(t, currentRoot, "current prompt\n")
+	secondJourneyPath := writeTwoJourneyBundle(t, secondJourneyRoot, "http://example")
+	oldRegistry, err := definitions.Load(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondJourneyRegistry, err := definitions.Load(secondJourneyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := definitions.Load(currentPath, oldPath, secondJourneyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPlanner, _ := oldRegistry.Journey("planner")
+	currentPlanner, _ := registry.Journey("planner")
+	shiftSwap, _ := secondJourneyRegistry.Journey("shift-swap")
+	pool := database(t)
+	store := journal.New(pool)
+	if err := store.ActivateDefinition(ctx, "planner", "", oldPlanner.Digest, registry.JourneyIDForDigest); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ActivateDefinition(ctx, "planner", oldPlanner.Digest, shiftSwap.Digest, registry.JourneyIDForDigest); !errors.Is(err, journal.ErrDefinition) {
+		t.Fatalf("cross-journey activation = %v", err)
+	}
+	var current string
+	if err := pool.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current WHERE journey_id='planner'").Scan(&current); err != nil || current != oldPlanner.Digest {
+		t.Fatalf("cross-journey activation changed current = %q, %v", current, err)
+	}
+	var pins int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_sessions WHERE journey_id='planner'").Scan(&pins); err != nil || pins != 0 {
+		t.Fatalf("cross-journey activation created pins = %d, %v", pins, err)
+	}
+	if err := store.ActivateDefinition(ctx, "planner", oldPlanner.Digest, currentPlanner.Digest, registry.JourneyIDForDigest); err != nil {
+		t.Fatalf("retained activation = %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current WHERE journey_id='planner'").Scan(&current); err != nil || current != currentPlanner.Digest {
+		t.Fatalf("retained activation current = %q, %v", current, err)
+	}
+
+	if _, err := pool.Exec(ctx, "UPDATE agent_definition_current SET definition_digest=$1 WHERE journey_id='planner'", shiftSwap.Digest); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := store.DefinitionsReady(ctx, registry.JourneyIDForDigest); err != nil || ready {
+		t.Fatalf("mismatched current readiness = %v, %v", ready, err)
+	}
+	command := journal.Command{ThreadID: "mismatched-current", RunID: "mismatched-current", CommunicationID: "mismatched-current", Principal: "alice", Text: "plan"}
+	if _, _, err := store.Admit(ctx, command); err != nil {
+		t.Fatal(err)
+	}
+	owner := claimForTest(t, store, command, false)
+	if _, err := store.ResolveDefinition(ctx, owner, "planner", currentPlanner.Digest, registry.JourneyIDForDigest); !errors.Is(err, journal.ErrDefinition) {
+		t.Fatalf("mismatched current resolution = %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_sessions WHERE thread_id=$1", command.ThreadID).Scan(&pins); err != nil || pins != 0 {
+		t.Fatalf("mismatched current created pin = %d, %v", pins, err)
 	}
 }
 
@@ -173,7 +236,7 @@ func TestResolveDefinitionRejectsOwnerExpiredWhileWaitingForRollout(t *testing.T
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := store.ResolveDefinition(context.Background(), owner, "planner", strings.Repeat("a", 64))
+		_, err := store.ResolveDefinition(context.Background(), owner, "planner", strings.Repeat("a", 64), func(string) (string, bool) { return "planner", true })
 		done <- err
 	}()
 	waitDatabase(t, pool, "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted)")

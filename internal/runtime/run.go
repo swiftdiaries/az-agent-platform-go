@@ -120,7 +120,7 @@ func (r *Runner) Binding(ctx context.Context, in RunInput) (string, string, erro
 	if in.Store == nil {
 		return "", "", journal.ErrDefinition
 	}
-	digest, err := in.Store.ResolveDefinition(ctx, in.Owner, journey.ID, journey.Digest)
+	digest, err := in.Store.ResolveDefinition(ctx, in.Owner, journey.ID, journey.Digest, r.definitions.JourneyIDForDigest)
 	if err != nil {
 		return "", "", err
 	}

@@ -364,7 +364,7 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 	oldJourney, _ := oldRegistry.Journey("planner")
 	newJourney, _ := registry.Journey("planner")
 	store := journal.New(database(t))
-	if err := store.ActivateDefinition(t.Context(), "planner", "", oldJourney.Digest, registry.HasDigest); err != nil {
+	if err := store.ActivateDefinition(t.Context(), "planner", "", oldJourney.Digest, registry.JourneyIDForDigest); err != nil {
 		t.Fatal(err)
 	}
 	var requests []agentruntime.ModelRequest
@@ -391,7 +391,7 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 		t.Fatal("missing clarification")
 	}
 	service.Close()
-	if err := store.ActivateDefinition(t.Context(), "planner", oldJourney.Digest, newJourney.Digest, registry.HasDigest); err != nil {
+	if err := store.ActivateDefinition(t.Context(), "planner", oldJourney.Digest, newJourney.Digest, registry.JourneyIDForDigest); err != nil {
 		t.Fatal(err)
 	}
 

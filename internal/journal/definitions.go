@@ -6,8 +6,8 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func (s *Store) ResolveDefinition(ctx context.Context, o Owner, journey, bootstrap string) (string, error) {
-	if len(bootstrap) != 64 {
+func (s *Store) ResolveDefinition(ctx context.Context, o Owner, journey, bootstrap string, identity func(string) (string, bool)) (string, error) {
+	if len(bootstrap) != 64 || identity == nil || !matchesJourney(identity, journey, bootstrap) {
 		return "", ErrDefinition
 	}
 	var digest string
@@ -21,6 +21,9 @@ func (s *Store) ResolveDefinition(ctx context.Context, o Owner, journey, bootstr
 		thread := o.Command.ThreadID
 		err := tx.QueryRow(ctx, "SELECT definition_digest FROM agent_sessions WHERE thread_id=$1 AND journey_id=$2", thread, journey).Scan(&digest)
 		if err == nil {
+			if !matchesJourney(identity, journey, digest) {
+				return ErrDefinition
+			}
 			return nil
 		}
 		if err != pgx.ErrNoRows {
@@ -34,6 +37,9 @@ func (s *Store) ResolveDefinition(ctx context.Context, o Owner, journey, bootstr
 			}
 		} else if err != nil {
 			return err
+		}
+		if !matchesJourney(identity, journey, digest) {
+			return ErrDefinition
 		}
 		_, err = tx.Exec(ctx, "INSERT INTO agent_sessions(thread_id,journey_id,definition_digest) VALUES($1,$2,$3)", thread, journey, digest)
 		return err
@@ -54,8 +60,8 @@ func (s *Store) CurrentDefinition(ctx context.Context, journey string) (string, 
 
 // ActivateDefinition conditionally advances current after the candidate and every
 // definition retained by a session are available to this replica.
-func (s *Store) ActivateDefinition(ctx context.Context, journey, expected, candidate string, available func(string) bool) error {
-	if len(candidate) != 64 || available == nil || !available(candidate) {
+func (s *Store) ActivateDefinition(ctx context.Context, journey, expected, candidate string, identity func(string) (string, bool)) error {
+	if len(candidate) != 64 || identity == nil || !matchesJourney(identity, journey, candidate) {
 		return ErrDefinition
 	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
@@ -63,17 +69,17 @@ func (s *Store) ActivateDefinition(ctx context.Context, journey, expected, candi
 		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(789134628)"); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, "SELECT DISTINCT definition_digest FROM agent_sessions")
+		rows, err := tx.Query(ctx, "SELECT DISTINCT journey_id, definition_digest FROM agent_sessions")
 		if err != nil {
 			return err
 		}
 		for rows.Next() {
-			var digest string
-			if err := rows.Scan(&digest); err != nil {
+			var retainedJourney, digest string
+			if err := rows.Scan(&retainedJourney, &digest); err != nil {
 				rows.Close()
 				return err
 			}
-			if !available(digest) {
+			if !matchesJourney(identity, retainedJourney, digest) {
 				rows.Close()
 				return ErrDefinition
 			}
@@ -97,6 +103,9 @@ func (s *Store) ActivateDefinition(ctx context.Context, journey, expected, candi
 		if err != nil {
 			return err
 		}
+		if !matchesJourney(identity, journey, current) {
+			return ErrDefinition
+		}
 		if current != expected {
 			return ErrDefinition
 		}
@@ -105,23 +114,28 @@ func (s *Store) ActivateDefinition(ctx context.Context, journey, expected, candi
 	})
 }
 
-func (s *Store) DefinitionsReady(ctx context.Context, available func(string) bool) (bool, error) {
-	if available == nil {
+func (s *Store) DefinitionsReady(ctx context.Context, identity func(string) (string, bool)) (bool, error) {
+	if identity == nil {
 		return false, ErrDefinition
 	}
-	rows, err := s.pool.Query(ctx, `SELECT definition_digest FROM agent_definition_current UNION SELECT definition_digest FROM agent_sessions`)
+	rows, err := s.pool.Query(ctx, `SELECT journey_id, definition_digest FROM agent_definition_current UNION SELECT journey_id, definition_digest FROM agent_sessions`)
 	if err != nil {
 		return false, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var digest string
-		if err := rows.Scan(&digest); err != nil {
+		var journey, digest string
+		if err := rows.Scan(&journey, &digest); err != nil {
 			return false, err
 		}
-		if !available(digest) {
+		if !matchesJourney(identity, journey, digest) {
 			return false, nil
 		}
 	}
 	return true, rows.Err()
+}
+
+func matchesJourney(identity func(string) (string, bool), journey, digest string) bool {
+	actual, ok := identity(digest)
+	return ok && actual == journey
 }
