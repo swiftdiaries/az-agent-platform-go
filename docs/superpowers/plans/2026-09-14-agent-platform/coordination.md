@@ -30,3 +30,16 @@ Keep independent review and verification. Split a deliverable only when its impl
 
 - The independent quality review found that configured credentials followed MCP redirects and that raw client IDs crossed the Chat/Agent boundary. The follow-up commit containing this entry rejects redirects before any destination request and maps external thread/run identity to stable, principal-scoped, process-local opaque thread/run/communication IDs. AG-UI responses retain external correlation, while Agent state, call IDs, and trace attributes use only opaque IDs. Specification and quality rereviews remain pending.
 - Repair checks: `go test ./integration -run 'TestJourneyAuthenticated|TestToolBindingDoesNotForward' -count=1` passed (`integration 0.746s`); `go test ./... -count=1` passed (`integration 0.735s`); `go test -race ./internal/... ./integration -run 'TestJourney|TestAuth|TestToolBinding' -count=1` passed (`integration 1.805s`); `go vet ./...` passed.
+
+## Delivery status
+
+| Deliverable | Status / owner / commit / checks / review |
+|---|---|
+| 1 | implemented and reviewed / `implement/task-1` / `11948213104a7bd2af6c2233f4d47cefd97ba874` / worker: `go test ./... -count=1`, required race suite and `go vet ./...` passed; specification reviewer `/root/task_1_spec_review`: required race suite passed (`integration 1.824s`); quality reviewer `/root/task_1_quality_review`: focused race suite passed, with zero redirect-target requests and ID-mapping/privacy assertions verified / both independent reviewers passed the exact commit with clean worktree and diff |
+| 2 | ready / unassigned / starts from the Task 1 integration-evidence commit / persistence, replay and admission checks remain pending |
+
+### Task 1 review history
+
+- Specification review failed `b1e7173c824063b773fe0aa4d3c9867617fbb852`; `87732333f1774d0723521ff76b36c66b07063592` repaired startup catalog matching, typed downstream `auth_required`, trace coverage and product call identity.
+- Quality review then found credential forwarding across redirects and raw external IDs crossing the Chat/Agent boundary; `11948213104a7bd2af6c2233f4d47cefd97ba874` rejected redirects and introduced principal-scoped opaque IDs.
+- `/root/task_1_spec_review` and `/root/task_1_quality_review` independently passed `11948213104a7bd2af6c2233f4d47cefd97ba874`. Task 2 is ready from the integration-evidence commit containing this history.
