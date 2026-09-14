@@ -289,6 +289,8 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		envelope := map[string]string{"A": "run-a", "B": "run-b", "B2": "run-b2", "C": "run-b"}[label]
+		assertEdgeCommandOutcomes(t, data, envelope, map[string]string{"run-b": "included", "run-b2": "included"}, before.Runs[0].CommandOutcomes)
 		if label == "C" {
 			var ids []int64
 			for _, line := range strings.Split(string(data), "\n") {
@@ -341,6 +343,17 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 	}
 	if included != 3 {
 		t.Fatalf("included %d commands", included)
+	}
+	freshService := platform.New(runner, journal.New(pool))
+	defer freshService.Close()
+	freshAPI := httptest.NewServer(chat.NewHandler(auth, freshService, pool))
+	defer freshAPI.Close()
+	for _, run := range []string{"run-b", "run-b2"} {
+		data := reconnectChat(t, freshAPI.URL, "external-thread", run, "token")
+		assertEdgeCommandOutcomes(t, data, run, map[string]string{"run-b": "included", "run-b2": "included"}, after.Runs[0].CommandOutcomes)
+	}
+	if modelCalls.Load() != 2 || toolCalls.Load() != 1 {
+		t.Fatal("fresh Chat reconnect reexecuted the run")
 	}
 	var durable string
 	if err := pool.QueryRow(ctx, `SELECT jsonb_build_array((SELECT jsonb_agg(c) FROM agent_commands c),(SELECT jsonb_agg(s) FROM agent_sessions s),(SELECT jsonb_agg(r) FROM agent_runs r),(SELECT jsonb_agg(e) FROM agent_events e))::text`).Scan(&durable); err != nil {
@@ -401,7 +414,7 @@ func TestSteeringInclusionFailureStopsDispatch(t *testing.T) {
 	}
 	defer reconnected.Body.Close()
 	data, err := io.ReadAll(reconnected.Body)
-	if err != nil || !bytes.Contains(data, []byte(`"State":"rejected"`)) || !bytes.Contains(data, []byte(`"Reason":"failed"`)) {
+	if err != nil || !bytes.Contains(data, []byte(`"state":"rejected"`)) || !bytes.Contains(data, []byte(`"reason":"failed"`)) {
 		t.Fatalf("missing snapshot disposition: %s %v", data, err)
 	}
 	retry := postAGUI(t, api.URL, body, "token", "", "")
@@ -642,6 +655,179 @@ func TestAdmissionFinishDispositionAtomic(t *testing.T) {
 			assertCommandOutcome(t, after, c.CommunicationID, disposition, string(state))
 			if after.Runs[0].PendingCommands != 0 {
 				t.Fatal("terminal command still pending")
+			}
+		})
+	}
+}
+
+// Command correlation is independent of the enclosing observed execution stream.
+func assertEdgeCommandOutcomes(t *testing.T, data []byte, envelope string, want map[string]string, internal []journal.CommandOutcome) {
+	t.Helper()
+	for _, command := range internal {
+		if bytes.Contains(data, []byte(command.CommunicationID)) {
+			t.Fatalf("internal command identity exposed at Chat edge: %s", data)
+		}
+	}
+	found := map[string]string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var frame struct {
+			Type, RunID, Name string
+			Snapshot          struct {
+				Commands []struct{ RunID, State string }
+			}
+			Value struct{ RunID string }
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.RunID != "" && frame.RunID != envelope {
+			t.Fatalf("execution envelope %s was replaced with command ID %s", envelope, frame.RunID)
+		}
+		for _, command := range frame.Snapshot.Commands {
+			if command.RunID == "" {
+				t.Fatal("snapshot command has no external run ID")
+			}
+			found[command.RunID] = command.State
+		}
+		if strings.HasPrefix(frame.Name, "command.") {
+			if frame.Value.RunID == "" {
+				t.Fatal("live command outcome has no external run ID")
+			}
+			state := strings.TrimPrefix(frame.Name, "command.")
+			if state == "accepted" {
+				state = "pending"
+			}
+			found[frame.Value.RunID] = state
+		}
+	}
+	for run, state := range want {
+		if found[run] != state {
+			t.Fatalf("external command %s outcome %q want %q; all outcomes %v", run, found[run], state, found)
+		}
+	}
+}
+
+func reconnectChat(t *testing.T, endpoint, thread, run, token string) []byte {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, endpoint+"?threadId="+thread+"&runId="+run, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Last-Event-ID", "999")
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(response.Body)
+	if err != nil || response.StatusCode != 200 {
+		t.Fatalf("reconnect status %d: %s %v", response.StatusCode, data, err)
+	}
+	return data
+}
+
+func TestSteeringTerminalCommandCorrelationAcrossReplicas(t *testing.T) {
+	for _, state := range []journal.RunState{journal.RunFailed, journal.RunInterrupted} {
+		t.Run(string(state), func(t *testing.T) {
+			ctx := context.Background()
+			pool := database(t)
+			started, release := make(chan struct{}), make(chan struct{})
+			var calls atomic.Int64
+			runner := fixtureRunner(t, modelFunc(func(_ context.Context, _ agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+				calls.Add(1)
+				close(started)
+				<-release
+				return agentruntime.ModelResponse{}, errors.New("model failed")
+			}))
+			auth := chat.StaticBearerTokens{"token": "alice", "other": "bob"}
+			owner := platform.New(runner, journal.New(pool))
+			defer owner.Close()
+			peer := platform.New(runner, journal.New(pool))
+			defer peer.Close()
+			a := httptest.NewServer(chat.NewHandler(auth, owner, pool))
+			defer a.Close()
+			b := httptest.NewServer(chat.NewHandler(auth, peer, pool))
+			defer b.Close()
+			defer func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+			}()
+			post := func(endpoint, run, text string) *http.Response {
+				payload, _ := json.Marshal(aguitypes.RunAgentInput{ThreadID: "external-thread", RunID: run, Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: text}}})
+				req, _ := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(payload))
+				req.Header.Set("Authorization", "Bearer token")
+				response, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if response.StatusCode != 200 {
+					t.Fatalf("POST status %d", response.StatusCode)
+				}
+				return response
+			}
+			first := post(a.URL, "owner-run", "hold")
+			defer first.Body.Close()
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("model did not start")
+			}
+			correction1 := post(b.URL, "correction-one", "one")
+			defer correction1.Body.Close()
+			correction2 := post(b.URL, "correction-two", "two")
+			defer correction2.Body.Close()
+			var thread string
+			if err := pool.QueryRow(ctx, "SELECT id FROM agent_conversations").Scan(&thread); err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := journal.New(pool).Snapshot(ctx, thread, "alice")
+			if err != nil {
+				t.Fatal(err)
+			}
+			disposition := "rejected"
+			if state == journal.RunInterrupted {
+				disposition = "interrupted"
+				if _, err := pool.Exec(ctx, "UPDATE agent_runs SET lease_until=clock_timestamp()-interval '1 second'"); err != nil {
+					t.Fatal(err)
+				}
+				if err := journal.New(pool).Reap(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			close(release)
+			want := map[string]string{"correction-one": disposition, "correction-two": disposition}
+			for run, response := range map[string]*http.Response{"owner-run": first, "correction-one": correction1, "correction-two": correction2} {
+				data, err := io.ReadAll(response.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertEdgeCommandOutcomes(t, data, run, want, snapshot.Runs[0].CommandOutcomes)
+			}
+			// New Platform and Chat instances restore only durable identities and outcomes.
+			fresh := platform.New(runner, journal.New(pool))
+			defer fresh.Close()
+			c := httptest.NewServer(chat.NewHandler(auth, fresh, pool))
+			defer c.Close()
+			for _, run := range []string{"correction-one", "correction-two"} {
+				data := reconnectChat(t, c.URL, "external-thread", run, "token")
+				assertEdgeCommandOutcomes(t, data, run, want, snapshot.Runs[0].CommandOutcomes)
+			}
+			denied, _ := http.NewRequest(http.MethodGet, c.URL+"?threadId=external-thread&runId=correction-one", nil)
+			denied.Header.Set("Authorization", "Bearer other")
+			response, err := http.DefaultClient.Do(denied)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response.Body.Close()
+			if response.StatusCode != http.StatusForbidden {
+				t.Fatalf("principal crossed command identity boundary: %d", response.StatusCode)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("outcome observation retried execution: %d", calls.Load())
 			}
 		})
 	}

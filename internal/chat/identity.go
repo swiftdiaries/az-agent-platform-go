@@ -41,3 +41,24 @@ func (m IdentityMap) resolve(ctx context.Context, principal, externalThread, ext
 	})
 	return
 }
+
+// externalCommands loads one thread's durable reverse mapping in a single query.
+// A live stream refreshes it only when a newly admitted command first appears.
+func (m IdentityMap) externalCommands(ctx context.Context, principal, thread string) (map[string]string, error) {
+	rows, err := m.pool.Query(ctx, `SELECT r.communication_id,r.external_id
+ FROM chat_runs r JOIN chat_threads t ON t.id=r.thread_id
+ WHERE t.principal=$1 AND t.id=$2`, principal, thread)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[string]string)
+	for rows.Next() {
+		var communication, external string
+		if err := rows.Scan(&communication, &external); err != nil {
+			return nil, err
+		}
+		result[communication] = external
+	}
+	return result, rows.Err()
+}

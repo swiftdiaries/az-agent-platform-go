@@ -107,6 +107,29 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer observation.Close()
+	snapshot := observation.Snapshot
+	var current platform.Run
+	for _, candidate := range snapshot.Runs {
+		if candidate.RunID == run || slices.Contains(candidate.CommandRunIDs, run) {
+			run = candidate.RunID
+			current = candidate
+			break
+		}
+	}
+	externalCommands, err := h.ids.externalCommands(ctx, principal, thread)
+	if err != nil {
+		commandError(w, err)
+		return
+	}
+	commands := make([]map[string]string, 0, len(current.CommandOutcomes))
+	for _, outcome := range current.CommandOutcomes {
+		external, ok := externalCommands[outcome.CommunicationID]
+		if !ok {
+			http.Error(w, "observation unavailable", http.StatusInternalServerError)
+			return
+		}
+		commands = append(commands, map[string]string{"runId": external, "state": outcome.State, "reason": outcome.Reason})
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	emit := func(event events.Event, sequence int64) bool {
@@ -130,16 +153,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !emit(events.NewRunStartedEvent(input.ThreadID, input.RunID), 0) {
 		return
 	}
-	snapshot := observation.Snapshot
-	var current platform.Run
-	for _, candidate := range snapshot.Runs {
-		if candidate.RunID == run || slices.Contains(candidate.CommandRunIDs, run) {
-			run = candidate.RunID
-			current = candidate
-			break
-		}
-	}
-	if !emit(events.NewStateSnapshotEvent(map[string]any{"threadId": input.ThreadID, "watermark": snapshot.Watermark, "journeyId": current.JourneyID, "runState": current.State, "pendingCommands": current.PendingCommands, "commands": current.CommandOutcomes, "answer": current.Answer}), max(cursor, snapshot.Watermark)) {
+	if !emit(events.NewStateSnapshotEvent(map[string]any{"threadId": input.ThreadID, "watermark": snapshot.Watermark, "journeyId": current.JourneyID, "runState": current.State, "pendingCommands": current.PendingCommands, "commands": commands, "answer": current.Answer}), max(cursor, snapshot.Watermark)) {
 		return
 	}
 	terminal := func(e platform.Event, sequence int64) bool {
@@ -161,7 +175,20 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emit(events.NewRunErrorEvent("run could not complete", events.WithErrorCode(code), events.WithRunID(input.RunID)), sequence)
 			return true
 		default:
-			return !emit(events.NewCustomEvent(e.Type, events.WithValue(map[string]any{"communicationId": e.CommunicationID, "reason": e.Reason})), sequence)
+			value := map[string]any{"reason": e.Reason}
+			if e.CommunicationID != "" {
+				external, ok := externalCommands[e.CommunicationID]
+				if !ok {
+					externalCommands, err = h.ids.externalCommands(ctx, principal, thread)
+					external, ok = externalCommands[e.CommunicationID]
+					if err != nil || !ok {
+						emit(events.NewRunErrorEvent("observation unavailable"), 0)
+						return true
+					}
+				}
+				value["runId"] = external
+			}
+			return !emit(events.NewCustomEvent(e.Type, events.WithValue(value)), sequence)
 		}
 	}
 	// Project completed state directly from Agent run records, not replay events.
