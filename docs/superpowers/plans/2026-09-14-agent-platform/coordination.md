@@ -36,7 +36,8 @@ Keep independent review and verification. Split a deliverable only when its impl
 | Deliverable | Status / owner / commit / checks / review |
 |---|---|
 | 1 | implemented and reviewed / `implement/task-1` / `11948213104a7bd2af6c2233f4d47cefd97ba874` / worker: `go test ./... -count=1`, required race suite and `go vet ./...` passed; specification reviewer `/root/task_1_spec_review`: required race suite passed (`integration 1.824s`); quality reviewer `/root/task_1_quality_review`: focused race suite passed, with zero redirect-target requests and ID-mapping/privacy assertions verified / both independent reviewers passed the exact commit with clean worktree and diff |
-| 2 | ready / unassigned / starts from the Task 1 integration-evidence commit / persistence, replay and admission checks remain pending |
+| 2 | implemented and reviewed / `implement/task-2` / `eb92208ec96571edf45eaada44516308ca4fb4c0` / worker: full suite, required persistence/replay/PostgreSQL/admission race suite and `go vet ./...` passed on PostgreSQL 16.13, with database fixtures cleaned; specification reviewer `/root/task_1_spec_review`: full suite passed (`integration 3.680s`) and required race suite passed (`integration 5.892s`) on PostgreSQL 16.13; quality reviewer `/root/task_1_quality_review`: required race suite passed (`integration 4.614s`) on PostgreSQL 16 and `go vet ./...` passed / both independent reviewers passed the exact commit with no skips and clean worktree |
+| 3 | ready / unassigned / starts from the Task 2 integration-evidence commit / ownership, steering and interruption checks remain pending |
 
 ### Task 1 review history
 
@@ -53,3 +54,7 @@ Keep independent review and verification. Split a deliverable only when its impl
 - Final checks: `go test ./... -count=1` passed (`integration 3.780s`); `go test -race ./internal/... ./integration -run 'TestPersistence|TestReplay|TestPostgres|TestAdmission' -count=1` passed (`integration 4.647s`); `go vet ./...` passed. `go mod tidy` completed; `git diff --check` passed.
 - Limits: single-process development execution only; no Task 3 ownership, leases, epoch fencing, reclaim, or live steering. Interrupted/commit-failed runs remain live until that recovery layer is implemented. MCP stateful sessions, configured header forwarding, OAuth ingress checks, tool allowlists, no-tool response, and sanitized errors retain their Task 1 regression coverage.
 - Next: independent reviewers inspect the exact submitted commit and both authority boundaries. Root records review/integration and only then releases Task 3.
+
+### Task 2 review history
+
+- `/root/task_1_spec_review` and `/root/task_1_quality_review` independently passed `eb92208ec96571edf45eaada44516308ca4fb4c0` without a repair commit. Both exercised the required PostgreSQL-backed race suite; the specification reviewer also ran the full suite, and the quality reviewer ran `go vet ./...` and confirmed no skips. Task 3 is ready from the integration-evidence commit containing this result.
