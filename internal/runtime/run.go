@@ -111,6 +111,15 @@ func NewRunner(registry *definitions.Registry, client *platformmcp.Client, model
 	return &Runner{definitions: registry, mcp: client, model: model}
 }
 
+// Ready verifies only durable definition availability. It deliberately does
+// not contact a provider or MCP server.
+func (r *Runner) Ready(ctx context.Context, store *journal.Store) (bool, error) {
+	if r == nil || r.definitions == nil || store == nil {
+		return false, journal.ErrDefinition
+	}
+	return store.DefinitionsReady(ctx, r.definitions.JourneyIDForDigest)
+}
+
 // Binding resolves an existing session's pin or the database current pointer for a new one.
 func (r *Runner) Binding(ctx context.Context, in RunInput) (string, string, error) {
 	journey, err := r.route(ctx, in.TargetJourney, in.Text)

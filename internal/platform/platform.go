@@ -21,6 +21,7 @@ var (
 	ErrConflict  = journal.ErrConflict
 	ErrForbidden = journal.ErrForbidden
 	ErrBusy      = journal.ErrBusy
+	ErrDraining  = errors.New("platform is draining")
 )
 
 type RunState = journal.RunState
@@ -53,20 +54,22 @@ type Snapshot = journal.Snapshot
 type Run = journal.Run
 
 type Platform struct {
-	ownerID string
-	runner  *agentruntime.Runner
-	store   *journal.Store
-	ctx     context.Context
-	cancel  context.CancelFunc
-	mu      sync.Mutex
-	closed  bool
-	workers sync.WaitGroup
+	ownerID    string
+	runner     *agentruntime.Runner
+	store      *journal.Store
+	ctx        context.Context
+	cancel     context.CancelFunc
+	mu         sync.Mutex
+	closed     bool
+	draining   bool
+	runs       sync.WaitGroup
+	background sync.WaitGroup
 }
 
 func New(runner *agentruntime.Runner, store *journal.Store) *Platform {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Platform{runner: runner, store: store, ctx: ctx, cancel: cancel, ownerID: rand.Text()}
-	p.workers.Go(func() {
+	p.background.Go(func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
@@ -85,7 +88,51 @@ func New(runner *agentruntime.Runner, store *journal.Store) *Platform {
 
 // Close stops local work. Lease expiry records interruption without transferring
 // execution or claiming that an already dispatched remote call was canceled.
-func (p *Platform) Close() { p.mu.Lock(); p.closed = true; p.cancel(); p.mu.Unlock(); p.workers.Wait() }
+func (p *Platform) Close() {
+	p.BeginDrain()
+	p.mu.Lock()
+	p.closed = true
+	p.cancel()
+	p.mu.Unlock()
+	p.runs.Wait()
+	p.background.Wait()
+}
+
+// BeginDrain serializes the boundary with admission and initial claiming.
+// Work accepted before this returns is owned; later work is not persisted.
+func (p *Platform) BeginDrain() {
+	p.mu.Lock()
+	p.draining = true
+	p.mu.Unlock()
+}
+
+// Drain waits for owned work through ctx's grace period. Expiry cancels local
+// work; the existing lease reaper later records interruption without handoff.
+func (p *Platform) Drain(ctx context.Context) error {
+	p.BeginDrain()
+	done := make(chan struct{})
+	go func() { p.runs.Wait(); close(done) }()
+	select {
+	case <-done:
+		p.cancel()
+		p.background.Wait()
+		return nil
+	case <-ctx.Done():
+		p.cancel()
+		return ctx.Err()
+	}
+}
+
+// Ready checks local drain state and durable definition availability only.
+func (p *Platform) Ready(ctx context.Context) (bool, error) {
+	p.mu.Lock()
+	unavailable := p.closed || p.draining
+	p.mu.Unlock()
+	if unavailable {
+		return false, nil
+	}
+	return p.runner.Ready(ctx, p.store)
+}
 func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, error) {
 	c := submission.Command
 	ctx, span := otel.Tracer("az-agent-platform/platform").Start(ctx, "agent.start_turn")
@@ -96,21 +143,26 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 		p.mu.Unlock()
 		return Receipt{}, context.Canceled
 	}
-	p.workers.Add(1)
-	p.mu.Unlock()
+	if p.draining {
+		p.mu.Unlock()
+		return Receipt{}, ErrDraining
+	}
+	p.runs.Add(1)
 	transferred := false
 	defer func() {
 		if !transferred {
-			p.workers.Done()
+			p.runs.Done()
 		}
 	}()
 	receipt, fresh, err := p.store.Admit(ctx, c.durable())
 	if err != nil {
+		p.mu.Unlock()
 		return Receipt{}, err
 	}
 	if !fresh && c.InteractionID != "" {
 		snapshot, snapshotErr := p.store.Snapshot(ctx, c.ThreadID, c.Principal)
 		if snapshotErr != nil {
+			p.mu.Unlock()
 			return Receipt{}, snapshotErr
 		}
 		for _, run := range snapshot.Runs {
@@ -124,6 +176,7 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 		if c.InteractionID != "" {
 			snapshot, err := p.store.Snapshot(ctx, c.ThreadID, c.Principal)
 			if err != nil {
+				p.mu.Unlock()
 				return Receipt{}, err
 			}
 			for _, run := range snapshot.Runs {
@@ -132,28 +185,33 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 				}
 			}
 		}
+		owner, err := p.store.Claim(ctx, c.durable(), p.ownerID, journal.LeaseDuration)
+		if err != nil {
+			p.mu.Unlock()
+			return Receipt{}, err
+		}
 		headers := submission.Headers.Clone()
 		transferred = true
+		p.mu.Unlock()
 		go func() {
-			defer p.workers.Done()
+			defer p.runs.Done()
 			// HTTP cancellation cannot revoke committed admission. Credentials remain in
 			// this worker only and are never part of the durable command or journal.
 			runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 			defer cancel()
 			stop := context.AfterFunc(p.ctx, cancel)
 			defer stop()
-			p.execute(runCtx, c, agentruntime.RunInput{ThreadID: c.ThreadID, RunID: c.RunID, Principal: c.Principal, Text: c.Text, TargetJourney: target, Headers: headers})
+			p.execute(runCtx, owner, c, agentruntime.RunInput{ThreadID: c.ThreadID, RunID: c.RunID, Principal: c.Principal, Text: c.Text, TargetJourney: target, Headers: headers})
 		}()
+	} else {
+		p.mu.Unlock()
 	}
 	return receipt, nil
 }
-func (p *Platform) execute(ctx context.Context, c Command, in agentruntime.RunInput) {
+func (p *Platform) execute(ctx context.Context, owner journal.Owner, c Command, in agentruntime.RunInput) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	owner, err := p.store.Claim(ctx, c.durable(), p.ownerID, journal.LeaseDuration)
-	if err != nil {
-		return
-	}
+	var err error
 	renewalDone := make(chan struct{})
 	defer func() { cancel(); <-renewalDone }()
 	go func() {

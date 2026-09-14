@@ -298,6 +298,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func commandError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	switch {
+	case errors.Is(err, platform.ErrDraining):
+		status = http.StatusServiceUnavailable
 	case errors.Is(err, platform.ErrConflict), errors.Is(err, platform.ErrBusy):
 		status = http.StatusConflict
 	case errors.Is(err, platform.ErrForbidden):
