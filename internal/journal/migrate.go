@@ -25,7 +25,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		if err := tx.QueryRow(ctx, "SELECT COALESCE(max(version),0) FROM agent_schema_migrations").Scan(&version); err != nil {
 			return err
 		}
-		names := []string{"000001_conversations.sql", "000002_ownership.sql", "000003_command_dispositions.sql", "000004_interactions_operations.sql"}
+		names := []string{"000001_conversations.sql", "000002_ownership.sql", "000003_command_dispositions.sql", "000004_interactions_operations.sql", "000005_definition_current.sql"}
 		if version > len(names) {
 			return fmt.Errorf("database schema is newer than this binary")
 		}

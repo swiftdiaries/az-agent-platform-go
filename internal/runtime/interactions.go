@@ -12,6 +12,7 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
+	platformskills "github.com/swiftdiaries/az-agent-platform-go/internal/skills"
 )
 
 type questionTool struct{}
@@ -64,6 +65,16 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 	var pending []journal.Input
 	var selected []string
 	var requestHistory json.RawMessage
+	skillSource := platformskills.New(journey)
+	skillCatalog := skillSource.Catalog()
+	var skillMaterial []platformskills.Material
+	for _, metadata := range skillCatalog {
+		material, err := skillSource.Read(metadata.Name, "SKILL.md")
+		if err != nil {
+			return RunOutput{}, err
+		}
+		skillMaterial = append(skillMaterial, material)
+	}
 	// The pinned graph resumes each outstanding tool result separately. The product
 	// owns batching and durable waiting; a bare MAF agent handles one provider turn.
 	tools := append(funcsAsTools(bound.Tools()), tool.Tool(questionTool{}))
@@ -72,6 +83,24 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 		req.Context = selected
 		req.PendingCommands = pending
 		req.History = requestHistory
+		req.DefinitionDigest = journey.Digest
+		req.SkillCatalog = append([]platformskills.Metadata(nil), skillCatalog...)
+		req.SkillMaterial = cloneSkillMaterial(skillMaterial)
+		req.Provenance = RequestProvenance{
+			Definition: MaterialProvenance{ID: journey.ID, Digest: journey.Digest},
+			System:     MaterialProvenance{ID: journey.ID + "/system", Digest: digestValue(req.Instructions)},
+			Handoff:    MaterialProvenance{ID: journey.ID, Digest: digestValue(req.Handoff)},
+			Catalog:    MaterialProvenance{ID: journey.ID + "/skills", Digest: digestValue(req.SkillCatalog)},
+			Context:    MaterialProvenance{ID: in.ThreadID + "/selected-context", Digest: digestValue(req.Context)},
+			History:    MaterialProvenance{ID: in.ThreadID + "/" + journey.ID, Digest: digestValue(req.History)},
+		}
+		for _, command := range req.PendingCommands {
+			item := MaterialProvenance{ID: command.CommunicationID, Digest: digestValue(command)}
+			req.Provenance.Pending = append(req.Provenance.Pending, item)
+			if command.Text != "" {
+				req.Provenance.IncludedInput = append(req.Provenance.IncludedInput, item)
+			}
+		}
 		return in.Store.Check(ctx, in.Owner)
 	}, func(ctx context.Context) error { return in.Store.Included(ctx, in.Owner, pending) })}, agent.Config{ID: "journey:" + journey.ID, Name: journey.ID, Description: journey.Description, Tools: tools, RunOptions: []agent.Option{agent.WithInstructions(journey.Prompt)}})
 	continuation, err := in.Store.Continuation(ctx, in.Owner)
@@ -162,7 +191,7 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 				return RunOutput{}, err
 			}
 			callID := stableCallID(in.ThreadID, fmt.Sprintf("%s/%d/%d", in.RunID, in.Iteration, callNumber))
-			policy := server.Policies[call.Name].Class
+			policy := journey.Policies[call.Name].Class
 			if policy == "" {
 				policy = "effectful"
 			}

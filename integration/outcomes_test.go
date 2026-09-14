@@ -38,6 +38,9 @@ func policyRunner(t *testing.T, url, class string, model agentruntime.Model) *ag
 	server := config["mcp_servers"].([]any)[0].(map[string]any)
 	server["endpoint"] = url
 	server["policies"] = map[string]any{"lookup_destination": map[string]any{"class": class, "deduplication_evidence": "fixture verifies same X-Platform-Call-ID yields one mutation"}}
+	server["tools"] = []any{"lookup_destination"}
+	config["journeys"] = config["journeys"].([]any)[:1]
+	config["skill_packages"] = config["skill_packages"].([]any)[:1]
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +52,17 @@ func policyRunner(t *testing.T, url, class string, model agentruntime.Model) *ag
 	if err = os.Mkdir(filepath.Join(dir, "prompts"), 0700); err != nil {
 		t.Fatal(err)
 	}
+	if err = os.MkdirAll(filepath.Join(dir, "skills", "planner"), 0700); err != nil {
+		t.Fatal(err)
+	}
 	if err = os.WriteFile(filepath.Join(dir, "prompts/planner.md"), prompt, 0600); err != nil {
+		t.Fatal(err)
+	}
+	skill, err := os.ReadFile("../configs/skills/planner/SKILL.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(dir, "skills/planner/SKILL.md"), skill, 0600); err != nil {
 		t.Fatal(err)
 	}
 	encoded, _ := json.Marshal(config)

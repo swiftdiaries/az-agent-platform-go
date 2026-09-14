@@ -181,6 +181,7 @@ func (p *Platform) execute(ctx context.Context, c Command, in agentruntime.RunIn
 	if err == nil {
 		in.History, err = p.store.Start(ctx, owner, journey, digest)
 		in.TargetJourney = journey
+		in.DefinitionDigest = digest
 	}
 	for {
 		var output agentruntime.RunOutput

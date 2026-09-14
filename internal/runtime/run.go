@@ -20,6 +20,7 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
+	platformskills "github.com/swiftdiaries/az-agent-platform-go/internal/skills"
 )
 
 type ModelTool struct {
@@ -37,15 +38,26 @@ type ToolResult struct {
 type Handoff struct{ JourneyID, Text string }
 
 type ModelRequest struct {
-	Handoff         Handoff
-	Context         []string
-	History         json.RawMessage
-	PendingCommands []journal.Input
-	Instructions    string
-	Messages        []string
-	Tools           []ModelTool
-	ToolResults     []ToolResult
+	Handoff          Handoff
+	Context          []string
+	History          json.RawMessage
+	PendingCommands  []journal.Input
+	Instructions     string
+	Messages         []string
+	Tools            []ModelTool
+	ToolResults      []ToolResult
+	DefinitionDigest string
+	SkillCatalog     []platformskills.Metadata
+	SkillMaterial    []platformskills.Material
+	Provenance       RequestProvenance
 }
+
+type RequestProvenance struct {
+	Definition, System, Handoff, Catalog, Context, History MaterialProvenance
+	Pending, IncludedInput                                 []MaterialProvenance
+}
+
+type MaterialProvenance struct{ ID, Digest string }
 
 type ToolCall struct {
 	CallID    string
@@ -70,16 +82,17 @@ type Runner struct {
 }
 
 type RunInput struct {
-	Store         *journal.Store
-	Owner         journal.Owner
-	Iteration     int
-	History       json.RawMessage
-	ThreadID      string
-	RunID         string
-	Principal     string
-	Text          string
-	TargetJourney string
-	Headers       http.Header
+	Store            *journal.Store
+	Owner            journal.Owner
+	Iteration        int
+	History          json.RawMessage
+	ThreadID         string
+	RunID            string
+	Principal        string
+	Text             string
+	TargetJourney    string
+	DefinitionDigest string
+	Headers          http.Header
 }
 
 type RunOutput struct {
@@ -95,31 +108,29 @@ func NewRunner(registry *definitions.Registry, client *platformmcp.Client, model
 	return &Runner{definitions: registry, mcp: client, model: model}
 }
 
-// Binding identifies exactly the loaded journey declaration and prompt used by this runner.
+// Binding resolves an existing session's pin or the database current pointer for a new one.
 func (r *Runner) Binding(ctx context.Context, in RunInput) (string, string, error) {
 	journey, err := r.route(ctx, in.TargetJourney, in.Text)
 	if err != nil {
 		return "", "", err
 	}
-	server, ok := r.definitions.Server(journey.MCP.Server)
-	if !ok {
-		return "", "", fmt.Errorf("missing MCP server")
+	if in.Store == nil {
+		return "", "", journal.ErrDefinition
 	}
-	data, err := json.Marshal(struct {
-		Definition definitions.Journey
-		Prompt     string
-		Policies   map[string]definitions.ToolPolicy
-	}{journey, journey.Prompt, server.Policies})
+	digest, err := in.Store.ResolveDefinition(ctx, in.ThreadID, journey.ID, journey.Digest)
 	if err != nil {
 		return "", "", err
 	}
-	return journey.ID, fmt.Sprintf("%x", sha256.Sum256(data)), nil
+	if _, ok := r.definitions.Version(digest); !ok {
+		return "", "", journal.ErrDefinition
+	}
+	return journey.ID, digest, nil
 }
 
 func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
-	journey, err := r.route(ctx, input.TargetJourney, input.Text)
-	if err != nil {
-		return RunOutput{}, err
+	journey, ok := r.definitions.Version(input.DefinitionDigest)
+	if !ok || journey.ID != input.TargetJourney {
+		return RunOutput{}, journal.ErrDefinition
 	}
 	ctx, span := otel.Tracer("az-agent-platform/runtime").Start(ctx, "journey.run")
 	span.SetAttributes(
@@ -230,6 +241,20 @@ func funcsAsTools(functions []tool.FuncTool) []tool.Tool {
 func stableCallID(threadID, runID string) string {
 	sum := sha256.Sum256([]byte(threadID + "\x00" + runID + "\x00tool-1"))
 	return "call_" + hex.EncodeToString(sum[:8])
+}
+
+func digestValue(value any) string {
+	data, _ := json.Marshal(value)
+	return fmt.Sprintf("%x", sha256.Sum256(data))
+}
+
+func cloneSkillMaterial(in []platformskills.Material) []platformskills.Material {
+	out := make([]platformskills.Material, len(in))
+	for i, material := range in {
+		out[i] = material
+		out[i].Body = append([]byte(nil), material.Body...)
+	}
+	return out
 }
 
 // TransientHeaders copies only names approved for the selected MCP server.

@@ -5,9 +5,17 @@
       "endpoint": "${TEST_JAVA_MCP_ENDPOINT}",
       "forward_headers": ["Cookie", "Authorization"],
       "call_id_header": "X-Platform-Call-ID",
-      "tools": ["lookup_destination"],
-      "policies": {"lookup_destination": {"class":"read_only"}}
+      "tools": ["lookup_destination", "lookup_shift", "request_shift_swap"],
+      "policies": {
+        "lookup_destination": {"class":"read_only"},
+        "lookup_shift": {"class":"read_only"},
+        "request_shift_swap": {"class":"effectful"}
+      }
     }
+  ],
+  "skill_packages": [
+    {"name":"planner", "root":"skills/planner"},
+    {"name":"shift-swap", "root":"skills/shift-swap"}
   ],
   "journeys": [
     {
@@ -17,7 +25,18 @@
       "mcp": {
         "server": "java-monolith",
         "tools": ["lookup_destination"]
-      }
+      },
+      "skills": ["planner"]
+    },
+    {
+      "id": "shift-swap",
+      "description": "Review available work shifts and request an explicit swap",
+      "system_prompt": "prompts/shift-swap.md",
+      "mcp": {
+        "server": "java-monolith",
+        "tools": ["lookup_shift", "request_shift_swap"]
+      },
+      "skills": ["shift-swap"]
     }
   ]
 }

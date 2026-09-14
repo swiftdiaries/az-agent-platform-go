@@ -20,7 +20,11 @@ func (r *Runner) route(ctx context.Context, target, text string) (definitions.Jo
 		}
 		return journey, nil
 	}
-	// Task 1 has one journey. Keep inference deterministic until Task 5 adds the second.
+	if strings.Contains(strings.ToLower(text), "shift") || strings.Contains(strings.ToLower(text), "swap") {
+		if journey, ok := r.definitions.Journey("shift-swap"); ok {
+			return journey, nil
+		}
+	}
 	journey, ok := r.definitions.DefaultJourney()
 	if !ok || strings.TrimSpace(text) == "" {
 		return definitions.Journey{}, fmt.Errorf("no journey matches request")

@@ -11,6 +11,10 @@ func (s *Store) Start(ctx context.Context, o Owner, journey, digest string) (jso
 	c := o.Command
 	var history json.RawMessage
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		// ponytail: one definition-rollout lock; split per journey only if startup contention matters.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(789134628)"); err != nil {
+			return err
+		}
 		if err := lockOwner(ctx, tx, o); err != nil {
 			return err
 		}
@@ -20,6 +24,20 @@ func (s *Store) Start(ctx context.Context, o Owner, journey, digest string) (jso
 		}
 		if unresolved {
 			return ErrOutcomeUnknown
+		}
+		var existing string
+		err := tx.QueryRow(ctx, "SELECT definition_digest FROM agent_sessions WHERE thread_id=$1 AND journey_id=$2", c.ThreadID, journey).Scan(&existing)
+		if err == pgx.ErrNoRows {
+			var current string
+			err := tx.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current WHERE journey_id=$1", journey).Scan(&current)
+			if err == pgx.ErrNoRows {
+				_, err = tx.Exec(ctx, "INSERT INTO agent_definition_current(journey_id,definition_digest) VALUES($1,$2)", journey, digest)
+			}
+			if err != nil || current != "" && current != digest {
+				return ErrDefinition
+			}
+		} else if err != nil {
+			return err
 		}
 		if _, err := tx.Exec(ctx, "INSERT INTO agent_sessions(thread_id,journey_id,definition_digest) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", c.ThreadID, journey, digest); err != nil {
 			return err

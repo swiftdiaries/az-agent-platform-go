@@ -2,6 +2,7 @@ package definitions
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+)
+
+const (
+	MaxPromptBytes     = 256 << 10
+	MaxConfigBytes     = 1 << 20
+	MaxSkillBytes      = 256 << 10
+	MaxSkillMetadata   = 8 << 10
+	MaxSupportingBytes = 1 << 20
 )
 
 type MCPServer struct {
@@ -32,27 +41,80 @@ type MCPBinding struct {
 }
 
 type Journey struct {
-	ID           string     `json:"id"`
-	Description  string     `json:"description"`
-	SystemPrompt string     `json:"system_prompt"`
-	MCP          MCPBinding `json:"mcp"`
-	Prompt       string     `json:"-"`
+	ID           string                `json:"id"`
+	Description  string                `json:"description"`
+	SystemPrompt string                `json:"system_prompt"`
+	MCP          MCPBinding            `json:"mcp"`
+	SkillNames   []string              `json:"skills,omitempty"`
+	Prompt       string                `json:"-"`
+	Skills       []SkillPackage        `json:"-"`
+	Policies     map[string]ToolPolicy `json:"-"`
+	Digest       string                `json:"-"`
+}
+
+type SkillDeclaration struct {
+	Name                 string   `json:"name"`
+	Root                 string   `json:"root"`
+	SupportingFiles      []string `json:"supporting_files,omitempty"`
+	Disabled             bool     `json:"disabled,omitempty"`
+	AllowSupportingFiles bool     `json:"allow_supporting_files,omitempty"`
+}
+
+type SkillFile struct {
+	Name, Path, Digest string
+	Data               []byte
+}
+
+type SkillPackage struct {
+	Name, Description              string
+	Disabled, AllowSupportingFiles bool
+	Instructions                   SkillFile
+	Supporting                     map[string]SkillFile
+	Digest                         string
 }
 
 type Registry struct {
-	servers  map[string]MCPServer
-	journeys map[string]Journey
-	order    []string
+	servers   map[string]MCPServer
+	journeys  map[string]Journey
+	versions  map[string]Journey
+	canonical map[string][]byte
+	order     []string
 }
 
-func Load(path string) (*Registry, error) {
-	data, err := os.ReadFile(path)
+// Load compiles one candidate configuration and optional retained configurations.
+// The candidate supplies routing defaults and live MCP connection settings.
+func Load(path string, retained ...string) (*Registry, error) {
+	registry, err := loadOne(path)
+	if err != nil {
+		return nil, err
+	}
+	for _, oldPath := range retained {
+		old, err := loadOne(oldPath)
+		if err != nil {
+			return nil, err
+		}
+		for digest, journey := range old.versions {
+			if existing, ok := registry.canonical[digest]; ok && !bytes.Equal(existing, old.canonical[digest]) {
+				return nil, fmt.Errorf("definition digest collision %s", digest)
+			}
+			if _, ok := registry.versions[digest]; !ok {
+				registry.versions[digest] = journey
+				registry.canonical[digest] = bytes.Clone(old.canonical[digest])
+			}
+		}
+	}
+	return registry, nil
+}
+
+func loadOne(path string) (*Registry, error) {
+	data, err := readLimited(path, MaxConfigBytes)
 	if err != nil {
 		return nil, fmt.Errorf("read journey config: %w", err)
 	}
 	var raw struct {
-		MCPServers []MCPServer `json:"mcp_servers"`
-		Journeys   []Journey   `json:"journeys"`
+		MCPServers    []MCPServer        `json:"mcp_servers"`
+		SkillPackages []SkillDeclaration `json:"skill_packages,omitempty"`
+		Journeys      []Journey          `json:"journeys"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -63,7 +125,7 @@ func Load(path string) (*Registry, error) {
 		return nil, fmt.Errorf("decode journey config: trailing value")
 	}
 
-	registry := &Registry{servers: make(map[string]MCPServer), journeys: make(map[string]Journey)}
+	registry := &Registry{servers: make(map[string]MCPServer), journeys: make(map[string]Journey), versions: make(map[string]Journey), canonical: make(map[string][]byte)}
 	for _, server := range raw.MCPServers {
 		if server.ID == "" || server.Endpoint == "" {
 			return nil, fmt.Errorf("MCP server id and endpoint are required")
@@ -119,7 +181,24 @@ func Load(path string) (*Registry, error) {
 		registry.servers[server.ID] = server
 	}
 
-	root := filepath.Dir(path)
+	root, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return nil, fmt.Errorf("resolve config directory: %w", err)
+	}
+	packages := make(map[string]SkillPackage, len(raw.SkillPackages))
+	for _, declaration := range raw.SkillPackages {
+		if declaration.Name == "" || declaration.Root == "" {
+			return nil, fmt.Errorf("skill name and root are required")
+		}
+		if _, ok := packages[declaration.Name]; ok {
+			return nil, fmt.Errorf("duplicate skill %q", declaration.Name)
+		}
+		compiled, err := compileSkill(root, declaration)
+		if err != nil {
+			return nil, fmt.Errorf("skill %q: %w", declaration.Name, err)
+		}
+		packages[declaration.Name] = compiled
+	}
 	for _, journey := range raw.Journeys {
 		if journey.ID == "" || journey.Description == "" || journey.SystemPrompt == "" {
 			return nil, fmt.Errorf("journey id, description, and system prompt are required")
@@ -152,12 +231,41 @@ func Load(path string) (*Registry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("journey %q prompt: %w", journey.ID, err)
 		}
-		prompt, err := os.ReadFile(promptPath)
+		prompt, err := readLimited(promptPath, MaxPromptBytes)
 		if err != nil {
 			return nil, fmt.Errorf("journey %q prompt: %w", journey.ID, err)
 		}
 		journey.Prompt = string(prompt)
+		journey.Policies = selectedPolicies(server.Policies, journey.MCP.Tools)
+		seenSkills := make(map[string]bool)
+		for _, name := range journey.SkillNames {
+			skill, ok := packages[name]
+			if !ok || seenSkills[name] {
+				return nil, fmt.Errorf("journey %q references missing or duplicate skill %q", journey.ID, name)
+			}
+			seenSkills[name] = true
+			journey.Skills = append(journey.Skills, cloneSkill(skill))
+		}
+		canonical, err := json.Marshal(struct {
+			ID, Description, Server, Prompt string
+			Tools                           []string
+			Policies                        map[string]ToolPolicy
+			Skills                          []skillIdentity
+		}{
+			ID: journey.ID, Description: journey.Description, Server: journey.MCP.Server,
+			Prompt: journey.Prompt, Tools: append([]string(nil), journey.MCP.Tools...), Policies: clonePolicies(journey.Policies),
+			Skills: skillIdentities(journey.Skills),
+		})
+		if err != nil {
+			return nil, err
+		}
+		journey.Digest = fmt.Sprintf("%x", sha256.Sum256(canonical))
 		registry.journeys[journey.ID] = journey
+		if existing, ok := registry.canonical[journey.Digest]; ok && !bytes.Equal(existing, canonical) {
+			return nil, fmt.Errorf("definition digest collision %s", journey.Digest)
+		}
+		registry.versions[journey.Digest] = journey
+		registry.canonical[journey.Digest] = bytes.Clone(canonical)
 		registry.order = append(registry.order, journey.ID)
 	}
 	if len(registry.order) == 0 {
@@ -190,20 +298,23 @@ func confinedPath(root, relative string) (string, error) {
 		return "", fmt.Errorf("path escapes config directory")
 	}
 	path := filepath.Join(root, clean)
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return "", err
+	current := root
+	for _, part := range strings.Split(clean, string(filepath.Separator)) {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("symbolic links are not allowed")
+		}
 	}
-	rel, err := filepath.Rel(root, resolved)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("path escapes config directory")
-	}
-	return resolved, nil
+	return path, nil
 }
 
 func (r *Registry) Journey(id string) (Journey, bool) {
 	journey, ok := r.journeys[id]
-	return journey, ok
+	return cloneJourney(journey), ok
 }
 
 func (r *Registry) DefaultJourney() (Journey, bool) {
@@ -215,5 +326,5 @@ func (r *Registry) DefaultJourney() (Journey, bool) {
 
 func (r *Registry) Server(id string) (MCPServer, bool) {
 	server, ok := r.servers[id]
-	return server, ok
+	return cloneServer(server), ok
 }
