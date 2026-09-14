@@ -15,6 +15,12 @@ The source commit is `4569dba84f21797ae57053c26603f54621785b26` (2026-09-14T05:0
 
 Direct transitive APIs at the pin use MCP Go SDK v1.7.0, AG-UI Go SDK `v0.0.0-20260312103001-8e7ab1df34c8`, and OpenTelemetry Go v1.46.0.
 
+### Task 1 confirmed MCP transport
+
+The user confirmed stateful Streamable HTTP with an MCP session ID. Task 1 uses `mcp.StreamableClientTransport` and a stateful server (`StreamableHTTPOptions.Stateless` remains `false`). The integration fixture proves one nonempty `Mcp-Session-Id` is reused within a run and different runs get different sessions. A per-run `http.Client` copies only the server registry's configured headers, so OAuth/session-cookie header names remain deployment configuration rather than platform constants. Legacy HTTP+SSE is not the selected transport.
+
+`configs/journeys.yaml` deliberately uses JSON syntax, which is valid YAML 1.2, so strict decoding and unknown-field rejection need no additional parser dependency. If configuration authors later require YAML-only syntax, add a YAML parser as a separate compatibility change rather than silently accepting a subset.
+
 ## Exact MAF seams
 
 - Session: `a.CreateSession(ctx, opts...) (*agent.Session,error)`; JSON round trip uses `json.Marshal(session)` and `json.Unmarshal(data,&session)`; run with `a.RunText(ctx,text,agent.WithSession(session)).Collect()` or `RunMessage`.

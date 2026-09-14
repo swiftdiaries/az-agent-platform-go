@@ -1,0 +1,21 @@
+{
+  "mcp_servers": [
+    {
+      "id": "java-monolith",
+      "endpoint": "${TEST_JAVA_MCP_ENDPOINT}",
+      "forward_headers": ["Cookie", "Authorization"],
+      "call_id_header": "X-Platform-Call-ID"
+    }
+  ],
+  "journeys": [
+    {
+      "id": "vacation-planner",
+      "description": "Plan a vacation using the configured read-only destination lookup",
+      "system_prompt": "prompts/planner.md",
+      "mcp": {
+        "server": "java-monolith",
+        "tools": ["lookup_destination"]
+      }
+    }
+  ]
+}
