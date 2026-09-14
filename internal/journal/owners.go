@@ -160,5 +160,8 @@ func interruptExpired(ctx context.Context, tx pgx.Tx, thread string) error {
 	if err != nil || result.RowsAffected() == 0 {
 		return err
 	}
+	if err := disposePending(ctx, tx, thread, run, RunInterrupted); err != nil {
+		return err
+	}
 	return appendEvent(ctx, tx, thread, Event{RunID: run, Type: "run.interrupted"})
 }

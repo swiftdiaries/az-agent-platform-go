@@ -20,7 +20,7 @@ func (s *Store) Pending(ctx context.Context, o Owner) (Inbox, error) {
 		if err := lockOwner(ctx, tx, o); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, "SELECT communication_id,payload FROM agent_commands WHERE thread_id=$1 AND execution_run_id=$2 AND NOT included ORDER BY ordinal", o.Command.ThreadID, o.Command.RunID)
+		rows, err := tx.Query(ctx, "SELECT communication_id,payload FROM agent_commands WHERE thread_id=$1 AND execution_run_id=$2 AND NOT included AND terminal_reason='' ORDER BY ordinal", o.Command.ThreadID, o.Command.RunID)
 		if err != nil {
 			return err
 		}
@@ -64,7 +64,7 @@ func (s *Store) Included(ctx context.Context, o Owner, commands []Input) error {
 			return err
 		}
 		for _, c := range commands {
-			result, err := tx.Exec(ctx, "UPDATE agent_commands SET included=true WHERE thread_id=$1 AND execution_run_id=$2 AND communication_id=$3 AND NOT included", o.Command.ThreadID, o.Command.RunID, c.CommunicationID)
+			result, err := tx.Exec(ctx, "UPDATE agent_commands SET included=true WHERE thread_id=$1 AND execution_run_id=$2 AND communication_id=$3 AND NOT included AND terminal_reason=''", o.Command.ThreadID, o.Command.RunID, c.CommunicationID)
 			if err != nil {
 				return err
 			}
@@ -77,4 +77,40 @@ func (s *Store) Included(ctx context.Context, o Owner, commands []Input) error {
 		}
 		return nil
 	})
+}
+
+// The caller holds the conversation/run locks. Terminal runs cannot drain again:
+// dispose their unincluded commands in the same transaction as the run outcome.
+func disposePending(ctx context.Context, tx pgx.Tx, thread, run string, reason RunState) error {
+	rows, err := tx.Query(ctx, `WITH disposed AS (
+ UPDATE agent_commands SET terminal_reason=$3
+ WHERE thread_id=$1 AND execution_run_id=$2 AND NOT included AND terminal_reason=''
+ RETURNING communication_id,ordinal)
+ SELECT communication_id FROM disposed ORDER BY ordinal`, thread, run, reason)
+	if err != nil {
+		return err
+	}
+	var commands []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		commands = append(commands, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	kind := "command.rejected"
+	if reason == RunInterrupted {
+		kind = "command.interrupted"
+	}
+	for _, id := range commands {
+		if err := appendEvent(ctx, tx, thread, Event{RunID: run, CommunicationID: id, Type: kind, Reason: string(reason)}); err != nil {
+			return err
+		}
+	}
+	return nil
 }

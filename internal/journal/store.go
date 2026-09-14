@@ -40,8 +40,14 @@ type Event struct {
 	Sequence                              int64
 	Type, RunID, CallID, ToolName, Answer string
 	CommunicationID                       string
+	Reason                                string
 }
+type CommandOutcome struct {
+	CommunicationID, State, Reason string
+}
+
 type Run struct {
+	CommandOutcomes   []CommandOutcome
 	CommandRunIDs     []string
 	PendingCommands   int
 	RunID             string
@@ -74,6 +80,6 @@ func appendEvent(ctx context.Context, tx pgx.Tx, thread string, e Event) error {
 	if err := tx.QueryRow(ctx, "UPDATE agent_conversations SET sequence=sequence+1 WHERE id=$1 RETURNING sequence", thread).Scan(&sequence); err != nil {
 		return err
 	}
-	_, err := tx.Exec(ctx, "INSERT INTO agent_events(thread_id,sequence,run_id,kind,call_id,tool_name,answer,communication_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)", thread, sequence, e.RunID, e.Type, e.CallID, e.ToolName, e.Answer, e.CommunicationID)
+	_, err := tx.Exec(ctx, "INSERT INTO agent_events(thread_id,sequence,run_id,kind,call_id,tool_name,answer,communication_id,reason) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)", thread, sequence, e.RunID, e.Type, e.CallID, e.ToolName, e.Answer, e.CommunicationID, e.Reason)
 	return err
 }

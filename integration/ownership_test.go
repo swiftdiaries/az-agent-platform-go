@@ -176,9 +176,11 @@ func TestOwnershipLossDuringModelRejectsResultAndRequiresFreshIngress(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if before.RunState != journal.RunInterrupted || before.Runs[0].PendingCommands != 2 || calls.Load() != 1 {
+	if before.RunState != journal.RunInterrupted || before.Runs[0].PendingCommands != 0 || calls.Load() != 1 {
 		t.Fatalf("loss: %+v calls %d", before, calls.Load())
 	}
+	assertCommandOutcome(t, before, "comm", "interrupted", "interrupted")
+	assertCommandOutcome(t, before, "steer", "interrupted", "interrupted")
 	close(release)
 	<-returned
 	a.Close() // Join stale local completion before checking authoritative state.

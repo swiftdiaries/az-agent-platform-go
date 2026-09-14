@@ -48,105 +48,144 @@ func waitDatabase(t *testing.T, pool *pgxpool.Pool, query string, args ...any) {
 }
 
 func TestAdmissionFinishBothCommitOrders(t *testing.T) {
-	for _, first := range []string{"admission", "finish"} {
-		t.Run(first, func(t *testing.T) {
-			ctx := context.Background()
-			pool := database(t)
-			store := journal.New(pool)
-			c := journal.Command{ThreadID: "thread", RunID: "run", CommunicationID: "first", Principal: "alice", Text: "first"}
-			if _, _, err := store.Admit(ctx, c); err != nil {
-				t.Fatal(err)
-			}
-			owner := claimForTest(t, store, c, true)
-			if _, err := store.Start(ctx, owner, "planner", strings.Repeat("a", 64)); err != nil {
-				t.Fatal(err)
-			}
-			steering := c
-			steering.RunID = "steering"
-			steering.CommunicationID = "second"
-			steering.Text = "correction"
-			gate, err := pool.Acquire(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer gate.Release()
-			if _, err := gate.Exec(ctx, "SELECT pg_advisory_lock(345678)"); err != nil {
-				t.Fatal(err)
-			}
-			trigger := `CREATE FUNCTION admission_finish_barrier() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(345678); RETURN NEW; END $$; `
-			if first == "admission" {
-				trigger += `CREATE TRIGGER admission_finish_barrier BEFORE INSERT ON agent_commands FOR EACH ROW EXECUTE FUNCTION admission_finish_barrier()`
-			} else {
-				trigger += `CREATE TRIGGER admission_finish_barrier BEFORE UPDATE ON agent_runs FOR EACH ROW WHEN (NEW.state='completed') EXECUTE FUNCTION admission_finish_barrier()`
-			}
-			if _, err := pool.Exec(ctx, trigger); err != nil {
-				t.Fatal(err)
-			}
-			type admission struct {
-				receipt journal.Receipt
-				fresh   bool
-				err     error
-			}
-			admitted := make(chan admission, 1)
-			finished := make(chan error, 1)
-			admit := func() { r, f, e := store.Admit(ctx, steering); admitted <- admission{r, f, e} }
-			finish := func() { finished <- store.Finish(ctx, owner, journal.RunCompleted, []byte(`[]`), "answer", "", "") }
-			if first == "admission" {
-				go admit()
-			} else {
-				go finish()
-			}
-			waitDatabase(t, pool, "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted AND locktype='advisory')")
-			if first == "admission" {
-				go finish()
-			} else {
-				go admit()
-			}
-			waitDatabase(t, pool, "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted AND locktype='transactionid')")
-			if _, err := gate.Exec(ctx, "SELECT pg_advisory_unlock(345678)"); err != nil {
-				t.Fatal(err)
-			}
-			a, f := <-admitted, <-finished
-			if a.err != nil {
-				t.Fatal(a.err)
-			}
-			if first == "admission" {
-				if !errors.Is(f, journal.ErrPending) || a.fresh || a.receipt.ExecutionRunID != c.RunID {
-					t.Fatalf("admission-first: %+v finish %v", a, f)
-				}
-				inbox, err := store.Pending(ctx, owner)
-				if err != nil || len(inbox.Commands) != 1 || inbox.Commands[0].Text != "correction" {
-					t.Fatalf("orphaned command: %+v %v", inbox, err)
-				}
-				if err := store.Included(ctx, owner, inbox.Commands); err != nil {
+	for _, state := range []journal.RunState{journal.RunCompleted, journal.RunFailed, journal.RunAuthRequired} {
+		for _, first := range []string{"admission", "finish"} {
+			t.Run(string(state)+"/"+first, func(t *testing.T) {
+				ctx := context.Background()
+				pool := database(t)
+				store := journal.New(pool)
+				c := journal.Command{ThreadID: "thread", RunID: "run", CommunicationID: "first", Principal: "alice", Text: "first"}
+				if _, _, err := store.Admit(ctx, c); err != nil {
 					t.Fatal(err)
 				}
-				if err := store.Finish(ctx, owner, journal.RunCompleted, []byte(`[]`), "corrected", "", ""); err != nil {
+				owner := claimForTest(t, store, c, true)
+				if _, err := store.Start(ctx, owner, "planner", strings.Repeat("a", 64)); err != nil {
 					t.Fatal(err)
 				}
-			} else if f != nil || !a.fresh || a.receipt.ExecutionRunID != steering.RunID {
-				t.Fatalf("finish-first: %+v finish %v", a, f)
-			}
-			duplicate, fresh, err := store.Admit(ctx, steering)
-			if err != nil || fresh || !reflect.DeepEqual(duplicate, a.receipt) {
-				t.Fatalf("unstable receipt %+v %v %v", duplicate, fresh, err)
-			}
-			steering.Text = "changed"
-			if _, _, err := store.Admit(ctx, steering); !errors.Is(err, journal.ErrConflict) {
-				t.Fatalf("changed duplicate: %v", err)
-			}
-			var live int
-			if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_runs WHERE state IN ('pending','running')").Scan(&live); err != nil {
-				t.Fatal(err)
-			}
-			want := 0
-			if first == "finish" {
-				want = 1
-			}
-			if live != want {
-				t.Fatalf("live runs %d want %d", live, want)
-			}
-		})
+				steering := c
+				steering.RunID = "steering"
+				steering.CommunicationID = "second"
+				steering.Text = "correction"
+				gate, err := pool.Acquire(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer gate.Release()
+				if _, err := gate.Exec(ctx, "SELECT pg_advisory_lock(345678)"); err != nil {
+					t.Fatal(err)
+				}
+				trigger := `CREATE FUNCTION admission_finish_barrier() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(345678); RETURN NEW; END $$; `
+				if first == "admission" {
+					trigger += `CREATE TRIGGER admission_finish_barrier BEFORE INSERT ON agent_commands FOR EACH ROW EXECUTE FUNCTION admission_finish_barrier()`
+				} else {
+					trigger += `CREATE TRIGGER admission_finish_barrier BEFORE UPDATE ON agent_runs FOR EACH ROW WHEN (NEW.state IN ('completed','failed','auth_required')) EXECUTE FUNCTION admission_finish_barrier()`
+				}
+				if _, err := pool.Exec(ctx, trigger); err != nil {
+					t.Fatal(err)
+				}
+				type admission struct {
+					receipt journal.Receipt
+					fresh   bool
+					err     error
+				}
+				admitted := make(chan admission, 1)
+				finished := make(chan error, 1)
+				admit := func() { r, f, e := store.Admit(ctx, steering); admitted <- admission{r, f, e} }
+				finish := func() { finished <- store.Finish(ctx, owner, state, []byte(`[]`), "answer", "", "") }
+				if first == "admission" {
+					go admit()
+				} else {
+					go finish()
+				}
+				waitDatabase(t, pool, "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted AND locktype='advisory')")
+				if first == "admission" {
+					go finish()
+				} else {
+					go admit()
+				}
+				waitDatabase(t, pool, "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted AND locktype='transactionid')")
+				if _, err := gate.Exec(ctx, "SELECT pg_advisory_unlock(345678)"); err != nil {
+					t.Fatal(err)
+				}
+				a, f := <-admitted, <-finished
+				if a.err != nil {
+					t.Fatal(a.err)
+				}
+				if first == "admission" && state == journal.RunCompleted {
+					if !errors.Is(f, journal.ErrPending) || a.fresh || a.receipt.ExecutionRunID != c.RunID {
+						t.Fatalf("admission-first: %+v finish %v", a, f)
+					}
+					inbox, err := store.Pending(ctx, owner)
+					if err != nil || len(inbox.Commands) != 1 || inbox.Commands[0].Text != "correction" {
+						t.Fatalf("orphaned command: %+v %v", inbox, err)
+					}
+					if err := store.Included(ctx, owner, inbox.Commands); err != nil {
+						t.Fatal(err)
+					}
+					if err := store.Finish(ctx, owner, journal.RunCompleted, []byte(`[]`), "corrected", "", ""); err != nil {
+						t.Fatal(err)
+					}
+				} else if first == "admission" {
+					if f != nil || a.fresh || a.receipt.ExecutionRunID != c.RunID {
+						t.Fatalf("admission-before-failure: %+v finish %v", a, f)
+					}
+					snapshot, err := store.Snapshot(ctx, c.ThreadID, c.Principal)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if snapshot.Runs[0].PendingCommands != 0 {
+						t.Fatalf("terminal %s stranded accepted commands: %+v", state, snapshot)
+					}
+					rejected := false
+					for _, event := range snapshot.Events {
+						if event.Type == "command.rejected" && event.CommunicationID == steering.CommunicationID && event.Reason == string(state) {
+							rejected = true
+						}
+					}
+					if !rejected {
+						t.Fatal("accepted steering has no terminal disposition")
+					}
+				} else if f != nil || !a.fresh || a.receipt.ExecutionRunID != steering.RunID {
+					t.Fatalf("finish-first: %+v finish %v", a, f)
+				}
+				beforeRetry, err := store.Snapshot(ctx, c.ThreadID, c.Principal)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertCommandOutcome(t, beforeRetry, c.CommunicationID, "included", "")
+				disposition, reason := "included", ""
+				if first == "finish" {
+					disposition = "pending"
+				} else if state != journal.RunCompleted {
+					disposition = "rejected"
+					reason = string(state)
+				}
+				assertCommandOutcome(t, beforeRetry, steering.CommunicationID, disposition, reason)
+				duplicate, fresh, err := store.Admit(ctx, steering)
+				if err != nil || fresh || !reflect.DeepEqual(duplicate, a.receipt) {
+					t.Fatalf("unstable receipt %+v %v %v", duplicate, fresh, err)
+				}
+				steering.Text = "changed"
+				if _, _, err := store.Admit(ctx, steering); !errors.Is(err, journal.ErrConflict) {
+					t.Fatalf("changed duplicate: %v", err)
+				}
+				afterRetry, err := store.Snapshot(ctx, c.ThreadID, c.Principal)
+				if err != nil || !reflect.DeepEqual(beforeRetry, afterRetry) {
+					t.Fatalf("duplicate changed terminal disposition: %+v %v", afterRetry, err)
+				}
+				var live int
+				if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_runs WHERE state IN ('pending','running')").Scan(&live); err != nil {
+					t.Fatal(err)
+				}
+				want := 0
+				if first == "finish" {
+					want = 1
+				}
+				if live != want {
+					t.Fatalf("live runs %d want %d", live, want)
+				}
+			})
+		}
 	}
 }
 
@@ -328,22 +367,46 @@ func TestSteeringInclusionFailureStopsDispatch(t *testing.T) {
 	}))
 	service := platform.New(runner, journal.New(pool))
 	defer service.Close()
-	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "comm", Principal: "alice", Text: "hello"}
-	if _, err := service.Submit(ctx, platform.Submission{Command: c}); err != nil {
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, service, pool))
+	defer api.Close()
+	body := aguitypes.RunAgentInput{ThreadID: "external", RunID: "run", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "hello"}}}
+	response := postAGUI(t, api.URL, body, "token", "", "")
+	if response.StatusCode != 200 {
+		t.Fatalf("submission: %+v", response)
+	}
+	var thread string
+	if err := pool.QueryRow(ctx, "SELECT id FROM agent_conversations").Scan(&thread); err != nil {
 		t.Fatal(err)
 	}
-	waitDatabase(t, pool, "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE state='failed')")
-	snapshot, err := service.Snapshot(ctx, "thread", "alice")
+	snapshot, err := service.Snapshot(ctx, thread, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls.Load() != 1 || snapshot.Runs[0].PendingCommands != 1 {
+	if calls.Load() != 1 || snapshot.Runs[0].PendingCommands != 0 {
 		t.Fatalf("failure did not stop: calls %d snapshot %+v", calls.Load(), snapshot)
 	}
 	for _, event := range snapshot.Events {
 		if event.Type == "command.included" || event.Type == "tool.completed" || event.Type == "message.completed" {
 			t.Fatalf("false success: %+v", event)
 		}
+	}
+	assertCommandOutcome(t, snapshot, snapshot.Runs[0].CommandOutcomes[0].CommunicationID, "rejected", "failed")
+	// Reconnect above the watermark must still show the rejected command and reason.
+	req, _ := http.NewRequest(http.MethodGet, api.URL+"?threadId=external&runId=run", nil)
+	req.Header.Set("Authorization", "Bearer token")
+	req.Header.Set("Last-Event-ID", "999")
+	reconnected, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reconnected.Body.Close()
+	data, err := io.ReadAll(reconnected.Body)
+	if err != nil || !bytes.Contains(data, []byte(`"State":"rejected"`)) || !bytes.Contains(data, []byte(`"Reason":"failed"`)) {
+		t.Fatalf("missing snapshot disposition: %s %v", data, err)
+	}
+	retry := postAGUI(t, api.URL, body, "token", "", "")
+	if retry.StatusCode != 200 || calls.Load() != 1 {
+		t.Fatalf("failed command retried provider: %+v calls %d", retry, calls.Load())
 	}
 	var history string
 	if err := pool.QueryRow(ctx, "SELECT history::text FROM agent_sessions").Scan(&history); err != nil || history != "[]" {
@@ -487,12 +550,99 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.RunState != journal.RunInterrupted || snapshot.Runs[0].PendingCommands != 1 || toolCalls.Load() != 1 || modelCalls.Load() != 1 {
+	if snapshot.RunState != journal.RunInterrupted || snapshot.Runs[0].PendingCommands != 0 || toolCalls.Load() != 1 || modelCalls.Load() != 1 {
 		t.Fatalf("takeover/late tool result: %+v calls %d/%d", snapshot, toolCalls.Load(), modelCalls.Load())
 	}
+	assertCommandOutcome(t, snapshot, "initial", "included", "")
+	assertCommandOutcome(t, snapshot, "pending", "interrupted", "interrupted")
 	for _, event := range snapshot.Events {
 		if event.Type == "tool.completed" || event.Type == "message.completed" {
 			t.Fatalf("late result committed: %+v", event)
 		}
+	}
+}
+
+func assertCommandOutcome(t *testing.T, snapshot journal.Snapshot, communication, state, reason string) {
+	t.Helper()
+	for _, run := range snapshot.Runs {
+		for _, outcome := range run.CommandOutcomes {
+			if outcome.CommunicationID != communication {
+				continue
+			}
+			if outcome.State != state || outcome.Reason != reason {
+				t.Fatalf("command disposition: %+v want %s/%s", outcome, state, reason)
+			}
+			if state == "rejected" || state == "interrupted" {
+				found := 0
+				for _, event := range snapshot.Events {
+					if event.CommunicationID == communication && event.Type == "command."+state && event.Reason == reason {
+						found++
+					}
+				}
+				if found != 1 {
+					t.Fatalf("command %s has %d terminal disposition events", communication, found)
+				}
+			}
+			return
+		}
+	}
+	t.Fatalf("no outcome for accepted command %s", communication)
+}
+
+func TestAdmissionFinishDispositionAtomic(t *testing.T) {
+	for _, state := range []journal.RunState{journal.RunFailed, journal.RunAuthRequired, journal.RunInterrupted} {
+		t.Run(string(state), func(t *testing.T) {
+			ctx := context.Background()
+			pool := database(t)
+			store := journal.New(pool)
+			c := journal.Command{ThreadID: "thread", RunID: "run", CommunicationID: "comm", Principal: "alice", Text: "hello"}
+			if _, _, err := store.Admit(ctx, c); err != nil {
+				t.Fatal(err)
+			}
+			owner := claimForTest(t, store, c, false)
+			if state == journal.RunInterrupted {
+				if _, err := pool.Exec(ctx, "UPDATE agent_runs SET lease_until=clock_timestamp()-interval '1 second'"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := store.Snapshot(ctx, c.ThreadID, c.Principal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `CREATE FUNCTION reject_terminal_event() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected terminal event failure'; END $$; CREATE TRIGGER reject_terminal_event BEFORE INSERT ON agent_events FOR EACH ROW WHEN (NEW.kind IN ('run.failed','auth_required','run.interrupted')) EXECUTE FUNCTION reject_terminal_event()`); err != nil {
+				t.Fatal(err)
+			}
+			finish := func() error {
+				if state == journal.RunInterrupted {
+					return store.Reap(ctx)
+				}
+				return store.Finish(ctx, owner, state, nil, "", "", "")
+			}
+			if err := finish(); err == nil {
+				t.Fatal("terminal event failure did not roll back")
+			}
+			after, err := store.Snapshot(ctx, c.ThreadID, c.Principal)
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatalf("partial command disposition: %+v %v", after, err)
+			}
+			if _, err := pool.Exec(ctx, "DROP TRIGGER reject_terminal_event ON agent_events"); err != nil {
+				t.Fatal(err)
+			}
+			if err := finish(); err != nil {
+				t.Fatal(err)
+			}
+			after, err = store.Snapshot(ctx, c.ThreadID, c.Principal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			disposition := "rejected"
+			if state == journal.RunInterrupted {
+				disposition = "interrupted"
+			}
+			assertCommandOutcome(t, after, c.CommunicationID, disposition, string(state))
+			if after.Runs[0].PendingCommands != 0 {
+				t.Fatal("terminal command still pending")
+			}
+		})
 	}
 }

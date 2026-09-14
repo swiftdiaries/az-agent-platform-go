@@ -139,7 +139,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	if !emit(events.NewStateSnapshotEvent(map[string]any{"threadId": input.ThreadID, "watermark": snapshot.Watermark, "journeyId": current.JourneyID, "runState": current.State, "pendingCommands": current.PendingCommands, "answer": current.Answer}), max(cursor, snapshot.Watermark)) {
+	if !emit(events.NewStateSnapshotEvent(map[string]any{"threadId": input.ThreadID, "watermark": snapshot.Watermark, "journeyId": current.JourneyID, "runState": current.State, "pendingCommands": current.PendingCommands, "commands": current.CommandOutcomes, "answer": current.Answer}), max(cursor, snapshot.Watermark)) {
 		return
 	}
 	terminal := func(e platform.Event, sequence int64) bool {
@@ -161,7 +161,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			emit(events.NewRunErrorEvent("run could not complete", events.WithErrorCode(code), events.WithRunID(input.RunID)), sequence)
 			return true
 		default:
-			return !emit(events.NewCustomEvent(e.Type, events.WithValue(map[string]any{"communicationId": e.CommunicationID})), sequence)
+			return !emit(events.NewCustomEvent(e.Type, events.WithValue(map[string]any{"communicationId": e.CommunicationID, "reason": e.Reason})), sequence)
 		}
 	}
 	// Project completed state directly from Agent run records, not replay events.

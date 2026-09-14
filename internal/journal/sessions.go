@@ -53,11 +53,16 @@ func (s *Store) Finish(ctx context.Context, o Owner, state RunState, history jso
 		}
 		if state == RunCompleted {
 			var pending bool
-			if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM agent_commands WHERE thread_id=$1 AND execution_run_id=$2 AND NOT included)", c.ThreadID, c.RunID).Scan(&pending); err != nil {
+			if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM agent_commands WHERE thread_id=$1 AND execution_run_id=$2 AND NOT included AND terminal_reason='')", c.ThreadID, c.RunID).Scan(&pending); err != nil {
 				return err
 			}
 			if pending {
 				return ErrPending
+			}
+		}
+		if state != RunCompleted {
+			if err := disposePending(ctx, tx, c.ThreadID, c.RunID, state); err != nil {
+				return err
 			}
 		}
 		if state == RunCompleted {
