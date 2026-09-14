@@ -259,7 +259,7 @@ func telemetryConfig(require func(string) (string, error), lookup func(string) s
 	endpoint := strings.TrimSpace(lookup("OTEL_EXPORTER_OTLP_ENDPOINT"))
 	if endpoint != "" {
 		parsed, err := url.ParseRequestURI(endpoint)
-		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Path == "" || parsed.Path == "/" {
 			return telemetry.Config{}, errors.New("invalid telemetry endpoint configuration")
 		}
 	}

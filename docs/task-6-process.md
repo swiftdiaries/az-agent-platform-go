@@ -41,7 +41,7 @@ these nonsecret values through `envFrom`; actual values have not been supplied.
 | `AZ_AGENT_FOUNDRY_DEPLOYMENT` | Foundry deployment name |
 | `OTEL_SERVICE_NAME` | trace service name |
 | `OTEL_SERVICE_VERSION` | deployed revision/version |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | optional absolute HTTP(S) OTLP endpoint; empty disables export |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | optional absolute HTTP(S) OTLP traces URL, including its path; empty disables export |
 
 Every listed ConfigMap key is required except
 `AGENT_PLATFORM_RETAINED_CONFIGS` and `OTEL_EXPORTER_OTLP_ENDPOINT`, which are

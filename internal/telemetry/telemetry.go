@@ -14,8 +14,8 @@ import (
 
 const defaultShutdownTimeout = 5 * time.Second
 
-// Config contains non-sensitive telemetry settings. Endpoint must be an OTLP
-// HTTP base URL (for example, http://collector:4318); Headers are copied and
+// Config contains non-sensitive telemetry settings. Endpoint must be the OTLP
+// HTTP traces URL (for example, http://collector:4318/v1/traces); Headers are copied and
 // passed to the exporter without being recorded in spans.
 type Config struct {
 	ServiceName     string

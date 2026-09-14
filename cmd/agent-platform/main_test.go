@@ -83,6 +83,14 @@ func TestLoadConfigRejectsInvalidTelemetryEndpoint(t *testing.T) {
 	}
 }
 
+func TestLoadConfigRequiresTelemetryTracePath(t *testing.T) {
+	values := validEnvironment()
+	values["OTEL_EXPORTER_OTLP_ENDPOINT"] = "https://collector.example"
+	if _, err := loadConfig(missingValue(values)); err == nil {
+		t.Fatal("telemetry endpoint without trace path accepted")
+	}
+}
+
 func validEnvironment() map[string]string {
 	return map[string]string{
 		"DATABASE_URL":          "postgres://user:secret@database.example/agent",
