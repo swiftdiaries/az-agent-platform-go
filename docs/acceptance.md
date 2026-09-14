@@ -1,11 +1,10 @@
 # V1 acceptance ledger
 
 Status: **incomplete**. This ledger is the Task 6 evidence map, not a release
-claim. It is based on `334739438bd91ac9c9b91708b1d25d646c80c33a`; Task 5's
-integrated completion is `5c5d0e2`. The final command must be rerun from the
-root-selected integrated revision after the deployment and telemetry slices
-land. No configured Keycloak, Foundry, Java MCP, or Kubernetes environment was
-provided, so those real-boundary cells are blocked.
+claim. The final candidate source is
+`94e9a63ab608149408da7cb25a6219f1033ff579`; Task 5's integrated completion is
+`5c5d0e2`. No configured Keycloak, Foundry, Java MCP, or Kubernetes environment
+was provided, so those real-boundary cells are blocked.
 
 ## Configuration boundary
 
@@ -16,12 +15,16 @@ The Kubernetes ConfigMap supplies only nonsecret values with `envFrom`:
 | `AGENT_PLATFORM_PORT`, `AGENT_PLATFORM_SHUTDOWN_GRACE`, `AGENT_PLATFORM_CONFIG`, `AGENT_PLATFORM_RETAINED_CONFIGS` |
 | `KEYCLOAK_JWT_ISSUER`, `KEYCLOAK_JWKS_URL`, `KEYCLOAK_JWT_AUDIENCE`, `KEYCLOAK_JWT_SOURCE`, `KEYCLOAK_JWT_HEADER`, `KEYCLOAK_USER_CLAIM_PATH`, `KEYCLOAK_TENANT_CLAIM_PATH`, `KEYCLOAK_JWT_ALLOWED_ALGORITHMS` |
 | `AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT`, `AZ_AGENT_FOUNDRY_DEPLOYMENT` |
+| `OTEL_SERVICE_NAME`, `OTEL_SERVICE_VERSION`, optional `OTEL_EXPORTER_OTLP_ENDPOINT` (the full OTLP HTTP traces URL, including `/v1/traces`) |
 
 `DATABASE_URL` comes from a Kubernetes Secret reference. AAD credentials come
-from workload identity or explicit Secret references. Neither values nor secret
-material belong in this repository, logs, traces, this ledger, or journey YAML.
-The deployment artifact is still pending its Task 6 deployment worker; do not
-apply a substitute manifest.
+from workload identity or explicit Secret references. Optional
+`OTEL_EXPORTER_OTLP_HEADERS` also comes from a Secret reference. Compose requires
+the explicit Secret-provided `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and
+`AZURE_CLIENT_SECRET`; it does not use a host Azure CLI credential. Kubernetes
+uses workload identity. Neither values nor secret material belong in this
+repository, logs, traces, this ledger, or journey YAML. The checked-in deployment
+artifacts have not been applied.
 
 ## Deterministic evidence map
 
@@ -32,33 +35,46 @@ Foundry, Java, or Kubernetes evidence.
 
 | Spec case | Runnable fixture evidence | Current result |
 | --- | --- | --- |
-| 1. Route, declared tools/skills, allowed headers | `TestJourneyAuthenticatedAGUIToMCP`, `TestDeclarativeJourneyRouting`, `TestAcceptanceThreeServiceHTTPSteeringReconnectAndForcedDrain` | PENDING final integrated run |
-| 2. Second configured journey and pinned restart | `TestPersistenceDisconnectAndReplacement`, `TestVersionActivationPreservesPinnedSessions`, `TestJourneyDefinitionRoutesAndMaterializesContext` | PENDING final integrated run |
-| 3. Blocked-tool steering race and reconnect through three replicas | `TestAcceptanceThreeServiceHTTPSteeringReconnectAndForcedDrain`, `TestSteeringBlockedToolAcrossThreeReplicas`, `TestReplayHTTPReconnectCursor` | PENDING final integrated run |
-| 4. Database loss after external dispatch | `TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted`, `TestOwnershipLossDuringModelRejectsResultAndRequiresFreshIngress` | PENDING final integrated run; real Java effect is BLOCKED |
-| 5. Additive definitions, readiness, graceful drain, forced interruption | `TestVersionActivationPreservesPinnedSessions`, `TestServiceDrainRejectsNewAdmissionAndInterruptsExpiredOwner`, `TestAcceptanceThreeServiceHTTPSteeringReconnectAndForcedDrain` | PENDING final integrated run; Kubernetes rollout is BLOCKED |
-| 6. Expired credentials and no durable/shared credentials | `TestJourneyAuthenticatedAGUIToMCP`, `TestApprovalFreshCredentialsAndRejectedReplies` | PENDING final integrated run; real Keycloak expiry is BLOCKED |
-| 7. Correlated trace and privacy defaults | `TestJourneyAuthenticatedAGUIToMCP` | PENDING telemetry integration; real Go-to-Java trace is BLOCKED |
-| 8. Durable clarification and exact approval | `TestHITLDurableWaitReply`, `TestHITLCompletedToolNotReplayed`, `TestApprovalFreshCredentialsAndRejectedReplies`, `TestAcceptanceThreeServiceHTTPApprovalAndReconnect` | PENDING final integrated run |
-| 9. Bounded safe-read retries | `TestToolCallVerifiedRetryStableID` | PENDING final integrated run |
-| 10. Ambiguous effect stops execution | `TestToolCallLostAfterEffectNoRetry`, `TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted` | PENDING final integrated run; real Java effect is BLOCKED |
-| 11. Business repair and renewed approval | `TestBusinessErrorChangedActionRequiresNewApproval` | PENDING final integrated run |
-| 12. Auth-required versus sanitized internal failure | `TestJourneyAuthenticatedAGUIToMCP`, `TestAuthRejectsMissingCredentials` | PENDING final integrated run; real Keycloak boundary is BLOCKED |
+| 1. Route, declared tools/skills, allowed headers | `TestJourneyAuthenticatedAGUIToMCP`, `TestDeclarativeJourneyRouting`, `TestAcceptanceThreeServiceHTTPSteeringReconnectAndForcedDrain` | PASS fixture |
+| 2. Second configured journey and pinned restart | `TestPersistenceDisconnectAndReplacement`, `TestVersionActivationPreservesPinnedSessions`, `TestJourneyDefinitionRoutesAndMaterializesContext` | PASS fixture |
+| 3. Blocked-tool steering race and reconnect through three replicas | `TestAcceptanceThreeServiceHTTPSteeringReconnectAndForcedDrain`, `TestSteeringBlockedToolAcrossThreeReplicas`, `TestReplayHTTPReconnectCursor` | PASS fixture |
+| 4. Database loss after external dispatch | `TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted`, `TestOwnershipLossDuringModelRejectsResultAndRequiresFreshIngress` | PASS fixture; real Java effect is BLOCKED |
+| 5. Additive definitions, readiness, graceful drain, forced interruption | `TestVersionActivationPreservesPinnedSessions`, `TestServiceDrainRejectsNewAdmissionAndInterruptsExpiredOwner`, `TestAcceptanceThreeServiceHTTPSteeringReconnectAndForcedDrain` | PASS fixture; Kubernetes rollout is BLOCKED |
+| 6. Expired credentials and no durable/shared credentials | `TestJourneyAuthenticatedAGUIToMCP`, `TestApprovalFreshCredentialsAndRejectedReplies` | PASS fixture; real Keycloak expiry is BLOCKED |
+| 7. Correlated trace and privacy defaults | `TestJourneyAuthenticatedAGUIToMCP`, `TestExporterPostsToConfiguredTracePath` | PASS fixture; real Go-to-Java trace is BLOCKED |
+| 8. Durable clarification and exact approval | `TestHITLDurableWaitReply`, `TestHITLCompletedToolNotReplayed`, `TestApprovalFreshCredentialsAndRejectedReplies`, `TestAcceptanceThreeServiceHTTPApprovalAndReconnect` | PASS fixture |
+| 9. Bounded safe-read retries | `TestToolCallVerifiedRetryStableID` | PASS fixture |
+| 10. Ambiguous effect stops execution | `TestToolCallLostAfterEffectNoRetry`, `TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted` | PASS fixture; real Java effect is BLOCKED |
+| 11. Business repair and renewed approval | `TestBusinessErrorChangedActionRequiresNewApproval` | PASS fixture |
+| 12. Auth-required versus sanitized internal failure | `TestJourneyAuthenticatedAGUIToMCP`, `TestAuthRejectsMissingCredentials` | PASS fixture; real Keycloak boundary is BLOCKED |
 
 The new service-level tests use three independently served `service.Service`
 instances with shared PostgreSQL, real AG-UI HTTP requests, reconnect, durable
 steering or approval, and a bounded drain/forced-loss path. Their model and MCP
 peers are fixtures; they do not claim a Java trace or an external provider.
 
-Local development evidence for this task: `GOCACHE=$PWD/.cache/go-build go test
--race ./integration -run '^TestAcceptance' -count=1` passed on 2026-09-15 with
-the isolated PostgreSQL `16.13 (Debian 16.13-1.pgdg13+1)` fixture. This is a
-focused pre-integration result only; it does not change any `PENDING` or
-`BLOCKED` final cell above.
+Local candidate evidence, run on 2026-09-15 from
+`94e9a63ab608149408da7cb25a6219f1033ff579`:
+
+| Check | Result |
+| --- | --- |
+| `go test -race ./... -count=1 -timeout=120s` | PASS; PostgreSQL `16.13 (Debian 16.13-1.pgdg13+1)` isolated fixture; integration package 32.431s |
+| `go vet ./...` | PASS |
+| `go version` | `go1.26.0 darwin/arm64` |
+| `docker build -t az-agent-platform:task-6-candidate .` | PASS; image `sha256:289a79cdf1798ca3affba308fa32771fefb1723b85f381f52b8bdc07888256ee`, user `nonroot:nonroot`, entrypoint `/app/agent-platform` |
+| `docker compose -f deploy/compose.yaml config --quiet` | PASS with synthetic nonsecret configuration |
+| `kubectl config current-context` | BLOCKED: no current context is configured; no manifest was applied |
+
+The fixture cases use three independently served `service.Service` instances
+with shared PostgreSQL, real AG-UI HTTP requests, reconnect, durable steering
+or approval, and a bounded drain/forced-loss path. Their model and MCP peers
+are fixtures; the PASS entries do not claim a Java trace, an external provider,
+or Kubernetes rollout.
 
 ## Required final commands and external evidence
 
-Run after integration, from the exact Git revision recorded with the result:
+Repeat after root integrates the candidate, from the exact Git revision recorded
+with the result:
 
 ```sh
 GOCACHE=$PWD/.cache/go-build go test -race ./... -count=1
