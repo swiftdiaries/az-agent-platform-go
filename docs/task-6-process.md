@@ -39,6 +39,14 @@ these nonsecret values through `envFrom`; actual values have not been supplied.
 | `AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT` | Azure AI Foundry project endpoint |
 | `AZ_AGENT_FOUNDRY_DEPLOYMENT` | Foundry deployment name |
 
+Every listed ConfigMap key is required except
+`AGENT_PLATFORM_RETAINED_CONFIGS`, which is optional and empty when no session
+pin needs an older bundle. There are no implicit file, port, or grace-period
+defaults: `AGENT_PLATFORM_PORT` must be an integer from 1 through 65535 and
+`AGENT_PLATFORM_SHUTDOWN_GRACE` must be a positive Go duration. Missing or
+invalid values stop startup with the fixed message `agent platform startup
+failed`; values and Secret details are not printed.
+
 `journeys.yaml` remains mounted ConfigMap content. It declares the Java MCP
 endpoint and the exact forwarded-header allowlist; deployment does not add an
 ad hoc endpoint override or interpolate secret values into YAML. Header values
@@ -51,6 +59,13 @@ Kubernetes workload identity or explicit Secret references. Secret values are
 never committed or logged. Missing Keycloak,
 Foundry, Java MCP, or cluster values leave their real-boundary acceptance cells
 `BLOCKED`; fixture coverage does not change that state.
+
+Foundry is limited to an AAD-authenticated Azure AI Foundry **project endpoint**
+and deployment through the Responses API. Generic Foundry endpoints and API-key
+authentication are unsupported. The process constructs an Azure default AAD
+credential, so workload identity is the expected production path. The Foundry
+adapter refuses redirects before a redirected request can receive that bearer
+credential.
 
 ## Delivery split
 
@@ -65,6 +80,6 @@ Task 6 began from `5c5d0e29d6e68b51cbc1ea89905ff3e83afceb62` in parallel:
 - F: combined three-replica, twelve-case acceptance (Terra), after A through E
 
 Each slice receives focused independent review before integration. The command
-entrypoint will compose A and B through `service.Dependencies` after their
-source is integrated. No real acceptance claim is made until supplied
+entrypoint composes A and B through `service.Dependencies`. No real acceptance
+claim is made until supplied
 configuration permits the corresponding checks.

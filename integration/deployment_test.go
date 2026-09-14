@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -61,12 +62,27 @@ func TestServiceDrainRejectsNewAdmissionAndInterruptsExpiredOwner(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer app.Close()
-	api := httptest.NewServer(app.Handler())
-	defer api.Close()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- app.Serve(listener) }()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := app.Shutdown(shutdownCtx); err != nil {
+			t.Error(err)
+		}
+		if err := <-serveErr; err != nil {
+			t.Error(err)
+		}
+		app.Close()
+	}()
+	apiURL := "http://" + listener.Addr().String()
 
 	for _, endpoint := range []string{"/livez", "/readyz"} {
-		response, err := http.Get(api.URL + endpoint)
+		response, err := http.Get(apiURL + endpoint)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -78,7 +94,7 @@ func TestServiceDrainRejectsNewAdmissionAndInterruptsExpiredOwner(t *testing.T) 
 	post := func(run string) *http.Response {
 		t.Helper()
 		body, _ := json.Marshal(aguitypes.RunAgentInput{ThreadID: "thread", RunID: run, Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan"}}})
-		req, _ := http.NewRequest(http.MethodPost, api.URL+"/agent", bytes.NewReader(body))
+		req, _ := http.NewRequest(http.MethodPost, apiURL+"/agent", bytes.NewReader(body))
 		req.Header.Set("Authorization", "Bearer token")
 		response, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -98,7 +114,7 @@ func TestServiceDrainRejectsNewAdmissionAndInterruptsExpiredOwner(t *testing.T) 
 	}
 
 	app.BeginDrain()
-	response, err := http.Get(api.URL + "/readyz")
+	response, err := http.Get(apiURL + "/readyz")
 	if err != nil {
 		t.Fatal(err)
 	}
