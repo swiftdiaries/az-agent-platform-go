@@ -139,7 +139,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	t.Cleanup(api.Close)
 
 	body := aguitypes.RunAgentInput{
-		ThreadID: "thread-1", RunID: "message-1",
+		ThreadID: "thread-secret-alice@example.com", RunID: "run-secret-ssn-1234",
 		State:    map[string]any{"principal": "mallory", "journey": "vacation-planner"},
 		Messages: []aguitypes.Message{{ID: "message-1", Role: aguitypes.RoleUser, Content: "Plan Kyoto"}},
 	}
@@ -165,22 +165,36 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	if aliceSession == "" {
 		t.Fatalf("stateful streamable session did not reuse a session ID with allowlisted headers: %#v", gotTransport)
 	}
-	firstSnapshot, err := service.Snapshot("thread-1", "alice")
+	internalThreadID, internalRunID := assertTrace(t, spanRecorder.Ended(), got[0].callID, body.ThreadID, body.RunID, "Plan Kyoto", "session=alice", "alice-token", "Kyoto")
+	if internalThreadID == body.ThreadID || internalRunID == body.RunID || internalThreadID == "" || internalRunID == "" {
+		t.Fatalf("external identity was not mapped to opaque product IDs: thread=%q run=%q", internalThreadID, internalRunID)
+	}
+	if !strings.Contains(response.Body, body.ThreadID) || !strings.Contains(response.Body, body.RunID) ||
+		strings.Contains(response.Body, internalThreadID) || strings.Contains(response.Body, internalRunID) {
+		t.Fatalf("AG-UI response did not preserve external correlation at the edge: %s", response.Body)
+	}
+	firstSnapshot, err := service.Snapshot(internalThreadID, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if callIDFromEvents(firstSnapshot.Events) != got[0].callID {
 		t.Fatalf("event/product call ID does not match Java header: %#v", firstSnapshot.Events)
 	}
-	assertTrace(t, spanRecorder.Ended(), got[0].callID, "Plan Kyoto", "session=alice", "alice-token", "Kyoto")
 
+	bobSpanStart := len(spanRecorder.Ended())
 	bobBody := body
-	bobBody.ThreadID, bobBody.RunID = "thread-2", "message-2"
-	bobBody.Messages = []aguitypes.Message{{ID: "message-2", Role: aguitypes.RoleUser, Content: "Plan Kyoto"}}
+	bobBody.Messages = []aguitypes.Message{{ID: body.RunID, Role: aguitypes.RoleUser, Content: "Plan Kyoto"}}
 	bobBody.ForwardedProps = map[string]any{"journeyId": "vacation-planner"}
 	bob := postAGUI(t, api.URL, bobBody, "bob-token", "session=bob", "other-secret")
 	if bob.StatusCode != http.StatusOK {
 		t.Fatalf("bob response = %#v", bob)
+	}
+	bobThreadID, bobRunID := chatIdentity(spanRecorder.Ended()[bobSpanStart:])
+	if bobThreadID == "" || bobRunID == "" || bobThreadID == internalThreadID || bobRunID == internalRunID {
+		t.Fatalf("principal-scoped identity mapping was not isolated: alice=(%q,%q) bob=(%q,%q)", internalThreadID, internalRunID, bobThreadID, bobRunID)
+	}
+	if _, err := service.Snapshot(bobThreadID, "bob"); err != nil {
+		t.Fatalf("bob snapshot through mapped identity: %v", err)
 	}
 	mu.Lock()
 	got = slices.Clone(observations)
@@ -212,6 +226,12 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	if replay.StatusCode != http.StatusOK || !strings.Contains(replay.Body, "Kyoto is available") {
 		t.Fatalf("idempotent replay = %#v", replay)
 	}
+	mu.Lock()
+	callCountAfterReplay := len(observations)
+	mu.Unlock()
+	if callCountAfterReplay != 2 {
+		t.Fatalf("stable external ID retry mapping executed MCP again, observations = %d", callCountAfterReplay)
+	}
 	changed := body
 	changed.Messages = []aguitypes.Message{{ID: "message-1", Role: aguitypes.RoleUser, Content: "changed payload"}}
 	conflict := postAGUI(t, api.URL, changed, "alice-token", "session=alice", "")
@@ -241,7 +261,8 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	if expired.StatusCode != http.StatusOK || !strings.Contains(expired.Body, `"code":"auth_required"`) || strings.Contains(expired.Body, "expired downstream") {
 		t.Fatalf("expired downstream auth response = %#v", expired)
 	}
-	expiredSnapshot, err := service.Snapshot("thread-6", "alice")
+	expiredThreadID, _ := latestChatIdentity(spanRecorder.Ended())
+	expiredSnapshot, err := service.Snapshot(expiredThreadID, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,22 +283,26 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	if internal.StatusCode != http.StatusOK || !strings.Contains(internal.Body, `"code":"internal_error"`) || strings.Contains(internal.Body, "password") {
 		t.Fatalf("internal failure response = %#v", internal)
 	}
-	internalSnapshot, err := service.Snapshot("thread-7", "alice")
+	failedThreadID, _ := latestChatIdentity(spanRecorder.Ended())
+	internalSnapshot, err := service.Snapshot(failedThreadID, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if internalSnapshot.RunState != platform.RunFailed || !slices.ContainsFunc(internalSnapshot.Events, func(event platform.Event) bool { return event.Type == "run.failed" }) {
 		t.Fatalf("internal failure snapshot = %#v", internalSnapshot)
 	}
-	snapshot, err := service.Snapshot("thread-1", "alice")
+	snapshot, err := service.Snapshot(internalThreadID, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if snapshot.RunState != platform.RunCompleted || snapshot.Answer != "Kyoto is available" || len(snapshot.Events) < 4 {
 		t.Fatalf("snapshot = %#v", snapshot)
 	}
-	if _, err := service.Snapshot("thread-1", "mallory"); err == nil {
+	if _, err := service.Snapshot(internalThreadID, "mallory"); err == nil {
 		t.Fatal("forged principal read another principal's thread")
+	}
+	if _, err := service.Snapshot(body.ThreadID, "alice"); err == nil {
+		t.Fatal("raw external thread ID reached platform state")
 	}
 }
 
@@ -363,6 +388,36 @@ func TestToolBindingFailsClosed(t *testing.T) {
 	}
 }
 
+func TestToolBindingDoesNotForwardCredentialsAcrossRedirect(t *testing.T) {
+	var hostileRequests int
+	var hostileAuthorization, hostileCookie string
+	hostile := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		hostileRequests++
+		hostileAuthorization = request.Header.Get("Authorization")
+		hostileCookie = request.Header.Get("Cookie")
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(hostile.Close)
+
+	redirect := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, hostile.URL, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirect.Close)
+
+	headers := make(http.Header)
+	headers.Set("Authorization", "Bearer redirect-secret")
+	headers.Set("Cookie", "session=redirect-secret")
+	_, err := platformmcp.NewClient().Bind(t.Context(), definitions.MCPServer{
+		ID: "redirect", Endpoint: redirect.URL, ForwardHeaders: []string{"Authorization", "Cookie"},
+	}, []string{"lookup_destination"}, headers)
+	if err == nil {
+		t.Fatal("Bind followed an MCP redirect")
+	}
+	if hostileRequests != 0 || hostileAuthorization != "" || hostileCookie != "" {
+		t.Fatalf("redirect destination received requests=%d authorization=%q cookie=%q", hostileRequests, hostileAuthorization, hostileCookie)
+	}
+}
+
 func statefulSessionID(observations []transportObservation, cookie, authorization string) string {
 	var sessionID string
 	requestsWithSession := 0
@@ -423,11 +478,11 @@ func callIDFromEvents(events []platform.Event) string {
 	return ""
 }
 
-func assertTrace(t *testing.T, spans []sdktrace.ReadOnlySpan, callID string, forbidden ...string) {
+func assertTrace(t *testing.T, spans []sdktrace.ReadOnlySpan, callID string, forbidden ...string) (string, string) {
 	t.Helper()
 	var traceID string
 	for _, span := range spans {
-		if span.Name() == "chat.accept" && spanAttribute(span, "thread.id") == "thread-1" {
+		if span.Name() == "chat.accept" {
 			traceID = span.SpanContext().TraceID().String()
 			break
 		}
@@ -477,6 +532,31 @@ func assertTrace(t *testing.T, spans []sdktrace.ReadOnlySpan, callID string, for
 			t.Fatalf("span %s parent = %s, want %s (%s)", child, parents[child], parent, spanIDs[parent])
 		}
 	}
+	for _, span := range spans {
+		if span.SpanContext().TraceID().String() == traceID && span.Name() == "chat.accept" {
+			return spanAttribute(span, "thread.id"), spanAttribute(span, "run.id")
+		}
+	}
+	t.Fatal("chat.accept identity attributes missing")
+	return "", ""
+}
+
+func latestChatIdentity(spans []sdktrace.ReadOnlySpan) (string, string) {
+	for i := len(spans) - 1; i >= 0; i-- {
+		if spans[i].Name() == "chat.accept" {
+			return spanAttribute(spans[i], "thread.id"), spanAttribute(spans[i], "run.id")
+		}
+	}
+	return "", ""
+}
+
+func chatIdentity(spans []sdktrace.ReadOnlySpan) (string, string) {
+	for _, span := range spans {
+		if span.Name() == "chat.accept" {
+			return spanAttribute(span, "thread.id"), spanAttribute(span, "run.id")
+		}
+	}
+	return "", ""
 }
 
 func spanAttribute(span sdktrace.ReadOnlySpan, name string) string {

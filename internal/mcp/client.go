@@ -38,9 +38,14 @@ func (c *Client) Bind(ctx context.Context, server definitions.MCPServer, allowed
 			forwarded.Add(name, value)
 		}
 	}
-	httpClient := &http.Client{Transport: &headerTransport{
-		base: http.DefaultTransport, headers: forwarded, callIDHeader: server.CallIDHeader,
-	}}
+	httpClient := &http.Client{
+		Transport: &headerTransport{
+			base: http.DefaultTransport, headers: forwarded, callIDHeader: server.CallIDHeader,
+		},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	ctx, span := otel.Tracer("az-agent-platform/mcp").Start(ctx, "mcp.discover")
 	span.SetAttributes(attribute.String("mcp.server.id", server.ID))
 	defer span.End()
