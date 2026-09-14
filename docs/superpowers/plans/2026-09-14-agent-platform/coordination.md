@@ -95,13 +95,18 @@ Keep independent review and verification. Split a deliverable only when its impl
 
 ## Task 5 submission
 
-- Authored on `implement/task-5` from reviewed Task 4 base `61c6b556ec7e9f4fa31845a7c7425fec207bae54`. Submitted revision is the commit containing this entry. Independent specification and quality reviews are pending; no review gate is marked passed.
+- Authored on `implement/task-5` from reviewed Task 4 base `61c6b556ec7e9f4fa31845a7c7425fec207bae54`. Integrated reviewed candidate is `7710fe20efb786d21c7cd57e164f895008f45735` on `main`; Task 5 review gate is passed.
 - Added content-addressed immutable journey and skill compilation, retained-version lookup, bounded and traversal-safe package reads, metadata-only skill catalogs, controlled material reads, and defensive copies. MCP endpoints and forwarded-header values remain live configuration outside definition identity.
 - PostgreSQL current pointers advance conditionally only when the candidate and every session-pinned digest are locally available. Activation is serialized with first-session pinning; stale activation and unknown versions fail closed. Completed and clarification-waiting sessions preserve their old definition through replacement, while new sessions use current.
 - The second `shift-swap` journey is declarative configuration plus prompt and skill content. Runtime routing remains the existing explicit-target path with a minimal deterministic inference fallback. Provider requests carry the exact pinned definition, prompt, tools, skill catalog/material, selected context and stable ID/digest provenance without adding transcript content to telemetry.
 - Red evidence: definition tests first failed on absent digest/version/skill APIs; skill tests failed on the absent controlled source; version tests failed on absent PostgreSQL current-pointer APIs; provider tests failed on absent pinned material and provenance. The first full suite exposed an old temp-config fixture that omitted newly declared package roots; copying the declared planner package repaired it.
-- Final checks on PostgreSQL 16.13 with no skips: `go test ./... -count=1 -timeout=90s`; `go test -race ./internal/... ./integration -run 'TestJourneyDefinition|TestSkill|TestContext|TestVersion' -count=1 -timeout=90s`; `go vet ./...`; `git diff --check`.
-- Next: independent reviewers inspect the exact submitted commit. Task 6 remains pending and no real provider, identity, ingress or deployment integration is claimed here.
+- Final checks on PostgreSQL 16.13 with no skips: `go test -race ./... -count=1 -timeout=120s` passed (`integration 38.619s`); verbose `TestPostgresIsolationAndMigrations` passed and reported PostgreSQL 16.13 (Debian 16.13-1.pgdg13+1); `go vet ./...` and both diff checks passed. The reviewed runtime-tool-name delta `5659d94f4d3cba4db9b5e6c0796344c4cd723624` and cross-journey activation delta `190b55165802dc8309b1a2d6de1d1bb5b78e9403` retain matching patch identities after cherry-pick as `68fac9f` and `7710fe2`; all three independent review scopes passed, including the narrow PostgreSQL state rereview (`4.118s`).
+- Next: Task 6 is pending and ready. No real provider, identity, ingress or deployment integration is claimed here.
+
+### Task 5 integration and review history
+
+- Root fast-forwarded `main` from `61c6b556ec7e9f4fa31845a7c7425fec207bae54` to `7710fe20efb786d21c7cd57e164f895008f45735` after the exact candidate passed its final checks. The pre-existing `go.mod`/`go.sum` dependency diff was preserved byte-for-byte and remains the only dirty main-worktree state; no push was performed.
+- The reserved runtime-name/compiler and storage review scopes passed independently on `5659d94f4d3cba4db9b5e6c0796344c4cd723624`; the cross-journey activation state rereview passed independently on `190b55165802dc8309b1a2d6de1d1bb5b78e9403` with the narrow PostgreSQL race check. Combined candidate review passed all three scopes.
 
 ## Task 5 repair after specification review
 
