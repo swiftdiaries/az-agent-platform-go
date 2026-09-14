@@ -7,6 +7,10 @@ import (
 	"slices"
 	"sync"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+
+	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
@@ -14,15 +18,17 @@ var (
 	ErrConflict        = errors.New("communication ID conflicts with accepted command")
 	ErrForbidden       = errors.New("thread belongs to another principal")
 	ErrExecutionFailed = errors.New("accepted run failed")
+	ErrAuthRequired    = errors.New("downstream authentication required")
 )
 
 type RunState string
 
 const (
-	RunAccepted  RunState = "accepted"
-	RunRunning   RunState = "running"
-	RunCompleted RunState = "completed"
-	RunFailed    RunState = "failed"
+	RunAccepted     RunState = "accepted"
+	RunRunning      RunState = "running"
+	RunCompleted    RunState = "completed"
+	RunFailed       RunState = "failed"
+	RunAuthRequired RunState = "auth_required"
 )
 
 type Command struct {
@@ -95,6 +101,12 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	command := submission.Command
+	ctx, span := otel.Tracer("az-agent-platform/platform").Start(ctx, "agent.start_turn")
+	span.SetAttributes(
+		attribute.String("thread.id", command.ThreadID), attribute.String("run.id", command.RunID),
+		attribute.String("communication.id", command.CommunicationID),
+	)
+	defer span.End()
 	current := p.threads[command.ThreadID]
 	if current != nil && current.principal != command.Principal {
 		return Receipt{}, ErrForbidden
@@ -111,6 +123,9 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 		if accepted.receipt.State == RunFailed {
 			return accepted.receipt, ErrExecutionFailed
 		}
+		if accepted.receipt.State == RunAuthRequired {
+			return accepted.receipt, ErrAuthRequired
+		}
 		return accepted.receipt, nil
 	}
 
@@ -126,11 +141,18 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 		Text: command.Text, TargetJourney: command.TargetJourney, Headers: submission.Headers,
 	})
 	if err != nil {
+		if errors.Is(err, platformmcp.ErrAuthRequired) {
+			current.snapshot.RunState = RunAuthRequired
+			p.append(current, Event{Type: "auth_required", RunID: command.RunID})
+			receipt.State = RunAuthRequired
+			current.commands[command.CommunicationID] = acceptedCommand{command: command, receipt: receipt}
+			return receipt, ErrAuthRequired
+		}
 		current.snapshot.RunState = RunFailed
 		p.append(current, Event{Type: "run.failed", RunID: command.RunID})
 		receipt.State = RunFailed
 		current.commands[command.CommunicationID] = acceptedCommand{command: command, receipt: receipt}
-		return receipt, err
+		return receipt, ErrExecutionFailed
 	}
 	if output.CallID != "" {
 		p.append(current, Event{Type: "tool.completed", RunID: command.RunID, CallID: output.CallID, ToolName: output.ToolName})

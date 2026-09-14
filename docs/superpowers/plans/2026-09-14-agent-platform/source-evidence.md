@@ -21,6 +21,8 @@ The user confirmed stateful Streamable HTTP with an MCP session ID. Task 1 uses 
 
 `configs/journeys.yaml` deliberately uses JSON syntax, which is valid YAML 1.2, so strict decoding and unknown-field rejection need no additional parser dependency. If configuration authors later require YAML-only syntax, add a YAML parser as a separate compatibility change rather than silently accepting a subset.
 
+The checked-in MCP server entry is also the credential-free startup contract for tool names. Journey allowlists must match that catalog exactly, then each run still performs authenticated discovery and exact binding. HTTP 401/403 from the downstream MCP transport is classified as `auth_required`; other transport/model failures remain sanitized terminal failures. The application trace chain is `chat.accept` → `agent.start_turn` → `hub.route` and `journey.run`, with provider and MCP children. The stable product call ID is generated from the run and carried in the MCP header, event, and span; a distinct provider call ID remains inside MAF history for function-result correlation.
+
 ## Exact MAF seams
 
 - Session: `a.CreateSession(ctx, opts...) (*agent.Session,error)`; JSON round trip uses `json.Marshal(session)` and `json.Unmarshal(data,&session)`; run with `a.RunText(ctx,text,agent.WithSession(session)).Collect()` or `RunMessage`.

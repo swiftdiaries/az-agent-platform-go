@@ -4,7 +4,8 @@
       "id": "java-monolith",
       "endpoint": "${TEST_JAVA_MCP_ENDPOINT}",
       "forward_headers": ["Cookie", "Authorization"],
-      "call_id_header": "X-Platform-Call-ID"
+      "call_id_header": "X-Platform-Call-ID",
+      "tools": ["lookup_destination"]
     }
   ],
   "journeys": [

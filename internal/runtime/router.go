@@ -1,13 +1,18 @@
 package runtime
 
 import (
+	"context"
 	"fmt"
 	"strings"
+
+	"go.opentelemetry.io/otel"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 )
 
-func (r *Runner) route(target, text string) (definitions.Journey, error) {
+func (r *Runner) route(ctx context.Context, target, text string) (definitions.Journey, error) {
+	_, span := otel.Tracer("az-agent-platform/runtime").Start(ctx, "hub.route")
+	defer span.End()
 	if target != "" {
 		journey, ok := r.definitions.Journey(target)
 		if !ok {

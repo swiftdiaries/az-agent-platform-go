@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -16,6 +17,8 @@ import (
 )
 
 type Client struct{}
+
+var ErrAuthRequired = errors.New("MCP authentication required")
 
 func NewClient() *Client { return &Client{} }
 
@@ -113,5 +116,10 @@ func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			clone.Header.Set(t.callIDHeader, callID)
 		}
 	}
-	return t.base.RoundTrip(clone)
+	response, err := t.base.RoundTrip(clone)
+	if err == nil && (response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) {
+		response.Body.Close()
+		return nil, ErrAuthRequired
+	}
+	return response, err
 }

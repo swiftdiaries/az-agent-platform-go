@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +18,9 @@ import (
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
@@ -39,9 +44,19 @@ type transportObservation struct {
 }
 
 func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
+	spanRecorder := tracetest.NewSpanRecorder()
+	tracerProvider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRecorder))
+	previousTracerProvider := otel.GetTracerProvider()
+	otel.SetTracerProvider(tracerProvider)
+	t.Cleanup(func() {
+		otel.SetTracerProvider(previousTracerProvider)
+		_ = tracerProvider.Shutdown(context.Background())
+	})
+
 	var mu sync.Mutex
 	var observations []mcpObservation
 	var transportObservations []transportObservation
+	var expiredAttempts int
 	server := mcp.NewServer(&mcp.Implementation{Name: "java-fixture", Version: "1"}, nil)
 	mcp.AddTool(server, &mcp.Tool{Name: "lookup_destination", Description: "look up a destination"},
 		func(_ context.Context, req *mcp.CallToolRequest, input struct {
@@ -68,6 +83,21 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 			authorization: request.Header.Get("Authorization"), smuggled: request.Header.Get("X-Smuggle"),
 		})
 		mu.Unlock()
+		if request.Header.Get("Cookie") == "session=expired" && request.Method == http.MethodPost {
+			payload, err := io.ReadAll(request.Body)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			request.Body = io.NopCloser(bytes.NewReader(payload))
+			if bytes.Contains(payload, []byte(`"method":"tools/call"`)) {
+				mu.Lock()
+				expiredAttempts++
+				mu.Unlock()
+				http.Error(writer, "expired downstream credential detail", http.StatusUnauthorized)
+				return
+			}
+		}
 		streamableHandler.ServeHTTP(writer, request)
 	}))
 	t.Cleanup(httpMCP.Close)
@@ -85,14 +115,20 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 			if slices.Contains(req.Messages, "hello") {
 				return agentruntime.ModelResponse{Text: "Hello from the planner"}, nil
 			}
+			if slices.Contains(req.Messages, "explode") {
+				return agentruntime.ModelResponse{}, errors.New("internal database password=bad")
+			}
 			if slices.Contains(req.Messages, "try hidden") {
 				return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{
 					Name: "hidden_tool", Arguments: json.RawMessage(`{}`),
 				}}, nil
 			}
 			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{
-				Name: "lookup_destination", Arguments: json.RawMessage(`{"destination":"Kyoto"}`),
+				CallID: "provider-call-id", Name: "lookup_destination", Arguments: json.RawMessage(`{"destination":"Kyoto"}`),
 			}}, nil
+		}
+		if req.ToolResults[0].CallID != "provider-call-id" {
+			t.Fatalf("provider result correlation ID = %q", req.ToolResults[0].CallID)
 		}
 		return agentruntime.ModelResponse{Text: "Kyoto is available"}, nil
 	})
@@ -122,13 +158,21 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	got := slices.Clone(observations)
 	gotTransport := slices.Clone(transportObservations)
 	mu.Unlock()
-	if len(got) != 1 || got[0].cookie != "session=alice" || got[0].authorization != "Bearer alice-token" || got[0].smuggled != "" || got[0].callID == "" {
+	if len(got) != 1 || got[0].cookie != "session=alice" || got[0].authorization != "Bearer alice-token" || got[0].smuggled != "" || got[0].callID == "" || got[0].callID == "provider-call-id" {
 		t.Fatalf("MCP observations = %#v", got)
 	}
 	aliceSession := statefulSessionID(gotTransport, "session=alice", "Bearer alice-token")
 	if aliceSession == "" {
 		t.Fatalf("stateful streamable session did not reuse a session ID with allowlisted headers: %#v", gotTransport)
 	}
+	firstSnapshot, err := service.Snapshot("thread-1", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if callIDFromEvents(firstSnapshot.Events) != got[0].callID {
+		t.Fatalf("event/product call ID does not match Java header: %#v", firstSnapshot.Events)
+	}
+	assertTrace(t, spanRecorder.Ended(), got[0].callID, "Plan Kyoto", "session=alice", "alice-token", "Kyoto")
 
 	bobBody := body
 	bobBody.ThreadID, bobBody.RunID = "thread-2", "message-2"
@@ -179,7 +223,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	hiddenBody.ThreadID, hiddenBody.RunID = "thread-4", "message-4"
 	hiddenBody.Messages = []aguitypes.Message{{ID: "message-4", Role: aguitypes.RoleUser, Content: "try hidden"}}
 	hidden := postAGUI(t, api.URL, hiddenBody, "alice-token", "session=alice", "")
-	if hidden.StatusCode != http.StatusInternalServerError || strings.Contains(hidden.Body, "hidden_tool") {
+	if hidden.StatusCode != http.StatusOK || !strings.Contains(hidden.Body, `"code":"internal_error"`) || strings.Contains(hidden.Body, "hidden_tool") {
 		t.Fatalf("unregistered tool response = %#v", hidden)
 	}
 
@@ -187,8 +231,43 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	unknownTarget.ThreadID, unknownTarget.RunID = "thread-5", "message-5"
 	unknownTarget.ForwardedProps = map[string]any{"journeyId": "missing"}
 	unknown := postAGUI(t, api.URL, unknownTarget, "alice-token", "session=alice", "")
-	if unknown.StatusCode != http.StatusInternalServerError || strings.Contains(unknown.Body, "missing") {
+	if unknown.StatusCode != http.StatusOK || !strings.Contains(unknown.Body, `"code":"internal_error"`) || strings.Contains(unknown.Body, "missing") {
 		t.Fatalf("unknown target response = %#v", unknown)
+	}
+
+	expiredBody := body
+	expiredBody.ThreadID, expiredBody.RunID = "thread-6", "message-6"
+	expired := postAGUI(t, api.URL, expiredBody, "alice-token", "session=expired", "")
+	if expired.StatusCode != http.StatusOK || !strings.Contains(expired.Body, `"code":"auth_required"`) || strings.Contains(expired.Body, "expired downstream") {
+		t.Fatalf("expired downstream auth response = %#v", expired)
+	}
+	expiredSnapshot, err := service.Snapshot("thread-6", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expiredSnapshot.RunState != platform.RunAuthRequired || !slices.ContainsFunc(expiredSnapshot.Events, func(event platform.Event) bool { return event.Type == "auth_required" }) {
+		t.Fatalf("expired auth snapshot = %#v", expiredSnapshot)
+	}
+	mu.Lock()
+	gotExpiredAttempts := expiredAttempts
+	mu.Unlock()
+	if gotExpiredAttempts != 1 {
+		t.Fatalf("expired credential tool attempts = %d, want 1", gotExpiredAttempts)
+	}
+
+	internalBody := body
+	internalBody.ThreadID, internalBody.RunID = "thread-7", "message-7"
+	internalBody.Messages = []aguitypes.Message{{ID: "message-7", Role: aguitypes.RoleUser, Content: "explode"}}
+	internal := postAGUI(t, api.URL, internalBody, "alice-token", "session=alice", "")
+	if internal.StatusCode != http.StatusOK || !strings.Contains(internal.Body, `"code":"internal_error"`) || strings.Contains(internal.Body, "password") {
+		t.Fatalf("internal failure response = %#v", internal)
+	}
+	internalSnapshot, err := service.Snapshot("thread-7", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if internalSnapshot.RunState != platform.RunFailed || !slices.ContainsFunc(internalSnapshot.Events, func(event platform.Event) bool { return event.Type == "run.failed" }) {
+		t.Fatalf("internal failure snapshot = %#v", internalSnapshot)
 	}
 	snapshot, err := service.Snapshot("thread-1", "alice")
 	if err != nil {
@@ -311,12 +390,13 @@ func statefulSessionID(observations []transportObservation, cookie, authorizatio
 
 func TestJourneyConfigFailsClosed(t *testing.T) {
 	cases := map[string]string{
-		"empty tools":       `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":[]}}]}`,
-		"missing tools":     `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s"}}]}`,
+		"empty tools":       `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[],"tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":[]}}]}`,
+		"missing tools":     `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[],"tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s"}}]}`,
 		"unknown field":     `{"extra":true,"mcp_servers":[],"journeys":[]}`,
-		"duplicate journey": `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}},{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}}]}`,
-		"escaping prompt":   `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[]}],"journeys":[{"id":"j","description":"x","system_prompt":"../p.md","mcp":{"server":"s","tools":["t"]}}]}`,
-		"missing prompt":    `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[]}],"journeys":[{"id":"j","description":"x","system_prompt":"missing.md","mcp":{"server":"s","tools":["t"]}}]}`,
+		"duplicate journey": `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[],"tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}},{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}}]}`,
+		"escaping prompt":   `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[],"tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"../p.md","mcp":{"server":"s","tools":["t"]}}]}`,
+		"missing prompt":    `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[],"tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"missing.md","mcp":{"server":"s","tools":["t"]}}]}`,
+		"undeclared tool":   `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[],"tools":["registered"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["registred"]}}]}`,
 	}
 	for name, config := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -332,6 +412,80 @@ func TestJourneyConfigFailsClosed(t *testing.T) {
 			}
 		})
 	}
+}
+
+func callIDFromEvents(events []platform.Event) string {
+	for _, event := range events {
+		if event.Type == "tool.completed" {
+			return event.CallID
+		}
+	}
+	return ""
+}
+
+func assertTrace(t *testing.T, spans []sdktrace.ReadOnlySpan, callID string, forbidden ...string) {
+	t.Helper()
+	var traceID string
+	for _, span := range spans {
+		if span.Name() == "chat.accept" && spanAttribute(span, "thread.id") == "thread-1" {
+			traceID = span.SpanContext().TraceID().String()
+			break
+		}
+	}
+	if traceID == "" {
+		t.Fatal("chat.accept trace not recorded")
+	}
+	wantNames := map[string]bool{"chat.accept": false, "agent.start_turn": false, "hub.route": false, "journey.run": false, "model.call": false, "mcp.discover": false, "mcp.call": false}
+	spanIDs := make(map[string]string)
+	parents := make(map[string]string)
+	for _, span := range spans {
+		if span.SpanContext().TraceID().String() != traceID {
+			continue
+		}
+		if _, ok := wantNames[span.Name()]; ok {
+			wantNames[span.Name()] = true
+			spanIDs[span.Name()] = span.SpanContext().SpanID().String()
+			parents[span.Name()] = span.Parent().SpanID().String()
+		}
+		serialized := span.Name()
+		for _, value := range span.Attributes() {
+			serialized += fmt.Sprint(value.Key, "=", value.Value.Emit())
+		}
+		for _, secret := range forbidden {
+			if strings.Contains(serialized, secret) {
+				t.Fatalf("trace leaked %q in %q", secret, serialized)
+			}
+		}
+		if span.Name() == "mcp.call" && spanAttribute(span, "call.id") != callID {
+			t.Fatalf("mcp.call call.id = %q, want %q", spanAttribute(span, "call.id"), callID)
+		}
+	}
+	for name, found := range wantNames {
+		if !found {
+			t.Fatalf("trace %s missing span %s", traceID, name)
+		}
+	}
+	for child, parent := range map[string]string{
+		"agent.start_turn": "chat.accept",
+		"hub.route":        "agent.start_turn",
+		"journey.run":      "agent.start_turn",
+		"model.call":       "journey.run",
+		"mcp.discover":     "journey.run",
+		"mcp.call":         "journey.run",
+	} {
+		if parents[child] != spanIDs[parent] {
+			t.Fatalf("span %s parent = %s, want %s (%s)", child, parents[child], parent, spanIDs[parent])
+		}
+	}
+}
+
+func spanAttribute(span sdktrace.ReadOnlySpan, name string) string {
+	for _, value := range span.Attributes() {
+		if string(value.Key) == name {
+			return value.Value.AsString()
+		}
+	}
+	return ""
 }
 
 func writeFixture(path, value string) error {

@@ -7,6 +7,7 @@ require (
 	github.com/microsoft/agent-framework-go v0.0.0-20260914050536-4569dba84f21
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	go.opentelemetry.io/otel v1.46.0
+	go.opentelemetry.io/otel/sdk v1.46.0
 )
 
 require (

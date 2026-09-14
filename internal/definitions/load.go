@@ -16,6 +16,7 @@ type MCPServer struct {
 	Endpoint       string   `json:"endpoint"`
 	ForwardHeaders []string `json:"forward_headers"`
 	CallIDHeader   string   `json:"call_id_header"`
+	Tools          []string `json:"tools"`
 }
 
 type MCPBinding struct {
@@ -83,6 +84,16 @@ func Load(path string) (*Registry, error) {
 				return nil, fmt.Errorf("MCP server %q has invalid call ID header", server.ID)
 			}
 		}
+		if len(server.Tools) == 0 {
+			return nil, fmt.Errorf("MCP server %q has empty checked-in tool catalog", server.ID)
+		}
+		seenTools := make(map[string]bool, len(server.Tools))
+		for _, name := range server.Tools {
+			if strings.TrimSpace(name) == "" || seenTools[name] {
+				return nil, fmt.Errorf("MCP server %q has invalid or duplicate catalog tool %q", server.ID, name)
+			}
+			seenTools[name] = true
+		}
 		registry.servers[server.ID] = server
 	}
 
@@ -94,16 +105,24 @@ func Load(path string) (*Registry, error) {
 		if _, exists := registry.journeys[journey.ID]; exists {
 			return nil, fmt.Errorf("duplicate journey %q", journey.ID)
 		}
-		if _, exists := registry.servers[journey.MCP.Server]; !exists {
+		server, exists := registry.servers[journey.MCP.Server]
+		if !exists {
 			return nil, fmt.Errorf("journey %q references unknown MCP server %q", journey.ID, journey.MCP.Server)
 		}
 		if len(journey.MCP.Tools) == 0 {
 			return nil, fmt.Errorf("journey %q has empty tool allowlist", journey.ID)
 		}
 		seenTools := make(map[string]bool)
+		catalog := make(map[string]bool, len(server.Tools))
+		for _, name := range server.Tools {
+			catalog[name] = true
+		}
 		for _, name := range journey.MCP.Tools {
 			if strings.TrimSpace(name) == "" || seenTools[name] {
 				return nil, fmt.Errorf("journey %q has invalid or duplicate tool %q", journey.ID, name)
+			}
+			if !catalog[name] {
+				return nil, fmt.Errorf("journey %q tool %q is absent from MCP server %q catalog", journey.ID, name, server.ID)
 			}
 			seenTools[name] = true
 		}

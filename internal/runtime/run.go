@@ -80,7 +80,7 @@ func NewRunner(registry *definitions.Registry, client *platformmcp.Client, model
 }
 
 func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
-	journey, err := r.route(input.TargetJourney, input.Text)
+	journey, err := r.route(ctx, input.TargetJourney, input.Text)
 	if err != nil {
 		return RunOutput{}, err
 	}
@@ -100,10 +100,10 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 	}
 	defer bound.Close()
 
-	callBase := stableCallID(input.ThreadID, input.RunID)
+	productCallID := stableCallID(input.ThreadID, input.RunID)
 	mafAgent := agent.New(agent.ProviderConfig{
 		ProviderName: "configured-model",
-		Run:          modelRun(r.model, callBase),
+		Run:          modelRun(r.model, productCallID),
 	}, agent.Config{
 		ID:          "journey:" + journey.ID,
 		Name:        journey.ID,
@@ -129,7 +129,7 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 	if !json.Valid([]byte(call.Arguments)) {
 		return RunOutput{}, fmt.Errorf("model returned invalid tool arguments")
 	}
-	result, err := bound.Call(ctx, call.CallID, call.Name, []byte(call.Arguments))
+	result, err := bound.Call(ctx, productCallID, call.Name, []byte(call.Arguments))
 	if err != nil {
 		return RunOutput{}, err
 	}
@@ -149,7 +149,7 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 	if final.String() == "" {
 		return RunOutput{}, fmt.Errorf("model returned no answer")
 	}
-	return RunOutput{JourneyID: journey.ID, Answer: final.String(), CallID: call.CallID, ToolName: call.Name}, nil
+	return RunOutput{JourneyID: journey.ID, Answer: final.String(), CallID: productCallID, ToolName: call.Name}, nil
 }
 
 func modelRun(model Model, callBase string) agent.RunFunc {

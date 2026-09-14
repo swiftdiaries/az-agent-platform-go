@@ -68,8 +68,10 @@ func (h *handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			http.Error(writer, "communication conflict", http.StatusConflict)
 		case errors.Is(err, platform.ErrForbidden):
 			http.Error(writer, "forbidden", http.StatusForbidden)
+		case errors.Is(err, platform.ErrAuthRequired):
+			writeRunError(request, writer, receipt, "auth_required", "authentication required")
 		default:
-			http.Error(writer, "request failed", http.StatusInternalServerError)
+			writeRunError(request, writer, receipt, "internal_error", "request failed")
 		}
 		return
 	}
@@ -89,6 +91,14 @@ func (h *handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			return
 		}
 	}
+}
+
+func writeRunError(request *http.Request, writer http.ResponseWriter, receipt platform.Receipt, code, message string) {
+	writer.Header().Set("Content-Type", "text/event-stream")
+	writer.Header().Set("Cache-Control", "no-cache")
+	stream := sse.NewSSEWriter()
+	_ = stream.WriteEvent(request.Context(), writer, events.NewRunStartedEvent(receipt.ThreadID, receipt.RunID))
+	_ = stream.WriteEvent(request.Context(), writer, events.NewRunErrorEvent(message, events.WithErrorCode(code), events.WithRunID(receipt.RunID)))
 }
 
 func lastUserText(messages []types.Message) (string, error) {
