@@ -99,6 +99,7 @@ func (a *Adapter) Complete(ctx context.Context, request runtime.ModelRequest) (r
 		client = &http.Client{}
 	}
 	clientCopy := *client
+	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	clientCopy.Transport = &dispatchTransport{base: client.Transport, onDispatch: request.OnDispatch}
 	model := foundryprovider.NewAgent(
 		a.config.ProjectEndpoint,

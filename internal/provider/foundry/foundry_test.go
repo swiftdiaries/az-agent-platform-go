@@ -95,6 +95,23 @@ func TestCompleteDoesNotRetryOrLeakProviderError(t *testing.T) {
 	}
 }
 
+func TestCompleteDoesNotFollowFoundryRedirect(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		if request.URL.Path == "/redirected" {
+			t.Fatal("redirected request received an AAD bearer token")
+		}
+		http.Redirect(w, request, "/redirected", http.StatusFound)
+	}))
+	defer server.Close()
+
+	_, err := newAdapter(t, server).Complete(t.Context(), runtime.ModelRequest{ProviderMessages: []*message.Message{message.NewText("redirect")}})
+	if err == nil || err.Error() != "Foundry model request failed" || calls.Load() != 1 {
+		t.Fatalf("redirect error/calls = %v/%d", err, calls.Load())
+	}
+}
+
 func TestCompleteReturnsFinishedText(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
