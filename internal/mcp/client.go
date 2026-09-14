@@ -14,6 +14,7 @@ import (
 	protocol "github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 )
@@ -139,6 +140,9 @@ func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			clone.Header.Set(t.callIDHeader, callID)
 		}
 	}
+	// Inject only W3C trace context; prompts, tool arguments, credentials and
+	// business identifiers never enter propagation headers.
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(clone.Header))
 	response, err := t.base.RoundTrip(clone)
 	if err != nil {
 		release()
