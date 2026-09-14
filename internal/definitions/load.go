@@ -204,6 +204,9 @@ func loadOne(path string) (*Registry, error) {
 			if strings.TrimSpace(name) == "" || seenTools[name] {
 				return nil, fmt.Errorf("MCP server %q has invalid or duplicate catalog tool %q", server.ID, name)
 			}
+			if isProductToolName(name) {
+				return nil, fmt.Errorf("MCP server %q catalog tool %q is reserved for the product runtime", server.ID, name)
+			}
 			seenTools[name] = true
 		}
 		registry.servers[server.ID] = server
@@ -264,6 +267,9 @@ func loadOne(path string) (*Registry, error) {
 		for _, name := range journey.MCP.Tools {
 			if strings.TrimSpace(name) == "" || seenTools[name] {
 				return nil, fmt.Errorf("journey %q has invalid or duplicate tool %q", journey.ID, name)
+			}
+			if isProductToolName(name) {
+				return nil, fmt.Errorf("journey %q tool %q is reserved for the product runtime", journey.ID, name)
 			}
 			if !catalog[name] {
 				return nil, fmt.Errorf("journey %q tool %q is absent from MCP server %q catalog", journey.ID, name, server.ID)
@@ -338,6 +344,11 @@ func confinedPath(root, relative string) (string, error) {
 	if filepath.IsAbs(relative) {
 		return "", fmt.Errorf("absolute path is not allowed")
 	}
+	for _, part := range strings.Split(filepath.ToSlash(relative), "/") {
+		if part == ".." {
+			return "", fmt.Errorf("path parent components are not allowed")
+		}
+	}
 	clean := filepath.Clean(relative)
 	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("path escapes config directory")
@@ -355,6 +366,15 @@ func confinedPath(root, relative string) (string, error) {
 		}
 	}
 	return path, nil
+}
+
+func isProductToolName(name string) bool {
+	switch name {
+	case "load_skill", "read_skill_resource", "request_user_input":
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *Registry) Journey(id string) (Journey, bool) {
