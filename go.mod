@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260312103001-8e7ab1df34c8
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/jackc/pgx/v5 v5.7.6
 	github.com/microsoft/agent-framework-go v0.0.0-20260914050536-4569dba84f21
 	github.com/modelcontextprotocol/go-sdk v1.7.0
