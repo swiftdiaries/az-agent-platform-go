@@ -60,6 +60,7 @@ type Runner struct {
 }
 
 type RunInput struct {
+	History       json.RawMessage
 	ThreadID      string
 	RunID         string
 	Principal     string
@@ -69,6 +70,7 @@ type RunInput struct {
 }
 
 type RunOutput struct {
+	History   json.RawMessage
 	JourneyID string
 	Answer    string
 	CallID    string
@@ -77,6 +79,22 @@ type RunOutput struct {
 
 func NewRunner(registry *definitions.Registry, client *platformmcp.Client, model Model) *Runner {
 	return &Runner{definitions: registry, mcp: client, model: model}
+}
+
+// Binding identifies exactly the loaded journey declaration and prompt used by this runner.
+func (r *Runner) Binding(ctx context.Context, in RunInput) (string, string, error) {
+	journey, err := r.route(ctx, in.TargetJourney, in.Text)
+	if err != nil {
+		return "", "", err
+	}
+	data, err := json.Marshal(struct {
+		Definition definitions.Journey
+		Prompt     string
+	}{journey, journey.Prompt})
+	if err != nil {
+		return "", "", err
+	}
+	return journey.ID, fmt.Sprintf("%x", sha256.Sum256(data)), nil
 }
 
 func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
@@ -115,14 +133,23 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 	if err != nil {
 		return RunOutput{}, fmt.Errorf("create model session: %w", err)
 	}
-	response, err := mafAgent.RunText(ctx, input.Text, agent.WithSession(session)).Collect()
+	var history []*message.Message
+	if len(input.History) > 0 {
+		if err := json.Unmarshal(input.History, &history); err != nil {
+			return RunOutput{}, fmt.Errorf("decode provider history: %w", err)
+		}
+	}
+	history = append(history, &message.Message{Role: message.RoleUser, Contents: message.Contents{&message.TextContent{Text: input.Text}}})
+	response, err := mafAgent.Run(ctx, history, agent.WithSession(session)).Collect()
 	if err != nil {
 		return RunOutput{}, fmt.Errorf("model request failed: %w", err)
 	}
+	history = append(history, response.Messages...)
 	call := firstToolCall(response)
 	if call == nil {
 		if answer := response.String(); answer != "" {
-			return RunOutput{JourneyID: journey.ID, Answer: answer}, nil
+			serialized, err := json.Marshal(history)
+			return RunOutput{JourneyID: journey.ID, Answer: answer, History: serialized}, err
 		}
 		return RunOutput{}, fmt.Errorf("model returned no answer")
 	}
@@ -149,7 +176,10 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 	if final.String() == "" {
 		return RunOutput{}, fmt.Errorf("model returned no answer")
 	}
-	return RunOutput{JourneyID: journey.ID, Answer: final.String(), CallID: productCallID, ToolName: call.Name}, nil
+	history = append(history, toolMessage)
+	history = append(history, final.Messages...)
+	serialized, err := json.Marshal(history)
+	return RunOutput{JourneyID: journey.ID, Answer: final.String(), CallID: productCallID, ToolName: call.Name, History: serialized}, err
 }
 
 func modelRun(model Model, callBase string) agent.RunFunc {
@@ -230,4 +260,23 @@ func firstToolCall(response *agent.Response) *message.FunctionCallContent {
 func stableCallID(threadID, runID string) string {
 	sum := sha256.Sum256([]byte(threadID + "\x00" + runID + "\x00tool-1"))
 	return "call_" + hex.EncodeToString(sum[:8])
+}
+
+// TransientHeaders copies only names approved for the selected MCP server.
+func (r *Runner) TransientHeaders(ctx context.Context, target, text string, inbound http.Header) http.Header {
+	result := make(http.Header)
+	journey, err := r.route(ctx, target, text)
+	if err != nil {
+		return result
+	}
+	server, ok := r.definitions.Server(journey.MCP.Server)
+	if !ok {
+		return result
+	}
+	for _, name := range server.ForwardHeaders {
+		for _, value := range inbound.Values(name) {
+			result.Add(name, value)
+		}
+	}
+	return result
 }

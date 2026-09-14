@@ -24,6 +24,7 @@ import (
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
@@ -133,8 +134,10 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 		return agentruntime.ModelResponse{Text: "Kyoto is available"}, nil
 	})
 	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model)
-	service := platform.New(runner)
-	handler := chat.NewHandler(chat.StaticBearerTokens{"alice-token": "alice", "bob-token": "bob"}, service)
+	pool := database(t)
+	service := platform.New(runner, journal.New(pool))
+	t.Cleanup(service.Close)
+	handler := chat.NewHandler(chat.StaticBearerTokens{"alice-token": "alice", "bob-token": "bob"}, service, pool)
 	api := httptest.NewServer(handler)
 	t.Cleanup(api.Close)
 
@@ -173,7 +176,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 		strings.Contains(response.Body, internalThreadID) || strings.Contains(response.Body, internalRunID) {
 		t.Fatalf("AG-UI response did not preserve external correlation at the edge: %s", response.Body)
 	}
-	firstSnapshot, err := service.Snapshot(internalThreadID, "alice")
+	firstSnapshot, err := service.Snapshot(context.Background(), internalThreadID, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +196,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	if bobThreadID == "" || bobRunID == "" || bobThreadID == internalThreadID || bobRunID == internalRunID {
 		t.Fatalf("principal-scoped identity mapping was not isolated: alice=(%q,%q) bob=(%q,%q)", internalThreadID, internalRunID, bobThreadID, bobRunID)
 	}
-	if _, err := service.Snapshot(bobThreadID, "bob"); err != nil {
+	if _, err := service.Snapshot(context.Background(), bobThreadID, "bob"); err != nil {
 		t.Fatalf("bob snapshot through mapped identity: %v", err)
 	}
 	mu.Lock()
@@ -262,7 +265,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 		t.Fatalf("expired downstream auth response = %#v", expired)
 	}
 	expiredThreadID, _ := latestChatIdentity(spanRecorder.Ended())
-	expiredSnapshot, err := service.Snapshot(expiredThreadID, "alice")
+	expiredSnapshot, err := service.Snapshot(context.Background(), expiredThreadID, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,24 +287,24 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 		t.Fatalf("internal failure response = %#v", internal)
 	}
 	failedThreadID, _ := latestChatIdentity(spanRecorder.Ended())
-	internalSnapshot, err := service.Snapshot(failedThreadID, "alice")
+	internalSnapshot, err := service.Snapshot(context.Background(), failedThreadID, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if internalSnapshot.RunState != platform.RunFailed || !slices.ContainsFunc(internalSnapshot.Events, func(event platform.Event) bool { return event.Type == "run.failed" }) {
 		t.Fatalf("internal failure snapshot = %#v", internalSnapshot)
 	}
-	snapshot, err := service.Snapshot(internalThreadID, "alice")
+	snapshot, err := service.Snapshot(context.Background(), internalThreadID, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if snapshot.RunState != platform.RunCompleted || snapshot.Answer != "Kyoto is available" || len(snapshot.Events) < 4 {
 		t.Fatalf("snapshot = %#v", snapshot)
 	}
-	if _, err := service.Snapshot(internalThreadID, "mallory"); err == nil {
+	if _, err := service.Snapshot(context.Background(), internalThreadID, "mallory"); err == nil {
 		t.Fatal("forged principal read another principal's thread")
 	}
-	if _, err := service.Snapshot(body.ThreadID, "alice"); err == nil {
+	if _, err := service.Snapshot(context.Background(), body.ThreadID, "alice"); err == nil {
 		t.Fatal("raw external thread ID reached platform state")
 	}
 }
@@ -353,7 +356,7 @@ func toolNames(tools []agentruntime.ModelTool) []string {
 }
 
 func TestAuthRejectsMissingCredentials(t *testing.T) {
-	handler := chat.NewHandler(chat.StaticBearerTokens{"good": "alice"}, nil)
+	handler := chat.NewHandler(chat.StaticBearerTokens{"good": "alice"}, nil, nil)
 	api := httptest.NewServer(handler)
 	t.Cleanup(api.Close)
 	res := postAGUI(t, api.URL, aguitypes.RunAgentInput{ThreadID: "t", RunID: "r"}, "", "", "")
