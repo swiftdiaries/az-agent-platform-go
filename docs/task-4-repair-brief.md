@@ -49,6 +49,9 @@ owned/interrupted rejection, one continuation row, and one model re-entry.
 **Repair status.** Implemented. The reaper-first regression failed with the
 continuation interrupted; after the scoped repair it preserves and reclaims only
 the exact epoch-zero consumed-reply continuation. Owned/interrupted guards pass.
+Specification rereview then found the unlocked reaper candidate could become
+stale while waiting for the conversation lock. The locked helper now rechecks the
+exact candidate and applies the same continuation exemption for Reap and Admit.
 
 ## Card 2: enforce the second-attempt predecessor matrix
 

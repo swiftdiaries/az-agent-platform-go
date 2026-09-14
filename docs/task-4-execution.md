@@ -68,3 +68,44 @@ The fixture cleanup check found no remaining `agent-platform-task2-*` container.
 The submitted changed paths are this report and repair brief,
 `internal/chat/http.go`, `internal/journal/{interactions,observe,operations,owners,store}.go`,
 and `integration/{interactions,outcomes,ownership}_test.go`.
+
+### Card 1 specification-rereview repair
+
+Specification rereview passed Cards 2–5 and found one remaining Card 1 race on
+`78f2d14e4234b5e57a067d114a4f78578943f2a1`: Reap scanned expired run A without
+a lock, then its thread-only locked helper could interrupt a newer expired
+epoch-zero continuation C after the conversation advanced. The submitted repair
+revision is the commit containing this entry; independent specification and
+quality rereviews remain pending on that exact revision.
+
+`TestReapStaleCandidateCannotInterruptNewContinuation` deterministically holds
+the conversation lock after Reap scans A, replaces A with C, then releases the
+stale reaper. Before the repair C became `interrupted`. The shared locked helper
+now checks the exact Reap candidate and the pending/epoch-zero/consumed-
+continuation exemption. The same test calls direct Admit and proves it preserves
+C while attaching steering, after which the exact reply command claims C.
+Existing checks prove ordinary expired, epoch-positive pending, and interrupted
+runs remain ineligible for recovery.
+
+Fresh final verification used PostgreSQL
+`16.13 (Debian 16.13-1.pgdg13+1)` with no skips:
+
+```text
+go test -race ./internal/... ./integration -run 'TestHITL|TestReply|TestToolCall' -count=1 -timeout=90s
+PASS: internal/runtime 1.691s; integration 11.378s
+
+go test -race ./internal/... ./integration -run 'TestJourney|TestAuth|TestToolBinding|TestPersistence|TestReplay|TestPostgres|TestAdmission|TestOwnership|TestSteering|TestAdmissionFinish' -count=1 -timeout=90s
+PASS: integration 18.769s
+
+go test ./... -count=1 -timeout=90s
+PASS: internal/runtime 0.976s; integration 25.742s
+
+go vet ./...
+PASS
+
+git diff --check
+PASS
+```
+
+The follow-up changes only this evidence, the repair brief,
+`internal/journal/{commands,owners}.go`, and `integration/ownership_test.go`.

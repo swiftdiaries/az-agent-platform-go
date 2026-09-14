@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
@@ -158,6 +159,68 @@ func TestExpiredContinuationRecoveryNeverTakesOverOwnedWork(t *testing.T) {
 				t.Fatalf("%s continuation taken over: %v", state, err)
 			}
 		})
+	}
+}
+
+func TestReapStaleCandidateCannotInterruptNewContinuation(t *testing.T) {
+	pool := database(t)
+	store, owner, interaction := localWait(t, pool)
+	if err := store.Wait(t.Context(), owner, interaction, []byte(`{}`), []byte(`[]`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(t.Context(), "UPDATE agent_runs SET state='running',lease_until=clock_timestamp()-interval '1 second' WHERE id='run'"); err != nil {
+		t.Fatal(err)
+	}
+	gate, err := pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Rollback(t.Context())
+	if _, err := gate.Exec(t.Context(), "SELECT id FROM agent_conversations WHERE id='thread' FOR UPDATE"); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- store.Reap(context.Background()) }()
+	waitDatabase(t, pool, "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted AND locktype='transactionid')")
+	reply := journal.Command{ThreadID: "thread", RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: interaction.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
+	payload, err := json.Marshal(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{"UPDATE agent_runs SET state='completed' WHERE id='run'", nil},
+		{"INSERT INTO agent_commands(thread_id,communication_id,run_id,payload,execution_run_id) VALUES('thread','reply','reply',$1,'reply')", []any{payload}},
+		{"INSERT INTO agent_runs(id,thread_id,state,journey_id,definition_digest,lease_until) SELECT 'reply',thread_id,'pending',journey_id,definition_digest,clock_timestamp()-interval '1 second' FROM agent_runs WHERE id='run'", nil},
+		{"UPDATE agent_interactions SET state='consumed',continuation_run_id='reply',reply=$1 WHERE id=$2", []any{[]byte(reply.ReplyJSON), interaction.ID}},
+	} {
+		if _, err := gate.Exec(t.Context(), statement.query, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := gate.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	var epoch int64
+	if err := pool.QueryRow(t.Context(), "SELECT state,owner_epoch FROM agent_runs WHERE id='reply'").Scan(&state, &epoch); err != nil || state != "pending" || epoch != 0 {
+		t.Fatal("stale reaper interrupted new continuation", state, epoch, err)
+	}
+	steering := journal.Command{ThreadID: "thread", RunID: "steering", CommunicationID: "steering", Principal: "alice", Text: "new context"}
+	receipt, fresh, err := store.Admit(t.Context(), steering)
+	if err != nil || fresh || receipt.ExecutionRunID != reply.RunID {
+		t.Fatal("ingress did not preserve continuation", receipt, fresh, err)
+	}
+	if err := pool.QueryRow(t.Context(), "SELECT state,owner_epoch FROM agent_runs WHERE id='reply'").Scan(&state, &epoch); err != nil || state != "pending" || epoch != 0 {
+		t.Fatal("ingress interrupted new continuation", state, epoch, err)
+	}
+	if _, err := store.Claim(t.Context(), reply, "fresh-owner", time.Second); err != nil {
+		t.Fatal("preserved continuation was not recoverable", err)
 	}
 }
 

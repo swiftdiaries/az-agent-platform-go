@@ -45,7 +45,7 @@ func (s *Store) Admit(ctx context.Context, c Command) (Receipt, bool, error) {
 		if err != pgx.ErrNoRows {
 			return err
 		}
-		if err := interruptExpired(ctx, tx, c.ThreadID); err != nil {
+		if err := interruptExpired(ctx, tx, c.ThreadID, ""); err != nil {
 			return err
 		}
 		if err := expireInteractions(ctx, tx, c.ThreadID); err != nil {

@@ -119,7 +119,7 @@ func (s *Store) Renew(ctx context.Context, o Owner, duration time.Duration) erro
 
 // Reap records interruption only. It cannot start a worker or restore credentials.
 func (s *Store) Reap(ctx context.Context) error {
-	rows, err := s.pool.Query(ctx, "SELECT r.thread_id,r.id FROM agent_runs r WHERE r.state IN ('pending','running') AND r.lease_until<=clock_timestamp() AND NOT (r.state='pending' AND r.owner_epoch=0 AND EXISTS(SELECT 1 FROM agent_interactions i WHERE i.thread_id=r.thread_id AND i.continuation_run_id=r.id AND i.state='consumed')) UNION SELECT thread_id,run_id FROM agent_interactions WHERE state='pending' AND expires_at<=clock_timestamp()")
+	rows, err := s.pool.Query(ctx, "SELECT thread_id,id FROM agent_runs WHERE state IN ('pending','running') AND lease_until<=clock_timestamp() UNION SELECT thread_id,run_id FROM agent_interactions WHERE state='pending' AND expires_at<=clock_timestamp()")
 	if err != nil {
 		return err
 	}
@@ -143,7 +143,7 @@ func (s *Store) Reap(ctx context.Context) error {
 			if err := tx.QueryRow(ctx, "SELECT id FROM agent_conversations WHERE id=$1 FOR UPDATE", r.thread).Scan(&id); err != nil {
 				return err
 			}
-			if err := interruptExpired(ctx, tx, r.thread); err != nil {
+			if err := interruptExpired(ctx, tx, r.thread, r.run); err != nil {
 				return err
 			}
 			return expireInteractions(ctx, tx, r.thread)
@@ -156,18 +156,28 @@ func (s *Store) Reap(ctx context.Context) error {
 	return nil
 }
 
-// The caller holds the conversation lock. Lock the live run before reading time.
-func interruptExpired(ctx context.Context, tx pgx.Tx, thread string) error {
+// The caller holds the conversation lock. Lock the candidate run before
+// deciding from its current identity, owner epoch, continuation, and time.
+func interruptExpired(ctx context.Context, tx pgx.Tx, thread, candidate string) error {
 	var run string
-	err := tx.QueryRow(ctx, "SELECT id FROM agent_runs WHERE thread_id=$1 AND state IN ('pending','running') FOR UPDATE", thread).Scan(&run)
+	var state RunState
+	var epoch int64
+	err := tx.QueryRow(ctx, "SELECT id,state,owner_epoch FROM agent_runs WHERE thread_id=$1 AND state IN ('pending','running') AND ($2='' OR id=$2) FOR UPDATE", thread, candidate).Scan(&run, &state, &epoch)
 	if err == pgx.ErrNoRows {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	result, err := tx.Exec(ctx, "UPDATE agent_runs SET state='interrupted' WHERE thread_id=$1 AND id=$2 AND lease_until<=clock_timestamp()", thread, run)
-	if err != nil || result.RowsAffected() == 0 {
+	var expired, continuation bool
+	if err := tx.QueryRow(ctx, "SELECT lease_until<=clock_timestamp(),EXISTS(SELECT 1 FROM agent_interactions WHERE thread_id=$1 AND continuation_run_id=$2 AND state='consumed') FROM agent_runs WHERE thread_id=$1 AND id=$2", thread, run).Scan(&expired, &continuation); err != nil {
+		return err
+	}
+	if !expired || state == RunPending && epoch == 0 && continuation {
+		return nil
+	}
+	result, err := tx.Exec(ctx, "UPDATE agent_runs SET state='interrupted' WHERE thread_id=$1 AND id=$2 AND state IN ('pending','running')", thread, run)
+	if err != nil || result.RowsAffected() != 1 {
 		return err
 	}
 	if _, err := tx.Exec(ctx, "UPDATE agent_attempts a SET outcome='outcome_unknown' FROM agent_operations o WHERE a.call_id=o.call_id AND o.thread_id=$1 AND o.run_id=$2 AND a.outcome='dispatching'", thread, run); err != nil {
