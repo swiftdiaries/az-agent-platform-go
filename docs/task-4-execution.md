@@ -109,3 +109,46 @@ PASS
 
 The follow-up changes only this evidence, the repair brief,
 `internal/journal/{commands,owners}.go`, and `integration/ownership_test.go`.
+
+### Operation-uncertainty quality-rereview repair
+
+Quality rereview found one remaining issue on
+`62dc5ffd67e138848f53569c04a788c216cc6b10`: when `EndAttempt` could not persist
+a completed outcome, `Finish(RunFailed)` converted the still-dispatching attempt
+and operation to `outcome_unknown` but emitted only `run.failed`. Reap already
+emitted the separate uncertainty event. The submitted repair revision is the
+commit containing this entry; both independent rereviews remain pending on that
+exact revision.
+
+`TestToolCallCompletionPersistenceFailurePublishesUnknownBeforeRunFailure`
+installs a PostgreSQL trigger that rejects only the completed operation update,
+then observes the real MCP and live Chat path. Before the repair, its stream was
+`tool.started` followed by `run.failed`. Finish and Reap now share one helper that
+updates dispatching attempts and operations, appends one safe product-call
+`tool.outcome_unknown` event per changed operation, then lets the caller append
+its terminal run event in the same transaction. The test verifies live ordering,
+the stable snapshot operation ID, absent provider ID, and one model/MCP call.
+
+Fresh final verification used PostgreSQL
+`16.13 (Debian 16.13-1.pgdg13+1)` with no skips:
+
+```text
+go test -race ./internal/... ./integration -run 'TestHITL|TestReply|TestToolCall' -count=1 -timeout=90s
+PASS: internal/runtime 1.670s; integration 11.140s
+
+go test -race ./internal/... ./integration -run 'TestJourney|TestAuth|TestToolBinding|TestPersistence|TestReplay|TestPostgres|TestAdmission|TestOwnership|TestSteering|TestAdmissionFinish' -count=1 -timeout=90s
+PASS: integration 18.326s
+
+go test ./... -count=1 -timeout=90s
+PASS: internal/runtime 0.996s; integration 24.845s
+
+go vet ./...
+PASS
+
+git diff --check
+PASS
+```
+
+No PostgreSQL fixture containers remained. The follow-up changes only this
+evidence, the repair brief, `internal/journal/{operations,owners,sessions}.go`,
+and `integration/outcomes_test.go`.

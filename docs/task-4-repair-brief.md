@@ -109,6 +109,9 @@ snapshot, and below/equal-watermark reconnect must agree atomically.
 **Repair status.** Implemented. The regression first observed `tool.started`
 followed directly by `run.interrupted`; database events, repeatable-read snapshot,
 and cursor-zero/exact-watermark Chat reconnect now expose the safe ordered pair.
+Quality rereview found the same missing event when failed `EndAttempt` persistence
+falls through `Finish`. Both Finish and Reap now use one transaction-local helper
+that records changed operations and their safe events before the run terminal.
 
 ## Card 4: recheck interaction TTL after the row lock
 

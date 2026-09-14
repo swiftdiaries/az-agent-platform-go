@@ -319,6 +319,47 @@ func TestToolCallPredispatchPersistenceFailure(t *testing.T) {
 	}
 }
 
+func TestToolCallCompletionPersistenceFailurePublishesUnknownBeforeRunFailure(t *testing.T) {
+	pool := database(t)
+	if _, err := pool.Exec(t.Context(), `CREATE FUNCTION fail_completed_outcome() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.outcome='completed' THEN RAISE EXCEPTION 'completion unavailable'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_completed_outcome BEFORE UPDATE OF outcome ON agent_operations FOR EACH ROW EXECUTE FUNCTION fail_completed_outcome()`); err != nil {
+		t.Fatal(err)
+	}
+	mock := newMockMCP(t)
+	backend := httptest.NewServer(mock)
+	defer backend.Close()
+	const providerCallID = "provider-completion-sentinel"
+	var models atomic.Int32
+	runner := policyRunner(t, backend.URL, "read_only", modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+		models.Add(1)
+		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: providerCallID, Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
+	}))
+	p := platform.New(runner, journal.New(pool))
+	defer p.Close()
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, p, pool))
+	defer api.Close()
+	response := postJSONAGUI(t, api.URL, `{"threadId":"completion-thread","runId":"completion-run","messages":[{"id":"user","role":"user","content":"go"}],"tools":[],"context":[],"state":{},"forwardedProps":{}}`, "token", "", "")
+	unknownAt := strings.Index(response.Body, "tool.outcome_unknown")
+	failedAt := strings.Index(response.Body, `"code":"internal_error"`)
+	if response.StatusCode != http.StatusOK || unknownAt < 0 || failedAt < unknownAt || strings.Contains(response.Body, providerCallID) {
+		t.Fatalf("unsafe or missing live uncertainty: %d %s", response.StatusCode, response.Body)
+	}
+	var thread, productCallID, toolName, operation, attempt, run string
+	if err := pool.QueryRow(t.Context(), "SELECT o.thread_id,o.call_id,o.name,o.outcome,a.outcome,r.state FROM agent_operations o JOIN agent_attempts a ON a.call_id=o.call_id JOIN agent_runs r ON r.id=o.run_id").Scan(&thread, &productCallID, &toolName, &operation, &attempt, &run); err != nil || productCallID == providerCallID || operation != "outcome_unknown" || attempt != "outcome_unknown" || run != "failed" {
+		t.Fatal(thread, productCallID, toolName, operation, attempt, run, err)
+	}
+	snapshot, err := journal.New(pool).Snapshot(t.Context(), thread, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Runs) != 1 || len(snapshot.Runs[0].OperationOutcomes) != 1 || snapshot.Runs[0].OperationOutcomes[0] != (journal.OperationOutcome{CallID: productCallID, ToolName: toolName, Outcome: "outcome_unknown"}) {
+		t.Fatal("snapshot lost operation uncertainty", snapshot.Runs)
+	}
+	unknownEvent, failedEvent := snapshot.Events[len(snapshot.Events)-2], snapshot.Events[len(snapshot.Events)-1]
+	if unknownEvent.Type != "tool.outcome_unknown" || unknownEvent.CallID != productCallID || unknownEvent.ToolName != toolName || failedEvent.Type != "run.failed" || len(mock.calls()) != 1 || models.Load() != 1 {
+		t.Fatal("uncertainty ordering or retry", unknownEvent, failedEvent, len(mock.calls()), models.Load())
+	}
+}
+
 func TestToolCallZeroOneMultipleAndDelayed(t *testing.T) {
 	for _, n := range []int{0, 1, 3} {
 		t.Run(fmt.Sprint(n), func(t *testing.T) {

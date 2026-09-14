@@ -91,3 +91,32 @@ func (s *Store) EndAttempt(ctx context.Context, o Owner, op Operation, attempt i
 		return appendEvent(ctx, tx, o.Command.ThreadID, Event{RunID: o.Command.RunID, Type: "tool." + outcome, CallID: op.CallID, ToolName: op.Name})
 	})
 }
+
+func markOperationsUnknown(ctx context.Context, tx pgx.Tx, thread, run string) error {
+	if _, err := tx.Exec(ctx, "UPDATE agent_attempts a SET outcome='outcome_unknown' FROM agent_operations o WHERE a.call_id=o.call_id AND o.thread_id=$1 AND o.run_id=$2 AND a.outcome='dispatching'", thread, run); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, "UPDATE agent_operations SET outcome='outcome_unknown' WHERE thread_id=$1 AND run_id=$2 AND outcome='dispatching' RETURNING call_id,name", thread, run)
+	if err != nil {
+		return err
+	}
+	var operations []Operation
+	for rows.Next() {
+		var op Operation
+		if err := rows.Scan(&op.CallID, &op.Name); err != nil {
+			rows.Close()
+			return err
+		}
+		operations = append(operations, op)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, op := range operations {
+		if err := appendEvent(ctx, tx, thread, Event{RunID: run, Type: "tool.outcome_unknown", CallID: op.CallID, ToolName: op.Name}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
