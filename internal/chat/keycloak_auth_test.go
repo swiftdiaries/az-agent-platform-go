@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
@@ -20,16 +21,17 @@ import (
 const testIssuer = "https://keycloak.example.test/realms/agents"
 
 type testJWKS struct {
-	mu    sync.Mutex
-	keys  []map[string]string
-	hits  int
-	delay time.Duration
+	mu     sync.Mutex
+	keys   []map[string]string
+	hits   int
+	delay  time.Duration
+	status int
 }
 
 func (s *testJWKS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.hits++
-	keys, delay := append([]map[string]string(nil), s.keys...), s.delay
+	keys, delay, status := append([]map[string]string(nil), s.keys...), s.delay, s.status
 	s.mu.Unlock()
 	if delay > 0 {
 		select {
@@ -37,6 +39,10 @@ func (s *testJWKS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		}
+	}
+	if status != 0 {
+		http.Error(w, "fixture", status)
+		return
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"keys": keys})
 }
@@ -51,6 +57,12 @@ func (s *testJWKS) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.hits
+}
+
+func (s *testJWKS) fail(status int) {
+	s.mu.Lock()
+	s.status = status
+	s.mu.Unlock()
 }
 
 func newTestAuthenticator(t *testing.T, keys ...map[string]string) (*KeycloakAuthenticator, *testJWKS) {
@@ -89,6 +101,10 @@ func newSigningKey(t *testing.T, kid string) (*rsa.PrivateKey, map[string]string
 }
 
 func signedToken(t *testing.T, key *rsa.PrivateKey, kid string, claims jwt.MapClaims) string {
+	return signedTokenWithMethod(t, key, kid, jwt.SigningMethodRS256, claims)
+}
+
+func signedTokenWithMethod(t *testing.T, key *rsa.PrivateKey, kid string, method jwt.SigningMethod, claims jwt.MapClaims) string {
 	t.Helper()
 	if claims["iss"] == nil {
 		claims["iss"] = testIssuer
@@ -102,7 +118,7 @@ func signedToken(t *testing.T, key *rsa.PrivateKey, kid string, claims jwt.MapCl
 	if claims["iat"] == nil {
 		claims["iat"] = time.Now().Add(-time.Minute).Unix()
 	}
-	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	token := jwt.NewWithClaims(method, claims)
 	token.Header["kid"] = kid
 	encoded, err := token.SignedString(key)
 	if err != nil {
@@ -214,6 +230,82 @@ func TestKeycloakAuthenticatorRefreshesForRotationAndBoundsUnknownKids(t *testin
 	}
 }
 
+func TestKeycloakAuthenticatorIgnoresUnusableMixedJWKSKeys(t *testing.T) {
+	key, signing := newSigningKey(t, "signing")
+	auth, _ := newTestAuthenticator(t, signing, map[string]string{"kty": "EC", "kid": "encryption", "alg": "ES256", "use": "enc"})
+	if _, err := auth.Authenticate(bearerRequest(signedToken(t, key, "signing", jwt.MapClaims{"sub": "alice", "tenant": "t"}))); err != nil {
+		t.Fatalf("valid signing key rejected by mixed key set: %v", err)
+	}
+}
+
+func TestKeycloakAuthenticatorBoundsFailedFetches(t *testing.T) {
+	key, jwk := newSigningKey(t, "one")
+	auth, endpoint := newTestAuthenticator(t, jwk)
+	endpoint.fail(http.StatusServiceUnavailable)
+	request := bearerRequest(signedToken(t, key, "one", jwt.MapClaims{"sub": "alice", "tenant": "t"}))
+	if _, err := auth.Authenticate(request); !errors.Is(err, errUnauthorized) {
+		t.Fatalf("first failure = %v", err)
+	}
+	if _, err := auth.Authenticate(request); !errors.Is(err, errUnauthorized) {
+		t.Fatalf("second failure = %v", err)
+	}
+	if got := endpoint.count(); got != 1 {
+		t.Fatalf("failed fetches = %d", got)
+	}
+}
+
+func TestKeycloakAuthenticatorBoundsKnownKidAlgorithmMismatch(t *testing.T) {
+	key, jwk := newSigningKey(t, "one")
+	endpoint := &testJWKS{keys: []map[string]string{jwk}}
+	server := httptest.NewTLSServer(endpoint)
+	defer server.Close()
+	auth, err := newKeycloakAuthenticator(KeycloakConfig{
+		Issuer: testIssuer, JWKSURL: server.URL, Audience: "agent-platform",
+		JWTSource: JWTSourceAuthorizationBearer, JWTHeader: "Authorization",
+		UserClaimPath: "/sub", TenantClaimPath: "/tenant", AllowedAlgorithms: []string{"RS256", "RS384"},
+	}, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := bearerRequest(signedTokenWithMethod(t, key, "one", jwt.SigningMethodRS384, jwt.MapClaims{"sub": "alice", "tenant": "t"}))
+	for range 2 {
+		if _, err := auth.Authenticate(request); !errors.Is(err, errUnauthorized) {
+			t.Fatalf("algorithm mismatch = %v", err)
+		}
+	}
+	if got := endpoint.count(); got != 1 {
+		t.Fatalf("algorithm mismatch fetches = %d", got)
+	}
+}
+
+func TestKeycloakAuthenticatorCancelsWhileAnotherFetchRuns(t *testing.T) {
+	key, jwk := newSigningKey(t, "one")
+	auth, endpoint := newTestAuthenticator(t, jwk)
+	endpoint.mu.Lock()
+	endpoint.delay = time.Second
+	endpoint.mu.Unlock()
+	firstDone := make(chan struct{})
+	go func() {
+		_, _ = auth.Authenticate(bearerRequest(signedToken(t, key, "one", jwt.MapClaims{"sub": "alice", "tenant": "t"})))
+		close(firstDone)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for endpoint.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	request := bearerRequest(signedToken(t, key, "one", jwt.MapClaims{"sub": "alice", "tenant": "t"})).WithContext(ctx)
+	started := time.Now()
+	if _, err := auth.Authenticate(request); !errors.Is(err, errUnauthorized) {
+		t.Fatalf("canceled fetch = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("waited for fetch lock for %v", elapsed)
+	}
+	<-firstDone
+}
+
 func TestKeycloakAuthenticatorBoundsJWKSResponseAndTimeout(t *testing.T) {
 	key, jwk := newSigningKey(t, "one")
 	auth, endpoint := newTestAuthenticator(t, jwk)
@@ -222,6 +314,9 @@ func TestKeycloakAuthenticatorBoundsJWKSResponseAndTimeout(t *testing.T) {
 		t.Fatalf("oversized JWKS error = %v", err)
 	}
 	endpoint.set(jwk)
+	auth.mu.Lock()
+	auth.nextRefresh = time.Time{}
+	auth.mu.Unlock()
 	endpoint.mu.Lock()
 	endpoint.delay = time.Second
 	endpoint.mu.Unlock()

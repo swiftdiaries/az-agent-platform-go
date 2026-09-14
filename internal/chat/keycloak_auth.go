@@ -64,7 +64,7 @@ type KeycloakAuthenticator struct {
 	keys        map[string]rsaJWK
 	cacheExpiry time.Time
 	nextRefresh time.Time
-	fetchMu     sync.Mutex
+	fetchGate   chan struct{}
 }
 
 type rsaJWK struct {
@@ -108,7 +108,7 @@ func newKeycloakAuthenticator(config KeycloakConfig, client *http.Client) (*Keyc
 		issuer: config.Issuer, audience: config.Audience, source: config.JWTSource,
 		header: config.JWTHeader, userPath: userPath, tenantPath: tenantPath,
 		algorithms: algorithms, allowedAlgorithms: allowed, jwksURL: config.JWKSURL,
-		client: &safeClient, fetchTimeout: jwksFetchTimeout, keys: make(map[string]rsaJWK),
+		client: &safeClient, fetchTimeout: jwksFetchTimeout, keys: make(map[string]rsaJWK), fetchGate: make(chan struct{}, 1),
 		parser: jwt.NewParser(jwt.WithValidMethods(algorithms), jwt.WithIssuer(config.Issuer),
 			jwt.WithAudience(config.Audience), jwt.WithExpirationRequired(), jwt.WithIssuedAt(), jwt.WithStrictDecoding()),
 	}, nil
@@ -229,15 +229,20 @@ func (a *KeycloakAuthenticator) key(ctx context.Context, kid, algorithm string) 
 	a.mu.Lock()
 	key, found := a.keys[kid]
 	fresh := now.Before(a.cacheExpiry)
+	cooldown := now.Before(a.nextRefresh)
 	a.mu.Unlock()
 	if fresh && found && key.algorithm == algorithm {
 		return key.key, nil
 	}
-	if fresh && !found && now.Before(a.nextRefresh) {
+	if cooldown {
 		return nil, errors.New("JWT key ID is unknown")
 	}
-	a.fetchMu.Lock()
-	defer a.fetchMu.Unlock()
+	select {
+	case a.fetchGate <- struct{}{}:
+		defer func() { <-a.fetchGate }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	now = time.Now()
 	a.mu.Lock()
 	key, found = a.keys[kid]
@@ -246,14 +251,12 @@ func (a *KeycloakAuthenticator) key(ctx context.Context, kid, algorithm string) 
 		a.mu.Unlock()
 		return key.key, nil
 	}
-	if fresh && !found && now.Before(a.nextRefresh) {
+	if now.Before(a.nextRefresh) {
 		a.mu.Unlock()
 		return nil, errors.New("JWT key ID is unknown")
 	}
-	refreshingUnknown := fresh && !found
-	if refreshingUnknown {
-		a.nextRefresh = now.Add(jwksRefreshMinInterval)
-	}
+	keepCooldown := fresh
+	a.nextRefresh = now.Add(jwksRefreshMinInterval)
 	a.mu.Unlock()
 	keys, err := a.fetchKeys(ctx)
 	if err != nil {
@@ -263,8 +266,8 @@ func (a *KeycloakAuthenticator) key(ctx context.Context, kid, algorithm string) 
 	a.keys = keys
 	a.cacheExpiry = time.Now().Add(jwksCacheLifetime)
 	key, found = a.keys[kid]
-	if !found && !refreshingUnknown {
-		a.nextRefresh = time.Now().Add(jwksRefreshMinInterval)
+	if found && key.algorithm == algorithm && !keepCooldown {
+		a.nextRefresh = time.Time{}
 	}
 	a.mu.Unlock()
 	if !found || key.algorithm != algorithm {
@@ -308,10 +311,10 @@ func (a *KeycloakAuthenticator) fetchKeys(ctx context.Context) (map[string]rsaJW
 	keys := make(map[string]rsaJWK, len(document.Keys))
 	for _, raw := range document.Keys {
 		if raw.Kty != "RSA" || raw.Kid == "" || raw.Alg == "" || (raw.Use != "" && raw.Use != "sig") {
-			return nil, errors.New("JWKS key is invalid")
+			continue
 		}
 		if _, allowed := a.allowedAlgorithms[raw.Alg]; !allowed {
-			return nil, errors.New("JWKS key algorithm is not allowed")
+			continue
 		}
 		if _, duplicate := keys[raw.Kid]; duplicate {
 			return nil, errors.New("JWKS has duplicate key IDs")
@@ -332,6 +335,9 @@ func (a *KeycloakAuthenticator) fetchKeys(ctx context.Context) (map[string]rsaJW
 			return nil, errors.New("JWKS RSA key is invalid")
 		}
 		keys[raw.Kid] = rsaJWK{algorithm: raw.Alg, key: &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: exponent}}
+	}
+	if len(keys) == 0 {
+		return nil, errors.New("JWKS has no usable signing keys")
 	}
 	return keys, nil
 }
