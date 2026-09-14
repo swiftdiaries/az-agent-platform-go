@@ -12,11 +12,18 @@ import (
 )
 
 type MCPServer struct {
-	ID             string   `json:"id"`
-	Endpoint       string   `json:"endpoint"`
-	ForwardHeaders []string `json:"forward_headers"`
-	CallIDHeader   string   `json:"call_id_header"`
-	Tools          []string `json:"tools"`
+	ID             string                `json:"id"`
+	Endpoint       string                `json:"endpoint"`
+	ForwardHeaders []string              `json:"forward_headers"`
+	CallIDHeader   string                `json:"call_id_header"`
+	Tools          []string              `json:"tools"`
+	Policies       map[string]ToolPolicy `json:"policies,omitempty"`
+}
+
+// ToolPolicy is reviewed integration configuration; MCP annotations grant no permission.
+type ToolPolicy struct {
+	Class                 string `json:"class"`
+	DeduplicationEvidence string `json:"deduplication_evidence,omitempty"`
 }
 
 type MCPBinding struct {
@@ -86,6 +93,21 @@ func Load(path string) (*Registry, error) {
 		}
 		if len(server.Tools) == 0 {
 			return nil, fmt.Errorf("MCP server %q has empty checked-in tool catalog", server.ID)
+		}
+		for name, policy := range server.Policies {
+			declared := false
+			for _, tool := range server.Tools {
+				declared = declared || tool == name
+			}
+			if !declared {
+				return nil, fmt.Errorf("policy for undeclared tool %q", name)
+			}
+			if policy.Class != "read_only" && policy.Class != "effectful" && policy.Class != "deduplicated" {
+				return nil, fmt.Errorf("invalid tool policy %q", name)
+			}
+			if policy.Class == "deduplicated" && (policy.DeduplicationEvidence == "" || server.CallIDHeader == "") {
+				return nil, fmt.Errorf("deduplicated tool requires reviewed evidence and call ID header")
+			}
 		}
 		seenTools := make(map[string]bool, len(server.Tools))
 		for _, name := range server.Tools {

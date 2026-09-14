@@ -5,7 +5,8 @@
       "endpoint": "${TEST_JAVA_MCP_ENDPOINT}",
       "forward_headers": ["Cookie", "Authorization"],
       "call_id_header": "X-Platform-Call-ID",
-      "tools": ["lookup_destination"]
+      "tools": ["lookup_destination"],
+      "policies": {"lookup_destination": {"class":"read_only"}}
     }
   ],
   "journeys": [

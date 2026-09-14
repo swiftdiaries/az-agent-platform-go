@@ -39,6 +39,19 @@ func (s *Store) Snapshot(ctx context.Context, thread, principal string) (Snapsho
 			return err
 		}
 
+		for i := range snapshot.Runs {
+			var artifact []byte
+			err := tx.QueryRow(ctx, "SELECT artifact FROM agent_interactions WHERE thread_id=$1 AND run_id=$2 AND state='pending'", thread, snapshot.Runs[i].RunID).Scan(&artifact)
+			if err == pgx.ErrNoRows {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if err = json.Unmarshal(artifact, &snapshot.Runs[i].Interaction); err != nil {
+				return err
+			}
+		}
 		snapshot.Events, err = readEvents(ctx, tx, thread, 0)
 		if err != nil {
 			return err

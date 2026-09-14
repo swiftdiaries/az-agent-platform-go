@@ -21,15 +21,16 @@ var (
 type RunState string
 
 const (
-	RunInterrupted  RunState = "interrupted"
-	RunPending      RunState = "pending"
-	RunRunning      RunState = "running"
-	RunCompleted    RunState = "completed"
-	RunFailed       RunState = "failed"
-	RunAuthRequired RunState = "auth_required"
+	RunAwaitingInput RunState = "awaiting_input"
+	RunInterrupted   RunState = "interrupted"
+	RunPending       RunState = "pending"
+	RunRunning       RunState = "running"
+	RunCompleted     RunState = "completed"
+	RunFailed        RunState = "failed"
+	RunAuthRequired  RunState = "auth_required"
 )
 
-type Command struct{ ThreadID, RunID, CommunicationID, Principal, Text, TargetJourney string }
+type Command struct{ ThreadID, RunID, CommunicationID, Principal, Text, TargetJourney, InteractionID, ReplyKind, ReplyJSON string }
 type Receipt struct {
 	ThreadID, RunID, CommunicationID string
 	ExecutionRunID                   string
@@ -47,6 +48,7 @@ type CommandOutcome struct {
 }
 
 type Run struct {
+	Interaction       *Interaction
 	CommandOutcomes   []CommandOutcome
 	CommandRunIDs     []string
 	PendingCommands   int

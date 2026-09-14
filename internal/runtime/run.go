@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"github.com/microsoft/agent-framework-go/tool"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
@@ -52,8 +54,9 @@ type ToolCall struct {
 }
 
 type ModelResponse struct {
-	Text     string
-	ToolCall *ToolCall
+	Text      string
+	ToolCalls []ToolCall
+	ToolCall  *ToolCall
 }
 
 type Model interface {
@@ -80,6 +83,7 @@ type RunInput struct {
 }
 
 type RunOutput struct {
+	Waiting   bool
 	History   json.RawMessage
 	JourneyID string
 	Answer    string
@@ -97,10 +101,15 @@ func (r *Runner) Binding(ctx context.Context, in RunInput) (string, string, erro
 	if err != nil {
 		return "", "", err
 	}
+	server, ok := r.definitions.Server(journey.MCP.Server)
+	if !ok {
+		return "", "", fmt.Errorf("missing MCP server")
+	}
 	data, err := json.Marshal(struct {
 		Definition definitions.Journey
 		Prompt     string
-	}{journey, journey.Prompt})
+		Policies   map[string]definitions.ToolPolicy
+	}{journey, journey.Prompt, server.Policies})
 	if err != nil {
 		return "", "", err
 	}
@@ -134,101 +143,13 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 	if err := input.Store.Check(ctx, input.Owner); err != nil {
 		return RunOutput{}, err
 	}
-	productCallID := stableCallID(input.ThreadID, fmt.Sprintf("%s/%d", input.RunID, input.Iteration))
-	var pending []journal.Input
-	var selected []string
-	var requestHistory json.RawMessage
-	mafAgent := agent.New(agent.ProviderConfig{
-		ProviderName: "configured-model",
-		Run: modelRun(r.model, productCallID, func(ctx context.Context, request *ModelRequest) error {
-			request.Handoff = Handoff{JourneyID: journey.ID, Text: input.Text}
-			request.Context = selected
-			request.History = requestHistory
-			request.PendingCommands = pending
-			return input.Store.Check(ctx, input.Owner)
-		}, func(ctx context.Context) error { return input.Store.Included(ctx, input.Owner, pending) }),
-	}, agent.Config{
-		ID:          "journey:" + journey.ID,
-		Name:        journey.ID,
-		Description: journey.Description,
-		Tools:       funcsAsTools(bound.Tools()),
-		RunOptions:  []agent.Option{agent.WithInstructions(journey.Prompt)},
-	})
-	var history []*message.Message
-	if len(input.History) > 0 {
-		if err := json.Unmarshal(input.History, &history); err != nil {
-			return RunOutput{}, fmt.Errorf("decode provider history: %w", err)
-		}
-	}
-	// MAF sessions remain reconstructable: pass the complete authoritative history
-	// to each invocation, including the inbox drained at this provider boundary.
-	invoke := func() (*agent.Response, error) {
-		inbox, err := input.Store.Pending(ctx, input.Owner)
-		if err != nil {
-			return nil, err
-		}
-		pending = inbox.Commands
-		selected = inbox.Context
-		requestHistory, err = json.Marshal(history)
-		if err != nil {
-			return nil, err
-		}
-		for _, command := range pending {
-			history = append(history, &message.Message{Role: message.RoleUser, Contents: message.Contents{&message.TextContent{Text: command.Text}}})
-		}
-		return mafAgent.Run(ctx, history).Collect()
-	}
-	response, err := invoke()
-	if err != nil {
-		return RunOutput{}, fmt.Errorf("model request failed: %w", err)
-	}
-	history = append(history, response.Messages...)
-	call := firstToolCall(response)
-	if call == nil {
-		if answer := response.String(); answer != "" {
-			serialized, err := json.Marshal(history)
-			return RunOutput{JourneyID: journey.ID, Answer: answer, History: serialized}, err
-		}
-		return RunOutput{}, fmt.Errorf("model returned no answer")
-	}
-	if !json.Valid([]byte(call.Arguments)) {
-		return RunOutput{}, fmt.Errorf("model returned invalid tool arguments")
-	}
-	if err := input.Store.Check(ctx, input.Owner); err != nil {
-		return RunOutput{}, err
-	}
-	result, err := bound.Call(ctx, productCallID, call.Name, []byte(call.Arguments))
-	if checkErr := input.Store.Check(ctx, input.Owner); checkErr != nil {
-		return RunOutput{}, checkErr
-	}
-	if err != nil {
-		return RunOutput{}, err
-	}
-	toolMessage := &message.Message{
-		Role: message.RoleTool,
-		Contents: message.Contents{&message.FunctionResultContent{
-			CallID: call.CallID, Result: result,
-		}},
-	}
-	history = append(history, toolMessage)
-	final, err := invoke()
-	if err != nil {
-		return RunOutput{}, fmt.Errorf("model request failed: %w", err)
-	}
-	if firstToolCall(final) != nil {
-		return RunOutput{}, fmt.Errorf("multiple tool rounds are outside the Task 1 read-only slice")
-	}
-	if final.String() == "" {
-		return RunOutput{}, fmt.Errorf("model returned no answer")
-	}
-	history = append(history, final.Messages...)
-	serialized, err := json.Marshal(history)
-	return RunOutput{JourneyID: journey.ID, Answer: final.String(), CallID: productCallID, ToolName: call.Name, History: serialized}, err
+	return r.runHarness(ctx, input, journey, bound, server)
 }
 
-func modelRun(model Model, callBase string, before func(context.Context, *ModelRequest) error, observed func(context.Context) error) agent.RunFunc {
+func modelRun(parent context.Context, model Model, callBase string, before func(context.Context, *ModelRequest) error, observed func(context.Context) error) agent.RunFunc {
 	return func(ctx context.Context, messages []*message.Message, options ...agent.Option) iter.Seq2[*agent.ResponseUpdate, error] {
 		return func(yield func(*agent.ResponseUpdate, error) bool) {
+			ctx = trace.ContextWithSpanContext(ctx, trace.SpanContextFromContext(parent))
 			request := ModelRequest{}
 			for instructions := range agent.AllOptions(options, agent.WithInstructions) {
 				request.Instructions = instructions
@@ -268,19 +189,24 @@ func modelRun(model Model, callBase string, before func(context.Context, *ModelR
 				return
 			}
 			update := &agent.ResponseUpdate{Role: message.RoleAssistant}
+			calls := response.ToolCalls
 			if response.ToolCall != nil {
-				callID := response.ToolCall.CallID
-				if callID == "" {
-					callID = callBase
-				}
+				calls = append(calls, *response.ToolCall)
+			}
+			if len(calls) > 0 {
 				update.FinishReason = "tool_calls"
-				update.Contents = message.Contents{&message.FunctionCallContent{
-					CallID: callID, Name: response.ToolCall.Name, Arguments: string(response.ToolCall.Arguments),
-				}}
+				for index, call := range calls {
+					id := call.CallID
+					if id == "" {
+						id = fmt.Sprintf("%s-%d-%s", callBase, index, rand.Text())
+					}
+					update.Contents = append(update.Contents, &message.FunctionCallContent{CallID: id, Name: call.Name, Arguments: string(call.Arguments)})
+				}
 			} else {
 				update.FinishReason = "stop"
 				update.Contents = message.Contents{&message.TextContent{Text: response.Text}}
 			}
+
 			yield(update, nil)
 		}
 	}
@@ -299,18 +225,6 @@ func funcsAsTools(functions []tool.FuncTool) []tool.Tool {
 		tools[i] = functions[i]
 	}
 	return tools
-}
-
-func firstToolCall(response *agent.Response) *message.FunctionCallContent {
-	if response == nil {
-		return nil
-	}
-	for content := range response.Contents() {
-		if call, ok := content.(*message.FunctionCallContent); ok && !call.InformationalOnly {
-			return call
-		}
-	}
-	return nil
 }
 
 func stableCallID(threadID, runID string) string {

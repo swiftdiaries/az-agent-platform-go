@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,8 @@ import (
 )
 
 type Client struct{}
+
+var ErrBusinessRejected = errors.New("MCP business rejection")
 
 var ErrAuthRequired = errors.New("MCP authentication required")
 
@@ -88,14 +91,21 @@ func (c *Client) Bind(ctx context.Context, server definitions.MCPServer, allowed
 func (b *Bound) Tools() []tool.FuncTool { return slices.Clone(b.tools) }
 
 func (b *Bound) Call(ctx context.Context, callID, name string, arguments []byte) (any, error) {
-	callable, ok := b.byName[name]
+	_, ok := b.byName[name]
 	if !ok {
 		return nil, fmt.Errorf("tool %q is not allowed", name)
 	}
 	ctx, span := otel.Tracer("az-agent-platform/mcp").Start(ctx, "mcp.call")
 	span.SetAttributes(attribute.String("call.id", callID), attribute.String("tool.name", name))
 	defer span.End()
-	return callable.Call(context.WithValue(ctx, callIDKey{}, callID), string(arguments))
+	result, err := b.session.CallTool(context.WithValue(ctx, callIDKey{}, callID), &protocol.CallToolParams{Name: name, Arguments: json.RawMessage(arguments)})
+	if err != nil {
+		return nil, err
+	}
+	if result.IsError {
+		return nil, ErrBusinessRejected
+	}
+	return result, nil
 }
 
 func (b *Bound) Close() error { return b.session.Close() }

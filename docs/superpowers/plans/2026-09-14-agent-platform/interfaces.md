@@ -30,3 +30,19 @@ Compile strict journey configuration at startup into immutable digest-indexed bu
 Startup validates symbolic tool selections against checked-in server contracts without user credentials. Each run performs authenticated discovery and exact fail-closed binding with fresh credentials. MCP owns tool schemas. Use strict configuration decoding and semantic checks; no duplicate journey JSON Schema is needed without a consumer.
 
 Retain the full retry/error taxonomy and privacy defaults from the spec. Use one retry budget, stable logical operation IDs and distinct attempt IDs. An uncertain effect must terminate outside normal model autocall. Provider-request inclusion is recorded only after direct boundary observation, never merely after context construction.
+
+## Task 4 implemented continuation and effect boundary
+
+`Command` adds `InteractionID`, `ReplyKind`, and `ReplyJSON`. Ordinary commands contain text; replies contain no text and must name the pending interaction and its exact kind. A wait releases the owner and marks the old run `awaiting_input`; ordinary steering then conflicts. A valid typed reply consumes the interaction and atomically admits a **new** execution run. Retransmitting the same receipt can claim that still-pending continuation, but cannot take over running or interrupted work.
+
+Chat accepts replies in `RunAgentInput.forwardedProps.interactionReply`, with empty `messages`:
+
+```json
+{"interactionId":"interaction_opaque","kind":"clarification","answer":{"answers":{"question-id":{"option":"Exact label"}}}}
+```
+
+A custom clarification answer uses `{"custom":"text"}` instead of `option`. Approval uses `{"kind":"approval","interactionId":"interaction_opaque","answer":{"decision":"approve","binding":"exact digest from artifact"}}`; `deny` is the only other decision. The committed artifact is available in snapshot `interaction` and live `interaction.requested`; its tool call is authoritative, and reply payloads cannot replace its arguments. The waiting stream finishes normally after the interaction event. External thread/run and command correlation remain Chat-owned.
+
+`Store.Wait` commits history and product checkpoint, validated interaction, TTL and lifecycle event with owner release. `Store.Continuation` is fenced and returns only the interaction consumed into that owner run. `Store.BeginAttempt`/`EndAttempt` journal each exact logical operation before/after dispatch; an unclosed intent is uncertain. The platform call ID stays stable across at most two attempts. Policy lives in the configured MCP server's `policies` map keyed by declared tool name; default is effectful/approval. `deduplicated` requires a reviewed `deduplication_evidence` reference and `call_id_header`; annotations are insufficient. Unknown operations block later provider/action re-entry pending explicit reconciliation.
+
+The pinned graph fails the multi-outstanding continuation gate. The chosen product harness uses MAF for single provider turns and owns durable wait/result batching; no production workflow graph checkpoint is claimed. All completed/suppressed tool results precede the next provider call and any newly included steering. There is one business-argument repair budget across continuation waits.

@@ -112,7 +112,7 @@ func (s *Store) Renew(ctx context.Context, o Owner, duration time.Duration) erro
 
 // Reap records interruption only. It cannot start a worker or restore credentials.
 func (s *Store) Reap(ctx context.Context) error {
-	rows, err := s.pool.Query(ctx, "SELECT thread_id,id FROM agent_runs WHERE state IN ('pending','running') AND lease_until<=clock_timestamp()")
+	rows, err := s.pool.Query(ctx, "SELECT thread_id,id FROM agent_runs WHERE state IN ('pending','running') AND lease_until<=clock_timestamp() UNION SELECT thread_id,run_id FROM agent_interactions WHERE state='pending' AND expires_at<=clock_timestamp()")
 	if err != nil {
 		return err
 	}
@@ -136,7 +136,10 @@ func (s *Store) Reap(ctx context.Context) error {
 			if err := tx.QueryRow(ctx, "SELECT id FROM agent_conversations WHERE id=$1 FOR UPDATE", r.thread).Scan(&id); err != nil {
 				return err
 			}
-			return interruptExpired(ctx, tx, r.thread)
+			if err := interruptExpired(ctx, tx, r.thread); err != nil {
+				return err
+			}
+			return expireInteractions(ctx, tx, r.thread)
 
 		})
 		if err != nil {
@@ -158,6 +161,12 @@ func interruptExpired(ctx context.Context, tx pgx.Tx, thread string) error {
 	}
 	result, err := tx.Exec(ctx, "UPDATE agent_runs SET state='interrupted' WHERE thread_id=$1 AND id=$2 AND lease_until<=clock_timestamp()", thread, run)
 	if err != nil || result.RowsAffected() == 0 {
+		return err
+	}
+	if _, err := tx.Exec(ctx, "UPDATE agent_attempts a SET outcome='outcome_unknown' FROM agent_operations o WHERE a.call_id=o.call_id AND o.thread_id=$1 AND o.run_id=$2 AND a.outcome='dispatching'", thread, run); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, "UPDATE agent_operations SET outcome='outcome_unknown' WHERE thread_id=$1 AND run_id=$2 AND outcome='dispatching'", thread, run); err != nil {
 		return err
 	}
 	if err := disposePending(ctx, tx, thread, run, RunInterrupted); err != nil {

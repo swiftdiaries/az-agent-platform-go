@@ -26,20 +26,21 @@ var (
 type RunState = journal.RunState
 
 const (
-	RunInterrupted  = journal.RunInterrupted
-	RunPending      = journal.RunPending
-	RunRunning      = journal.RunRunning
-	RunCompleted    = journal.RunCompleted
-	RunFailed       = journal.RunFailed
-	RunAuthRequired = journal.RunAuthRequired
+	RunAwaitingInput = journal.RunAwaitingInput
+	RunInterrupted   = journal.RunInterrupted
+	RunPending       = journal.RunPending
+	RunRunning       = journal.RunRunning
+	RunCompleted     = journal.RunCompleted
+	RunFailed        = journal.RunFailed
+	RunAuthRequired  = journal.RunAuthRequired
 )
 
 type Command struct {
-	ThreadID, RunID, CommunicationID, Principal, Text, TargetJourney string
+	ThreadID, RunID, CommunicationID, Principal, Text, TargetJourney, InteractionID, ReplyKind, ReplyJSON string
 }
 
 func (c Command) durable() journal.Command {
-	return journal.Command{ThreadID: c.ThreadID, RunID: c.RunID, CommunicationID: c.CommunicationID, Principal: c.Principal, Text: c.Text, TargetJourney: c.TargetJourney}
+	return journal.Command{ThreadID: c.ThreadID, RunID: c.RunID, CommunicationID: c.CommunicationID, Principal: c.Principal, Text: c.Text, TargetJourney: c.TargetJourney, InteractionID: c.InteractionID, ReplyKind: c.ReplyKind, ReplyJSON: c.ReplyJSON}
 }
 
 type Submission struct {
@@ -107,8 +108,31 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 	if err != nil {
 		return Receipt{}, err
 	}
+	if !fresh && c.InteractionID != "" {
+		snapshot, snapshotErr := p.store.Snapshot(ctx, c.ThreadID, c.Principal)
+		if snapshotErr != nil {
+			return Receipt{}, snapshotErr
+		}
+		for _, run := range snapshot.Runs {
+			if run.RunID == c.RunID && run.State == RunPending {
+				fresh = true
+			}
+		}
+	}
 	if fresh {
-		headers := p.runner.TransientHeaders(ctx, c.TargetJourney, c.Text, submission.Headers)
+		target := c.TargetJourney
+		if c.InteractionID != "" {
+			snapshot, err := p.store.Snapshot(ctx, c.ThreadID, c.Principal)
+			if err != nil {
+				return Receipt{}, err
+			}
+			for _, run := range snapshot.Runs {
+				if run.RunID == c.RunID {
+					target = run.JourneyID
+				}
+			}
+		}
+		headers := p.runner.TransientHeaders(ctx, target, c.Text, submission.Headers)
 		transferred = true
 		go func() {
 			defer p.workers.Done()
@@ -118,7 +142,7 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 			defer cancel()
 			stop := context.AfterFunc(p.ctx, cancel)
 			defer stop()
-			p.execute(runCtx, c, agentruntime.RunInput{ThreadID: c.ThreadID, RunID: c.RunID, Principal: c.Principal, Text: c.Text, TargetJourney: c.TargetJourney, Headers: headers})
+			p.execute(runCtx, c, agentruntime.RunInput{ThreadID: c.ThreadID, RunID: c.RunID, Principal: c.Principal, Text: c.Text, TargetJourney: target, Headers: headers})
 		}()
 	}
 	return receipt, nil
@@ -162,6 +186,9 @@ func (p *Platform) execute(ctx context.Context, c Command, in agentruntime.RunIn
 		var output agentruntime.RunOutput
 		if err == nil {
 			output, err = p.runner.Run(ctx, in)
+		}
+		if output.Waiting {
+			return
 		}
 		if ctx.Err() != nil || errors.Is(err, journal.ErrOwnership) {
 			return

@@ -11,6 +11,9 @@ import (
 // Admit commits an immutable receipt and maps input to the live owner inbox,
 // or schedules a new pending run if finish already committed.
 func (s *Store) Admit(ctx context.Context, c Command) (Receipt, bool, error) {
+	if c.InteractionID != "" {
+		return s.reply(ctx, c)
+	}
 	receipt := Receipt{ThreadID: c.ThreadID, RunID: c.RunID, CommunicationID: c.CommunicationID, State: RunPending}
 	fresh := false
 	if c.ThreadID == "" || c.RunID == "" || c.CommunicationID == "" || c.Principal == "" || c.Text == "" {
@@ -44,6 +47,16 @@ func (s *Store) Admit(ctx context.Context, c Command) (Receipt, bool, error) {
 		}
 		if err := interruptExpired(ctx, tx, c.ThreadID); err != nil {
 			return err
+		}
+		if err := expireInteractions(ctx, tx, c.ThreadID); err != nil {
+			return err
+		}
+		var waiting bool
+		if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM agent_interactions WHERE thread_id=$1 AND state='pending')", c.ThreadID).Scan(&waiting); err != nil {
+			return err
+		}
+		if waiting {
+			return ErrBusy
 		}
 		var execution, journey, originalTarget string
 		err = tx.QueryRow(ctx, "SELECT r.id,COALESCE(r.journey_id,''),c.payload->>'TargetJourney' FROM agent_runs r JOIN agent_commands c ON c.run_id=r.id WHERE r.thread_id=$1 AND r.state IN ('pending','running')", c.ThreadID).Scan(&execution, &journey, &originalTarget)

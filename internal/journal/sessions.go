@@ -14,6 +14,13 @@ func (s *Store) Start(ctx context.Context, o Owner, journey, digest string) (jso
 		if err := lockOwner(ctx, tx, o); err != nil {
 			return err
 		}
+		var unresolved bool
+		if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM agent_operations WHERE thread_id=$1 AND outcome IN ('dispatching','outcome_unknown'))", c.ThreadID).Scan(&unresolved); err != nil {
+			return err
+		}
+		if unresolved {
+			return ErrOutcomeUnknown
+		}
 		if _, err := tx.Exec(ctx, "INSERT INTO agent_sessions(thread_id,journey_id,definition_digest) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", c.ThreadID, journey, digest); err != nil {
 			return err
 		}
@@ -61,14 +68,22 @@ func (s *Store) Finish(ctx context.Context, o Owner, state RunState, history jso
 			}
 		}
 		if state != RunCompleted {
+			if _, err := tx.Exec(ctx, "UPDATE agent_attempts a SET outcome='outcome_unknown' FROM agent_operations o WHERE a.call_id=o.call_id AND o.thread_id=$1 AND o.run_id=$2 AND a.outcome='dispatching'", c.ThreadID, c.RunID); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, "UPDATE agent_operations SET outcome='outcome_unknown' WHERE thread_id=$1 AND run_id=$2 AND outcome='dispatching'", c.ThreadID, c.RunID); err != nil {
+				return err
+			}
 			if err := disposePending(ctx, tx, c.ThreadID, c.RunID, state); err != nil {
 				return err
 			}
 		}
-		if state == RunCompleted {
+		if len(history) > 0 {
 			if _, err := tx.Exec(ctx, "UPDATE agent_sessions SET history=$3 WHERE thread_id=$1 AND journey_id=$2", c.ThreadID, journey, history); err != nil {
 				return err
 			}
+		}
+		if state == RunCompleted {
 			if callID != "" {
 				if err := appendEvent(ctx, tx, c.ThreadID, Event{RunID: c.RunID, Type: "tool.completed", CallID: callID, ToolName: tool}); err != nil {
 					return err

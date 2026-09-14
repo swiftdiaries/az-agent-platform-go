@@ -13,6 +13,7 @@ import (
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -72,11 +73,26 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	text, target := "", ""
+	var reply struct {
+		InteractionID string          `json:"interactionId"`
+		Kind          string          `json:"kind"`
+		Answer        json.RawMessage `json:"answer"`
+	}
+	replyJSON := ""
 	if create {
-		text, err = lastUserText(input.Messages)
-		if err != nil {
-			http.Error(w, "user text is required", http.StatusBadRequest)
-			return
+		if props, ok := input.ForwardedProps.(map[string]any); ok && props["interactionReply"] != nil {
+			raw, marshalErr := json.Marshal(props["interactionReply"])
+			if marshalErr != nil || journal.DecodeStrict(raw, &reply) != nil || reply.InteractionID == "" || reply.Kind == "" || len(reply.Answer) == 0 || len(input.Messages) != 0 {
+				http.Error(w, "invalid interaction reply", http.StatusBadRequest)
+				return
+			}
+			replyJSON = string(reply.Answer)
+		} else {
+			text, err = lastUserText(input.Messages)
+			if err != nil {
+				http.Error(w, "user text is required", http.StatusBadRequest)
+				return
+			}
 		}
 		target, err = targetJourney(input.ForwardedProps)
 		if err != nil {
@@ -95,7 +111,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if create {
 		// Submit synchronously selects only the journey's configured MCP header names;
 		// no inbound header map is retained by execution or written to persistence.
-		_, err = h.platform.Submit(ctx, platform.Submission{Command: platform.Command{ThreadID: thread, RunID: run, CommunicationID: communication, Principal: principal, Text: text, TargetJourney: target}, Headers: r.Header})
+		_, err = h.platform.Submit(ctx, platform.Submission{Command: platform.Command{ThreadID: thread, RunID: run, CommunicationID: communication, Principal: principal, Text: text, TargetJourney: target, InteractionID: reply.InteractionID, ReplyKind: reply.Kind, ReplyJSON: replyJSON}, Headers: r.Header})
 		if err != nil {
 			commandError(w, err)
 			return
@@ -153,7 +169,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !emit(events.NewRunStartedEvent(input.ThreadID, input.RunID), 0) {
 		return
 	}
-	if !emit(events.NewStateSnapshotEvent(map[string]any{"threadId": input.ThreadID, "watermark": snapshot.Watermark, "journeyId": current.JourneyID, "runState": current.State, "pendingCommands": current.PendingCommands, "commands": commands, "answer": current.Answer}), max(cursor, snapshot.Watermark)) {
+	if !emit(events.NewStateSnapshotEvent(map[string]any{"threadId": input.ThreadID, "watermark": snapshot.Watermark, "journeyId": current.JourneyID, "runState": current.State, "pendingCommands": current.PendingCommands, "commands": commands, "answer": current.Answer, "interaction": current.Interaction}), max(cursor, snapshot.Watermark)) {
 		return
 	}
 	terminal := func(e platform.Event, sequence int64) bool {
@@ -161,6 +177,19 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case "message.completed":
 			messageID := input.RunID + ":answer"
 			return !emit(events.NewTextMessageStartEvent(messageID, events.WithRole("assistant")), 0) || !emit(events.NewTextMessageContentEvent(messageID, e.Answer), sequence) || !emit(events.NewTextMessageEndEvent(messageID), 0)
+		case "run.awaiting_input":
+			s, err := h.platform.Snapshot(ctx, thread, principal)
+			if err != nil {
+				emit(events.NewRunErrorEvent("observation unavailable"), sequence)
+				return true
+			}
+			for _, r := range s.Runs {
+				if r.RunID == run {
+					emit(events.NewCustomEvent("interaction.requested", events.WithValue(r.Interaction)), sequence)
+				}
+			}
+			emit(events.NewRunFinishedEvent(input.ThreadID, input.RunID), 0)
+			return true
 		case "run.completed":
 			emit(events.NewRunFinishedEvent(input.ThreadID, input.RunID), sequence)
 			return true
@@ -176,6 +205,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return true
 		default:
 			value := map[string]any{"reason": e.Reason}
+			if e.CallID != "" {
+				value["callId"] = e.CallID
+			}
+			if e.ToolName != "" {
+				value["toolName"] = e.ToolName
+			}
 			if e.CommunicationID != "" {
 				external, ok := externalCommands[e.CommunicationID]
 				if !ok {
@@ -198,6 +233,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	switch current.State {
+	case platform.RunAwaitingInput:
+		terminal(platform.Event{Type: "run.awaiting_input"}, 0)
+		return
 	case platform.RunCompleted:
 		terminal(platform.Event{Type: "run.completed"}, 0)
 		return
