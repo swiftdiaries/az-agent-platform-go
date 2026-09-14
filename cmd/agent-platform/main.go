@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/textproto"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -19,6 +21,7 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/provider/foundry"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/service"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/telemetry"
 )
 
 const (
@@ -38,6 +41,7 @@ type config struct {
 	keycloak          chat.KeycloakConfig
 	foundryEndpoint   string
 	foundryDeployment string
+	telemetry         telemetry.Config
 }
 
 func main() {
@@ -55,6 +59,22 @@ func run(ctx context.Context, lookup func(string) string) error {
 	if err != nil {
 		return err
 	}
+	provider, err := telemetry.New(config.telemetry)
+	if err != nil {
+		return errors.New("invalid telemetry configuration")
+	}
+	telemetryStopped := false
+	shutdownTelemetry := func(ctx context.Context) error {
+		telemetryStopped = true
+		return provider.Shutdown(ctx)
+	}
+	defer func() {
+		if !telemetryStopped {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), config.grace)
+			defer cancel()
+			_ = shutdownTelemetry(shutdownCtx)
+		}
+	}()
 	registry, err := definitions.Load(config.definitionPath, config.retainedConfigs...)
 	if err != nil {
 		return errors.New("invalid definitions")
@@ -101,8 +121,13 @@ func run(ctx context.Context, lookup func(string) string) error {
 	case <-ctx.Done():
 		graceCtx, cancel := context.WithTimeout(context.Background(), config.grace)
 		defer cancel()
-		if err := app.Shutdown(graceCtx); err != nil {
+		serviceErr := app.Shutdown(graceCtx)
+		telemetryErr := shutdownTelemetry(graceCtx)
+		if serviceErr != nil {
 			return errors.New("service shutdown failed")
+		}
+		if telemetryErr != nil {
+			return errors.New("telemetry shutdown failed")
 		}
 		return nil
 	case <-serveErr:
@@ -157,10 +182,15 @@ func loadConfig(lookup func(string) string) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	telemetryConfig, err := telemetryConfig(require, lookup, grace)
+	if err != nil {
+		return config{}, err
+	}
 	return config{
 		databaseURL: databaseURL, definitionPath: definitionPath,
 		retainedConfigs: splitValues(lookup(envRetained)), port: port, grace: grace, keycloak: keycloak,
 		foundryEndpoint: foundryEndpoint, foundryDeployment: foundryDeployment,
+		telemetry: telemetryConfig,
 	}, nil
 }
 
@@ -211,4 +241,52 @@ func splitValues(value string) []string {
 		}
 	}
 	return result
+}
+
+func telemetryConfig(require func(string) (string, error), lookup func(string) string, shutdownTimeout time.Duration) (telemetry.Config, error) {
+	serviceName, err := require("OTEL_SERVICE_NAME")
+	if err != nil {
+		return telemetry.Config{}, err
+	}
+	serviceVersion, err := require("OTEL_SERVICE_VERSION")
+	if err != nil {
+		return telemetry.Config{}, err
+	}
+	headers, err := telemetryHeaders(lookup("OTEL_EXPORTER_OTLP_HEADERS"))
+	if err != nil {
+		return telemetry.Config{}, err
+	}
+	endpoint := strings.TrimSpace(lookup("OTEL_EXPORTER_OTLP_ENDPOINT"))
+	if endpoint != "" {
+		parsed, err := url.ParseRequestURI(endpoint)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			return telemetry.Config{}, errors.New("invalid telemetry endpoint configuration")
+		}
+	}
+	return telemetry.Config{
+		ServiceName: serviceName, ServiceVersion: serviceVersion,
+		Endpoint: endpoint, Headers: headers,
+		ShutdownTimeout: shutdownTimeout,
+	}, nil
+}
+
+func telemetryHeaders(value string) (map[string]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	headers := make(map[string]string)
+	for _, item := range strings.Split(value, ",") {
+		name, headerValue, ok := strings.Cut(item, "=")
+		name = textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(name))
+		headerValue = strings.TrimSpace(headerValue)
+		if !ok || name == "" || headerValue == "" || strings.ContainsAny(name, "\r\n:") || strings.ContainsAny(headerValue, "\r\n") {
+			return nil, errors.New("invalid telemetry header configuration")
+		}
+		if _, exists := headers[name]; exists {
+			return nil, errors.New("invalid telemetry header configuration")
+		}
+		headers[name] = headerValue
+	}
+	return headers, nil
 }

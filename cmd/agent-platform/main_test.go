@@ -7,11 +7,12 @@ import (
 	"time"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/telemetry"
 )
 
 func TestLoadConfigRequiresEveryProductionBoundary(t *testing.T) {
 	values := validEnvironment()
-	for _, name := range []string{"DATABASE_URL", "AGENT_PLATFORM_CONFIG", "AGENT_PLATFORM_PORT", "AGENT_PLATFORM_SHUTDOWN_GRACE", "KEYCLOAK_JWT_ISSUER", "KEYCLOAK_JWKS_URL", "KEYCLOAK_JWT_AUDIENCE", "KEYCLOAK_JWT_SOURCE", "KEYCLOAK_JWT_HEADER", "KEYCLOAK_USER_CLAIM_PATH", "KEYCLOAK_TENANT_CLAIM_PATH", "KEYCLOAK_JWT_ALLOWED_ALGORITHMS", "AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT", "AZ_AGENT_FOUNDRY_DEPLOYMENT"} {
+	for _, name := range []string{"DATABASE_URL", "AGENT_PLATFORM_CONFIG", "AGENT_PLATFORM_PORT", "AGENT_PLATFORM_SHUTDOWN_GRACE", "KEYCLOAK_JWT_ISSUER", "KEYCLOAK_JWKS_URL", "KEYCLOAK_JWT_AUDIENCE", "KEYCLOAK_JWT_SOURCE", "KEYCLOAK_JWT_HEADER", "KEYCLOAK_USER_CLAIM_PATH", "KEYCLOAK_TENANT_CLAIM_PATH", "KEYCLOAK_JWT_ALLOWED_ALGORITHMS", "AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT", "AZ_AGENT_FOUNDRY_DEPLOYMENT", "OTEL_SERVICE_NAME", "OTEL_SERVICE_VERSION"} {
 		t.Run(name, func(t *testing.T) {
 			missing := mapsClone(values)
 			delete(missing, name)
@@ -58,6 +59,28 @@ func TestLoadConfigBuildsExplicitKeycloakMapping(t *testing.T) {
 	if !reflect.DeepEqual(config.keycloak, want) {
 		t.Fatalf("keycloak config = %#v", config.keycloak)
 	}
+	if !reflect.DeepEqual(config.telemetry, telemetry.Config{
+		ServiceName: "agent-platform", ServiceVersion: "revision", Endpoint: "https://collector.example/v1/traces",
+		Headers: map[string]string{"Authorization": "Bearer secret", "X-Tenant": "tenant"}, ShutdownTimeout: 30 * time.Second,
+	}) {
+		t.Fatalf("telemetry config = %#v", config.telemetry)
+	}
+}
+
+func TestLoadConfigRejectsMalformedTelemetrySecretHeaders(t *testing.T) {
+	values := validEnvironment()
+	values["OTEL_EXPORTER_OTLP_HEADERS"] = "not-a-header"
+	if _, err := loadConfig(missingValue(values)); err == nil {
+		t.Fatal("malformed telemetry header accepted")
+	}
+}
+
+func TestLoadConfigRejectsInvalidTelemetryEndpoint(t *testing.T) {
+	values := validEnvironment()
+	values["OTEL_EXPORTER_OTLP_ENDPOINT"] = "not an endpoint"
+	if _, err := loadConfig(missingValue(values)); err == nil {
+		t.Fatal("invalid telemetry endpoint accepted")
+	}
 }
 
 func validEnvironment() map[string]string {
@@ -68,6 +91,8 @@ func validEnvironment() map[string]string {
 		"KEYCLOAK_JWT_AUDIENCE": "agent-platform", "KEYCLOAK_JWT_SOURCE": "authorization_bearer", "KEYCLOAK_JWT_HEADER": "Authorization",
 		"KEYCLOAK_USER_CLAIM_PATH": "/preferred_username", "KEYCLOAK_TENANT_CLAIM_PATH": "/tenant", "KEYCLOAK_JWT_ALLOWED_ALGORITHMS": "RS256,RS512",
 		"AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT": "https://foundry.example/projects/agent", "AZ_AGENT_FOUNDRY_DEPLOYMENT": "gpt-deployment",
+		"OTEL_SERVICE_NAME": "agent-platform", "OTEL_SERVICE_VERSION": "revision", "OTEL_EXPORTER_OTLP_ENDPOINT": "https://collector.example/v1/traces",
+		"OTEL_EXPORTER_OTLP_HEADERS": "Authorization=Bearer secret,X-Tenant=tenant",
 	}
 }
 

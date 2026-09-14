@@ -39,10 +39,14 @@ these nonsecret values through `envFrom`; actual values have not been supplied.
 | `KEYCLOAK_JWT_ALLOWED_ALGORITHMS` | comma-separated RSA JWT algorithms |
 | `AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT` | Azure AI Foundry project endpoint |
 | `AZ_AGENT_FOUNDRY_DEPLOYMENT` | Foundry deployment name |
+| `OTEL_SERVICE_NAME` | trace service name |
+| `OTEL_SERVICE_VERSION` | deployed revision/version |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | optional absolute HTTP(S) OTLP endpoint; empty disables export |
 
 Every listed ConfigMap key is required except
-`AGENT_PLATFORM_RETAINED_CONFIGS`, which is optional and empty when no session
-pin needs an older bundle. There are no implicit file, port, or grace-period
+`AGENT_PLATFORM_RETAINED_CONFIGS` and `OTEL_EXPORTER_OTLP_ENDPOINT`, which are
+empty when no session pin needs an older bundle or trace export is disabled.
+There are no implicit file, port, or grace-period
 defaults: `AGENT_PLATFORM_PORT` must be an integer from 1 through 65535 and
 `AGENT_PLATFORM_SHUTDOWN_GRACE` must be a positive Go duration. Missing or
 invalid values stop startup with the fixed message `agent platform startup
@@ -67,6 +71,13 @@ authentication are unsupported. The process constructs an Azure default AAD
 credential, so workload identity is the expected production path. The Foundry
 adapter refuses redirects before a redirected request can receive that bearer
 credential.
+
+`OTEL_EXPORTER_OTLP_HEADERS` is optional and must be supplied only through a
+Secret reference. It is a comma-separated `Header=Value` list; malformed,
+duplicate, or newline-bearing entries fail startup without exposing the value.
+The process initializes W3C tracing before creating the service. On SIGTERM it
+uses the remaining `AGENT_PLATFORM_SHUTDOWN_GRACE` context for service drain and
+then telemetry shutdown, so exporter flushing receives no second grace period.
 
 ## Delivery split
 

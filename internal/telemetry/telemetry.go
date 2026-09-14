@@ -63,7 +63,9 @@ func New(cfg Config) (*Provider, error) {
 			otlptracehttp.WithTimeout(cfg.ExportTimeout),
 		}
 		exporterOptions = append(exporterOptions, otlptracehttp.WithEndpointURL(cfg.Endpoint))
-		exporter, err := otlptracehttp.New(context.Background(), exporterOptions...)
+		exporterCtx, cancel := context.WithTimeout(context.Background(), cfg.ExportTimeout)
+		defer cancel()
+		exporter, err := otlptracehttp.New(exporterCtx, exporterOptions...)
 		if err != nil {
 			return nil, err
 		}
