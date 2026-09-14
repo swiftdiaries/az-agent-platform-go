@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
@@ -154,6 +155,56 @@ func (b requestBody) method() string {
 	}
 	_ = json.Unmarshal(b, &v)
 	return v.Method
+}
+
+func TestBeginAttemptSecondAttemptPredecessorMatrix(t *testing.T) {
+	for _, predecessor := range []string{"dispatching", "completed", "rejected", "auth_required", "outcome_unknown"} {
+		for _, policy := range []string{"read_only", "deduplicated", "effectful"} {
+			t.Run(predecessor+"/"+policy, func(t *testing.T) {
+				pool := database(t)
+				store := journal.New(pool)
+				command := journal.Command{ThreadID: "retry-matrix", RunID: "retry-matrix", CommunicationID: "retry-matrix", Principal: "alice", Text: "go"}
+				if _, _, err := store.Admit(t.Context(), command); err != nil {
+					t.Fatal(err)
+				}
+				owner, err := store.Claim(t.Context(), command, "retry-owner", journal.LeaseDuration)
+				if err != nil {
+					t.Fatal(err)
+				}
+				binding, err := journal.ActionBinding("lookup_destination", []byte(`{"city":"A"}`))
+				if err != nil {
+					t.Fatal(err)
+				}
+				op := journal.Operation{CallID: "stable-product-call", Name: "lookup_destination", Arguments: `{"city":"A"}`, Binding: binding, Policy: policy}
+				if _, err := pool.Exec(t.Context(), "INSERT INTO agent_operations(call_id,thread_id,run_id,name,arguments,binding,policy,outcome) VALUES($1,$2,$3,$4,$5,$6,$7,$8)", op.CallID, command.ThreadID, command.RunID, op.Name, op.Arguments, op.Binding, op.Policy, predecessor); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := pool.Exec(t.Context(), "INSERT INTO agent_attempts(call_id,attempt,outcome) VALUES($1,1,$2)", op.CallID, predecessor); err != nil {
+					t.Fatal(err)
+				}
+
+				err = store.BeginAttempt(t.Context(), owner, op, 2, "")
+				allowed := predecessor == "rejected" || predecessor == "outcome_unknown" && policy != "effectful"
+				if allowed && err != nil {
+					t.Fatalf("allowed retry rejected: %v", err)
+				}
+				if !allowed && !errors.Is(err, journal.ErrState) {
+					t.Fatalf("disallowed retry returned %v", err)
+				}
+				var outcome string
+				var attempts int
+				if err := pool.QueryRow(t.Context(), "SELECT outcome,(SELECT count(*) FROM agent_attempts WHERE call_id=o.call_id) FROM agent_operations o WHERE call_id=$1", op.CallID).Scan(&outcome, &attempts); err != nil {
+					t.Fatal(err)
+				}
+				if allowed && (outcome != "dispatching" || attempts != 2) {
+					t.Fatalf("allowed retry unchanged: outcome=%s attempts=%d", outcome, attempts)
+				}
+				if !allowed && (outcome != predecessor || attempts != 1) {
+					t.Fatalf("denied retry mutated row: outcome=%s attempts=%d", outcome, attempts)
+				}
+			})
+		}
+	}
 }
 
 func TestToolCallVerifiedRetryStableID(t *testing.T) {
@@ -475,6 +526,7 @@ func TestBusinessErrorChangedActionRequiresNewApproval(t *testing.T) {
 }
 
 func TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted(t *testing.T) {
+	const providerCallID = "provider-loss-sentinel"
 	pool := database(t)
 	ownerPool, err := pgxpool.NewWithConfig(t.Context(), pool.Config())
 	if err != nil {
@@ -495,7 +547,7 @@ func TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted(t *testing.T) {
 	defer backend.Close()
 	p := platform.New(policyRunner(t, backend.URL, "read_only", modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		models.Add(1)
-		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "loss", Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
+		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: providerCallID, Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
 	})), journal.New(ownerPool))
 	defer p.Close()
 	c := platform.Command{ThreadID: "loss", RunID: "loss", CommunicationID: "loss", Principal: "alice", Text: "go"}
@@ -516,6 +568,50 @@ func TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted(t *testing.T) {
 	var run, outcome, attempt string
 	if err := pool.QueryRow(t.Context(), "SELECT r.state,o.outcome,a.outcome FROM agent_runs r JOIN agent_operations o ON o.run_id=r.id JOIN agent_attempts a ON a.call_id=o.call_id").Scan(&run, &outcome, &attempt); err != nil || run != "interrupted" || outcome != "outcome_unknown" || attempt != "outcome_unknown" || calls.Load() != 1 || models.Load() != 1 {
 		t.Fatal(run, outcome, attempt, calls.Load(), models.Load(), err)
+	}
+	var productCallID, toolName string
+	if err := pool.QueryRow(t.Context(), "SELECT call_id,name FROM agent_operations").Scan(&productCallID, &toolName); err != nil || productCallID == providerCallID {
+		t.Fatal(productCallID, toolName, err)
+	}
+	snapshot, err := journal.New(pool).Snapshot(t.Context(), c.ThreadID, c.Principal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Events) < 2 {
+		t.Fatal("missing owner-loss events", snapshot.Events)
+	}
+	unknownEvent, interruptedEvent := snapshot.Events[len(snapshot.Events)-2], snapshot.Events[len(snapshot.Events)-1]
+	if unknownEvent.Type != "tool.outcome_unknown" || unknownEvent.CallID != productCallID || unknownEvent.ToolName != toolName || interruptedEvent.Type != "run.interrupted" {
+		t.Fatal("owner-loss event order", unknownEvent, interruptedEvent)
+	}
+	if _, err := pool.Exec(t.Context(), "INSERT INTO chat_threads(principal,external_id,id) VALUES('alice','external-loss-thread','loss'); INSERT INTO chat_runs(thread_id,external_id,id,communication_id) VALUES('loss','external-loss-run','loss','loss')"); err != nil {
+		t.Fatal(err)
+	}
+	observer := platform.New(fixtureRunner(t, modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+		t.Fatal("reconnect executed provider")
+		return agentruntime.ModelResponse{}, nil
+	})), journal.New(pool))
+	defer observer.Close()
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, observer, pool))
+	defer api.Close()
+	for _, cursor := range []int64{0, snapshot.Watermark} {
+		req, _ := http.NewRequest(http.MethodGet, api.URL+"?threadId=external-loss-thread&runId=external-loss-run", nil)
+		req.Header.Set("Authorization", "Bearer token")
+		req.Header.Set("Last-Event-ID", fmt.Sprint(cursor))
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		response.Body.Close()
+		if readErr != nil || response.StatusCode != http.StatusOK {
+			t.Fatal(response.StatusCode, string(body), readErr)
+		}
+		unknownAt := strings.Index(string(body), "outcome_unknown")
+		interruptedAt := strings.Index(string(body), "interrupted")
+		if unknownAt < 0 || interruptedAt < unknownAt || !strings.Contains(string(body), productCallID) || strings.Contains(string(body), providerCallID) {
+			t.Fatalf("cursor %d missing safe ordered uncertainty: %s", cursor, body)
+		}
 	}
 }
 

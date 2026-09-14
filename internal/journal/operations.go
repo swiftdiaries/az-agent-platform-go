@@ -51,7 +51,7 @@ func (s *Store) BeginAttempt(ctx context.Context, o Owner, op Operation, attempt
 			if err := tx.QueryRow(ctx, "SELECT outcome,policy,binding FROM agent_operations WHERE call_id=$1 AND thread_id=$2 AND run_id=$3", op.CallID, c.ThreadID, c.RunID).Scan(&previous, &policy, &binding); err != nil {
 				return err
 			}
-			if binding != op.Binding || policy != op.Policy || (previous != "rejected" && policy != "read_only" && policy != "deduplicated") {
+			if binding != op.Binding || policy != op.Policy || previous != "rejected" && (previous != "outcome_unknown" || policy == "effectful") {
 				return ErrState
 			}
 			if _, err := tx.Exec(ctx, "UPDATE agent_operations SET outcome='dispatching' WHERE call_id=$1", op.CallID); err != nil {

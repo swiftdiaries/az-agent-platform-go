@@ -45,8 +45,9 @@ func (s *Store) Claim(ctx context.Context, c Command, id string, duration time.D
 			return ErrOwnership
 		}
 		var state RunState
+		var epoch int64
 		var valid bool
-		if err := tx.QueryRow(ctx, "SELECT state,lease_until>clock_timestamp() FROM agent_runs WHERE thread_id=$1 AND id=$2 FOR UPDATE", c.ThreadID, c.RunID).Scan(&state, &valid); err != nil {
+		if err := tx.QueryRow(ctx, "SELECT state,owner_epoch,lease_until>clock_timestamp() FROM agent_runs WHERE thread_id=$1 AND id=$2 FOR UPDATE", c.ThreadID, c.RunID).Scan(&state, &epoch, &valid); err != nil {
 			if err == pgx.ErrNoRows {
 				return ErrOwnership
 			}
@@ -56,7 +57,13 @@ func (s *Store) Claim(ctx context.Context, c Command, id string, duration time.D
 		if err := tx.QueryRow(ctx, "SELECT lease_until>clock_timestamp() FROM agent_runs WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID).Scan(&valid); err != nil {
 			return err
 		}
-		if state != RunPending || !valid {
+		recoverable := false
+		if state == RunPending && epoch == 0 && !valid && c.InteractionID != "" {
+			if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM agent_interactions WHERE thread_id=$1 AND id=$2 AND continuation_run_id=$3 AND state='consumed')", c.ThreadID, c.InteractionID, c.RunID).Scan(&recoverable); err != nil {
+				return err
+			}
+		}
+		if state != RunPending || !valid && !recoverable {
 			return ErrOwnership
 		}
 		if err := tx.QueryRow(ctx, "UPDATE agent_conversations SET owner_epoch=owner_epoch+1 WHERE id=$1 RETURNING owner_epoch", c.ThreadID).Scan(&o.Epoch); err != nil {
@@ -112,7 +119,7 @@ func (s *Store) Renew(ctx context.Context, o Owner, duration time.Duration) erro
 
 // Reap records interruption only. It cannot start a worker or restore credentials.
 func (s *Store) Reap(ctx context.Context) error {
-	rows, err := s.pool.Query(ctx, "SELECT thread_id,id FROM agent_runs WHERE state IN ('pending','running') AND lease_until<=clock_timestamp() UNION SELECT thread_id,run_id FROM agent_interactions WHERE state='pending' AND expires_at<=clock_timestamp()")
+	rows, err := s.pool.Query(ctx, "SELECT r.thread_id,r.id FROM agent_runs r WHERE r.state IN ('pending','running') AND r.lease_until<=clock_timestamp() AND NOT (r.state='pending' AND r.owner_epoch=0 AND EXISTS(SELECT 1 FROM agent_interactions i WHERE i.thread_id=r.thread_id AND i.continuation_run_id=r.id AND i.state='consumed')) UNION SELECT thread_id,run_id FROM agent_interactions WHERE state='pending' AND expires_at<=clock_timestamp()")
 	if err != nil {
 		return err
 	}
@@ -166,8 +173,27 @@ func interruptExpired(ctx context.Context, tx pgx.Tx, thread string) error {
 	if _, err := tx.Exec(ctx, "UPDATE agent_attempts a SET outcome='outcome_unknown' FROM agent_operations o WHERE a.call_id=o.call_id AND o.thread_id=$1 AND o.run_id=$2 AND a.outcome='dispatching'", thread, run); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, "UPDATE agent_operations SET outcome='outcome_unknown' WHERE thread_id=$1 AND run_id=$2 AND outcome='dispatching'", thread, run); err != nil {
+	rows, err := tx.Query(ctx, "UPDATE agent_operations SET outcome='outcome_unknown' WHERE thread_id=$1 AND run_id=$2 AND outcome='dispatching' RETURNING call_id,name", thread, run)
+	if err != nil {
 		return err
+	}
+	var operations []Operation
+	for rows.Next() {
+		var op Operation
+		if err := rows.Scan(&op.CallID, &op.Name); err != nil {
+			rows.Close()
+			return err
+		}
+		operations = append(operations, op)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, op := range operations {
+		if err := appendEvent(ctx, tx, thread, Event{RunID: run, Type: "tool.outcome_unknown", CallID: op.CallID, ToolName: op.Name}); err != nil {
+			return err
+		}
 	}
 	if err := disposePending(ctx, tx, thread, run, RunInterrupted); err != nil {
 		return err

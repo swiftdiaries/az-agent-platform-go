@@ -213,6 +213,45 @@ func TestReplyWaitTransactionsAndTTL(t *testing.T) {
 	if err := pool.QueryRow(t.Context(), "SELECT history::text FROM agent_sessions").Scan(&history); err != nil || !strings.Contains(history, "interaction_expired") {
 		t.Fatal("expired call not closed", err)
 	}
+
+	pool = database(t)
+	store, owner, i = localWait(t, pool)
+	if err := store.Wait(t.Context(), owner, i, []byte(`{}`), []byte(`[]`)); err != nil {
+		t.Fatal(err)
+	}
+	gate, err := pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Rollback(t.Context())
+	if _, err := pool.Exec(t.Context(), "UPDATE agent_interactions SET expires_at=clock_timestamp()+interval '200 milliseconds' WHERE id=$1", i.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gate.Exec(t.Context(), "SELECT id FROM agent_interactions WHERE id=$1 FOR UPDATE", i.ID); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := store.Admit(context.Background(), reply)
+		done <- err
+	}()
+	waitDatabase(t, pool, "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted AND locktype='transactionid')")
+	if _, err := gate.Exec(t.Context(), "SELECT pg_sleep(0.25)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, journal.ErrConflict) {
+		t.Fatalf("reply expiring during row-lock wait admitted: %v", err)
+	}
+	var runs, events int
+	if err := pool.QueryRow(t.Context(), "SELECT i.state,(SELECT count(*) FROM agent_commands WHERE run_id='reply'),(SELECT count(*) FROM agent_runs WHERE id='reply'),(SELECT count(*) FROM agent_events WHERE kind='interaction.expired') FROM agent_interactions i").Scan(&state, &n, &runs, &events); err != nil || state != "expired" || n != 0 || runs != 0 || events != 1 {
+		t.Fatal(state, n, runs, events, err)
+	}
+	if err := pool.QueryRow(t.Context(), "SELECT history::text FROM agent_sessions").Scan(&history); err != nil || !strings.Contains(history, "interaction_expired") {
+		t.Fatal("expiry during lock wait did not close history", err)
+	}
 }
 
 func TestHITLSeparateProcessAfterWaitAndReplyCommit(t *testing.T) {
@@ -274,6 +313,17 @@ func TestHITLSeparateProcessAfterWaitAndReplyCommit(t *testing.T) {
 	}
 	reply := journal.Command{ThreadID: "process", RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: i.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"custom":"fresh answer"}}}`}
 	child("reply", reply)
+	if _, err := pool.Exec(t.Context(), "UPDATE agent_runs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", reply.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.New(pool).Reap(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	var epoch, continuations, commands int
+	if err := pool.QueryRow(t.Context(), "SELECT r.state,r.owner_epoch,(SELECT count(*) FROM agent_interactions WHERE continuation_run_id=r.id),(SELECT count(*) FROM agent_commands WHERE run_id=r.id) FROM agent_runs r WHERE id=$1", reply.RunID).Scan(&state, &epoch, &continuations, &commands); err != nil || state != "pending" || epoch != 0 || continuations != 1 || commands != 1 {
+		t.Fatal("reaper destroyed never-started continuation", state, epoch, continuations, commands, err)
+	}
 	var models atomic.Int32
 	p := platform.New(fixtureRunner(t, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		models.Add(1)
@@ -291,14 +341,18 @@ func TestHITLSeparateProcessAfterWaitAndReplyCommit(t *testing.T) {
 	if models.Load() != 1 {
 		t.Fatal(models.Load())
 	}
+	if err := pool.QueryRow(t.Context(), "SELECT count(*) FROM agent_interactions WHERE continuation_run_id=$1", reply.RunID).Scan(&continuations); err != nil || continuations != 1 {
+		t.Fatal("duplicate reply created continuation", continuations, err)
+	}
 }
 
 func TestReplyChatProjectionAndOutstandingOrdering(t *testing.T) {
 	pool := database(t)
+	const providerCallID = "provider-only-sentinel"
 	var models atomic.Int32
 	runner := fixtureRunner(t, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		if models.Add(1) == 1 {
-			return agentruntime.ModelResponse{ToolCalls: []agentruntime.ToolCall{*questionCall("first"), {CallID: "sibling", Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}}, nil
+			return agentruntime.ModelResponse{ToolCalls: []agentruntime.ToolCall{*questionCall(providerCallID), {CallID: "sibling", Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}}, nil
 		}
 		if len(r.ToolResults) != 2 {
 			t.Errorf("provider resumed with partial outstanding results: %+v", r.ToolResults)
@@ -342,6 +396,17 @@ func TestReplyChatProjectionAndOutstandingOrdering(t *testing.T) {
 	if err := json.Unmarshal(artifact, &i); err != nil {
 		t.Fatal(err)
 	}
+	if i.Call.CallID == providerCallID {
+		t.Fatal("product and provider call IDs unexpectedly match")
+	}
+	assertSafeInteraction := func(label, body string) {
+		t.Helper()
+		if !strings.Contains(body, `"callId":"`+i.Call.CallID+`"`) || strings.Contains(body, providerCallID) || strings.Contains(body, "providerCallId") || strings.Contains(body, `"history"`) {
+			t.Fatalf("%s leaked provider interaction state: %s", label, body)
+		}
+	}
+	assertSafeInteraction("initial", first.Body)
+	assertSafeInteraction("reconnect", string(reconnectChat(t, api.URL, "external-thread", "external-wait", "token")))
 	reply := fmt.Sprintf(`{"threadId":"external-thread","runId":"external-reply","messages":[],"tools":[],"context":[],"state":{},"forwardedProps":{"interactionReply":{"interactionId":%q,"kind":"clarification","answer":{"answers":{"choice":{"option":"A"}}}}}}`, i.ID)
 	answer := postJSONAGUI(t, api.URL, reply, "token", "", "")
 	if answer.StatusCode != 200 || !strings.Contains(answer.Body, "answered") || !strings.Contains(answer.Body, `"runId":"external-reply"`) {

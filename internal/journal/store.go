@@ -46,10 +46,14 @@ type Event struct {
 type CommandOutcome struct {
 	CommunicationID, State, Reason string
 }
+type OperationOutcome struct {
+	CallID, ToolName, Outcome string
+}
 
 type Run struct {
 	Interaction       *Interaction
 	CommandOutcomes   []CommandOutcome
+	OperationOutcomes []OperationOutcome
 	CommandRunIDs     []string
 	PendingCommands   int
 	RunID             string

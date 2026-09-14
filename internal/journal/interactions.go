@@ -266,11 +266,14 @@ func (s *Store) reply(ctx context.Context, c Command) (Receipt, bool, error) {
 		var artifact []byte
 		var state, journey, oldRun string
 		var valid bool
-		err = tx.QueryRow(ctx, "SELECT artifact,state,journey_id,run_id,expires_at>clock_timestamp() FROM agent_interactions WHERE thread_id=$1 AND id=$2 FOR UPDATE", c.ThreadID, c.InteractionID).Scan(&artifact, &state, &journey, &oldRun, &valid)
+		err = tx.QueryRow(ctx, "SELECT artifact,state,journey_id,run_id FROM agent_interactions WHERE thread_id=$1 AND id=$2 FOR UPDATE", c.ThreadID, c.InteractionID).Scan(&artifact, &state, &journey, &oldRun)
 		if err == pgx.ErrNoRows {
 			return ErrState
 		}
 		if err != nil {
+			return err
+		}
+		if err = tx.QueryRow(ctx, "SELECT expires_at>clock_timestamp() FROM agent_interactions WHERE thread_id=$1 AND id=$2", c.ThreadID, c.InteractionID).Scan(&valid); err != nil {
 			return err
 		}
 		if !valid && state == "pending" {

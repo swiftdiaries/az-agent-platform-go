@@ -18,3 +18,53 @@ git diff --check
 The full scenario mapping and exact framework failure are in `docs/superpowers/plans/2026-09-14-agent-platform/source-evidence.md`. Task 5 and Task 6 remain unimplemented here. No live Java/provider/cluster acceptance is claimed.
 
 Final checks: full suite PASS (integration 18.986s; runtime 1.157s), focused race selection PASS, `go vet ./...` PASS, and `git diff --check` PASS. The implementation commit remains a review candidate, not an independent-review approval.
+
+## Specification-review repair candidate
+
+Repair base: `3b1a0a2cfa6378b68a13b0f94af96f350daf88c8` (candidate plus repair brief).
+The submitted revision is the commit containing this entry. It repairs all five
+review cards: exact epoch-zero reply-continuation recovery after reaper execution,
+the attempt-two predecessor matrix, durable owner-loss operation uncertainty,
+post-lock interaction TTL validation, and Chat-owned safe interaction projection.
+Task 5 and Task 6 remain untouched. Independent specification and quality
+rereviews are pending on the exact submitted revision.
+
+Red evidence:
+
+- `TestHITLSeparateProcessAfterWaitAndReplyCommit`: reaper changed the never-owned
+  continuation to `interrupted`; after preserving that row, Claim still left the
+  retransmission pending until the exact consumed-reply exception was added.
+- `TestBeginAttemptSecondAttemptPredecessorMatrix`: completed, dispatching, and
+  auth-required read-only/deduplicated rows reopened.
+- `TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted`: snapshot ended in
+  `tool.started`, `run.interrupted`, with no durable outcome event or reconnect
+  projection.
+- `TestReplyWaitTransactionsAndTTL`: a reply whose TTL elapsed behind its row
+  lock was admitted.
+- `TestReplyChatProjectionAndOutstandingOrdering`: initial/live reconnect data
+  exposed the provider call sentinel and `providerCallId`.
+
+Final verification used the Docker PostgreSQL
+`16.13 (Debian 16.13-1.pgdg13+1)` fixture with no skips:
+
+```text
+go test -race ./internal/... ./integration -run 'TestHITL|TestReply|TestToolCall' -count=1 -timeout=90s
+PASS: internal/runtime 1.718s; integration 10.540s
+
+go test -race ./internal/... ./integration -run 'TestJourney|TestAuth|TestToolBinding|TestPersistence|TestReplay|TestPostgres|TestAdmission|TestOwnership|TestSteering|TestAdmissionFinish' -count=1 -timeout=90s
+PASS: integration 17.276s
+
+go test ./... -count=1 -timeout=90s
+PASS: internal/runtime 0.656s; integration 23.188s
+
+go vet ./...
+PASS
+
+git diff --check
+PASS
+```
+
+The fixture cleanup check found no remaining `agent-platform-task2-*` container.
+The submitted changed paths are this report and repair brief,
+`internal/chat/http.go`, `internal/journal/{interactions,observe,operations,owners,store}.go`,
+and `integration/{interactions,outcomes,ownership}_test.go`.

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
@@ -23,6 +24,27 @@ type handler struct {
 	auth     Authenticator
 	platform *platform.Platform
 	ids      IdentityMap
+}
+
+type interactionCall struct {
+	CallID    string          `json:"callId"`
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+	Binding   string          `json:"binding"`
+}
+type interaction struct {
+	ID        string             `json:"id"`
+	Kind      string             `json:"kind"`
+	Questions []journal.Question `json:"questions,omitempty"`
+	Call      interactionCall    `json:"call"`
+	ExpiresAt time.Time          `json:"expiresAt"`
+}
+
+func safeInteraction(i *journal.Interaction) *interaction {
+	if i == nil {
+		return nil
+	}
+	return &interaction{ID: i.ID, Kind: i.Kind, Questions: i.Questions, Call: interactionCall{CallID: i.Call.CallID, Name: i.Call.Name, Arguments: i.Call.Arguments, Binding: i.Call.Binding}, ExpiresAt: i.ExpiresAt}
 }
 
 func NewHandler(auth Authenticator, service *platform.Platform, pool *pgxpool.Pool) http.Handler {
@@ -146,6 +168,10 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		commands = append(commands, map[string]string{"runId": external, "state": outcome.State, "reason": outcome.Reason})
 	}
+	operations := make([]map[string]string, 0, len(current.OperationOutcomes))
+	for _, outcome := range current.OperationOutcomes {
+		operations = append(operations, map[string]string{"callId": outcome.CallID, "toolName": outcome.ToolName, "outcome": outcome.Outcome})
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	emit := func(event events.Event, sequence int64) bool {
@@ -169,7 +195,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !emit(events.NewRunStartedEvent(input.ThreadID, input.RunID), 0) {
 		return
 	}
-	if !emit(events.NewStateSnapshotEvent(map[string]any{"threadId": input.ThreadID, "watermark": snapshot.Watermark, "journeyId": current.JourneyID, "runState": current.State, "pendingCommands": current.PendingCommands, "commands": commands, "answer": current.Answer, "interaction": current.Interaction}), max(cursor, snapshot.Watermark)) {
+	if !emit(events.NewStateSnapshotEvent(map[string]any{"threadId": input.ThreadID, "watermark": snapshot.Watermark, "journeyId": current.JourneyID, "runState": current.State, "pendingCommands": current.PendingCommands, "commands": commands, "operations": operations, "answer": current.Answer, "interaction": safeInteraction(current.Interaction)}), max(cursor, snapshot.Watermark)) {
 		return
 	}
 	terminal := func(e platform.Event, sequence int64) bool {
@@ -185,7 +211,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			for _, r := range s.Runs {
 				if r.RunID == run {
-					emit(events.NewCustomEvent("interaction.requested", events.WithValue(r.Interaction)), sequence)
+					emit(events.NewCustomEvent("interaction.requested", events.WithValue(safeInteraction(r.Interaction))), sequence)
 				}
 			}
 			emit(events.NewRunFinishedEvent(input.ThreadID, input.RunID), 0)

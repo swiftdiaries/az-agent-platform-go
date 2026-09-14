@@ -129,6 +129,38 @@ func TestOwnershipLeaseExpiresDuringRowLock(t *testing.T) {
 	}
 }
 
+func TestExpiredContinuationRecoveryNeverTakesOverOwnedWork(t *testing.T) {
+	for _, state := range []string{"pending", "interrupted"} {
+		t.Run(state, func(t *testing.T) {
+			pool := database(t)
+			store, owner, interaction := localWait(t, pool)
+			if err := store.Wait(t.Context(), owner, interaction, []byte(`{}`), []byte(`[]`)); err != nil {
+				t.Fatal(err)
+			}
+			reply := journal.Command{ThreadID: "thread", RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: interaction.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
+			if _, fresh, err := store.Admit(t.Context(), reply); err != nil || !fresh {
+				t.Fatal(err)
+			}
+			if _, err := store.Claim(t.Context(), reply, "first-owner", time.Second); err != nil {
+				t.Fatal(err)
+			}
+			if state == "interrupted" {
+				if _, err := pool.Exec(t.Context(), "UPDATE agent_runs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", reply.RunID); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.Reap(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := pool.Exec(t.Context(), "UPDATE agent_runs SET state='pending',lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", reply.RunID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Claim(t.Context(), reply, "second-owner", time.Second); !errors.Is(err, journal.ErrOwnership) {
+				t.Fatalf("%s continuation taken over: %v", state, err)
+			}
+		})
+	}
+}
+
 func TestOwnershipLossDuringModelRejectsResultAndRequiresFreshIngress(t *testing.T) {
 	ctx := context.Background()
 	pool := database(t)

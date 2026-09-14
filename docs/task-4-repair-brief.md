@@ -46,6 +46,10 @@ launch detection needs it, `integration/interactions_test.go`, and possibly
 credentials. Add no polling or takeover. Evidence must show epoch-zero recovery,
 owned/interrupted rejection, one continuation row, and one model re-entry.
 
+**Repair status.** Implemented. The reaper-first regression failed with the
+continuation interrupted; after the scoped repair it preserves and reclaims only
+the exact epoch-zero consumed-reply continuation. Owned/interrupted guards pass.
+
 ## Card 2: enforce the second-attempt predecessor matrix
 
 **Defect.** `internal/journal/operations.go:50-58` accepts attempt 2 for
@@ -68,6 +72,10 @@ framework and infer no safety from MCP annotations.
 
 **Done.** Matrix, stable product-call ID, bounded retry, approval and business
 error tests pass.
+
+**Repair status.** Implemented. The matrix regression first reopened completed,
+dispatching, and auth-required safe-policy rows; the direct predecessor predicate
+now passes the full allow/deny matrix without mutating denied rows.
 
 ## Card 3: publish owner-loss operation uncertainty
 
@@ -95,6 +103,10 @@ by run interruption and omit provider ID. Observe the outcome missing first.
 the existing transaction. Claim no cancellation/retry/reconciliation. Database,
 snapshot, and below/equal-watermark reconnect must agree atomically.
 
+**Repair status.** Implemented. The regression first observed `tool.started`
+followed directly by `run.interrupted`; database events, repeatable-read snapshot,
+and cursor-zero/exact-watermark Chat reconnect now expose the safe ordered pair.
+
 ## Card 4: recheck interaction TTL after the row lock
 
 **Defect.** `internal/journal/interactions.go:269` evaluates expiry in the same
@@ -116,6 +128,10 @@ transaction-start time.
 
 **Done.** The barrier deterministically proves expiry during lock wait cannot
 consume the interaction or create a continuation.
+
+**Repair status.** Implemented. The row-lock regression first admitted an expired
+reply; the post-lock database-clock check now expires it with zero continuation
+commands or runs.
 
 ## Card 5: project a safe interaction at the Chat edge
 
@@ -140,6 +156,10 @@ binding.
 
 **Done.** Initial snapshot, live request event, and reconnect share the safe
 shape; provider resume still passes.
+
+**Repair status.** Implemented. The sentinel regression first exposed
+`providerCallId`; Chat now projects one explicit action DTO for snapshot and live
+events while the durable provider correlation remains available for resume.
 
 ## Final verification and handoff
 

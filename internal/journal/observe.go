@@ -38,6 +38,28 @@ func (s *Store) Snapshot(ctx context.Context, thread, principal string) (Snapsho
 		if err := rows.Err(); err != nil {
 			return err
 		}
+		rows, err = tx.Query(ctx, "SELECT run_id,call_id,name,outcome FROM agent_operations WHERE thread_id=$1 ORDER BY call_id", thread)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var runID string
+			var outcome OperationOutcome
+			if err := rows.Scan(&runID, &outcome.CallID, &outcome.ToolName, &outcome.Outcome); err != nil {
+				rows.Close()
+				return err
+			}
+			for i := range snapshot.Runs {
+				if snapshot.Runs[i].RunID == runID {
+					snapshot.Runs[i].OperationOutcomes = append(snapshot.Runs[i].OperationOutcomes, outcome)
+					break
+				}
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
 
 		for i := range snapshot.Runs {
 			var artifact []byte
