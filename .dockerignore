@@ -1,0 +1,9 @@
+.git
+.gitignore
+.worktrees
+.cache
+deploy
+docs
+integration
+**/*_test.go
+*.log

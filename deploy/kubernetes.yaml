@@ -1,0 +1,293 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-platform-task-6
+  labels:
+    app.kubernetes.io/name: az-agent-platform
+    app.kubernetes.io/part-of: agent-platform
+    app.kubernetes.io/managed-by: task-6
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent-platform
+  namespace: agent-platform-task-6
+  labels:
+    app.kubernetes.io/name: az-agent-platform
+    app.kubernetes.io/managed-by: task-6
+  annotations:
+    # Replace this nonsecret placeholder with the workload identity client ID.
+    azure.workload.identity/client-id: "<required-workload-identity-client-id>"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-platform-config
+  namespace: agent-platform-task-6
+  labels:
+    app.kubernetes.io/name: az-agent-platform
+    app.kubernetes.io/managed-by: task-6
+data:
+  AGENT_PLATFORM_PORT: "8080"
+  AGENT_PLATFORM_SHUTDOWN_GRACE: 25s
+  AGENT_PLATFORM_CONFIG: /app/configs/journeys.yaml
+  AGENT_PLATFORM_RETAINED_CONFIGS: ""
+  KEYCLOAK_JWT_ISSUER: <required-keycloak-issuer>
+  KEYCLOAK_JWKS_URL: <required-keycloak-jwks-url>
+  KEYCLOAK_JWT_AUDIENCE: <required-keycloak-audience>
+  KEYCLOAK_JWT_SOURCE: authorization_bearer
+  KEYCLOAK_JWT_HEADER: Authorization
+  KEYCLOAK_USER_CLAIM_PATH: <required-user-claim-json-pointer>
+  KEYCLOAK_TENANT_CLAIM_PATH: <required-tenant-claim-json-pointer>
+  KEYCLOAK_JWT_ALLOWED_ALGORITHMS: RS256
+  AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT: <required-foundry-project-endpoint>
+  AZ_AGENT_FOUNDRY_DEPLOYMENT: <required-foundry-deployment>
+  AZURE_CLIENT_ID: <required-workload-identity-client-id>
+  TEST_JAVA_MCP_ENDPOINT: <required-java-mcp-endpoint>
+  OTEL_SERVICE_NAME: az-agent-platform
+  OTEL_SERVICE_VERSION: <required-release-version>
+  OTEL_EXPORTER_OTLP_ENDPOINT: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-platform-journeys
+  namespace: agent-platform-task-6
+  labels:
+    app.kubernetes.io/name: az-agent-platform
+    app.kubernetes.io/managed-by: task-6
+data:
+  journeys.yaml: |
+    {
+      "mcp_servers": [
+        {
+          "id": "java-monolith",
+          "endpoint": "${TEST_JAVA_MCP_ENDPOINT}",
+          "forward_headers": ["Cookie", "Authorization"],
+          "call_id_header": "X-Platform-Call-ID",
+          "tools": ["lookup_destination", "lookup_shift", "request_shift_swap"],
+          "policies": {
+            "lookup_destination": {"class":"read_only"},
+            "lookup_shift": {"class":"read_only"},
+            "request_shift_swap": {"class":"effectful"}
+          }
+        }
+      ],
+      "skill_packages": [
+        {"name":"planner", "root":"skills/planner"},
+        {"name":"shift-swap", "root":"skills/shift-swap"}
+      ],
+      "journeys": [
+        {
+          "id": "vacation-planner",
+          "description": "Plan a vacation using the configured read-only destination lookup",
+          "routing": {"default":true},
+          "system_prompt": "prompts/planner.md",
+          "mcp": {"server": "java-monolith", "tools": ["lookup_destination"]},
+          "skills": ["planner"]
+        },
+        {
+          "id": "shift-swap",
+          "description": "Review available work shifts and request an explicit swap",
+          "routing": {"keywords":["shift", "swap"], "priority":10},
+          "system_prompt": "prompts/shift-swap.md",
+          "mcp": {"server": "java-monolith", "tools": ["lookup_shift", "request_shift_swap"]},
+          "skills": ["shift-swap"]
+        }
+      ]
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-platform-postgres
+  namespace: agent-platform-task-6
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: agent-platform
+    app.kubernetes.io/managed-by: task-6
+spec:
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+  selector:
+    app.kubernetes.io/name: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: agent-platform-postgres
+  namespace: agent-platform-task-6
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: agent-platform
+    app.kubernetes.io/managed-by: task-6
+spec:
+  serviceName: agent-platform-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: agent-platform
+        app.kubernetes.io/managed-by: task-6
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: agent-platform-postgres
+                  key: database
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: agent-platform-postgres
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: agent-platform-postgres
+                  key: password
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: postgres
+          app.kubernetes.io/managed-by: task-6
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-platform
+  namespace: agent-platform-task-6
+  labels:
+    app.kubernetes.io/name: az-agent-platform
+    app.kubernetes.io/part-of: agent-platform
+    app.kubernetes.io/managed-by: task-6
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+  selector:
+    app.kubernetes.io/name: az-agent-platform
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-platform
+  namespace: agent-platform-task-6
+  labels:
+    app.kubernetes.io/name: az-agent-platform
+    app.kubernetes.io/part-of: agent-platform
+    app.kubernetes.io/managed-by: task-6
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: az-agent-platform
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: az-agent-platform
+        app.kubernetes.io/part-of: agent-platform
+        app.kubernetes.io/managed-by: task-6
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: agent-platform
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent-platform
+          image: az-agent-platform:task-6
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: agent-platform-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agent-platform-postgres
+                  key: database-url
+            - name: OTEL_EXPORTER_OTLP_HEADERS
+              valueFrom:
+                secretKeyRef:
+                  name: agent-platform-telemetry
+                  key: headers
+                  optional: true
+          volumeMounts:
+            - name: journey-config
+              mountPath: /app/configs/journeys.yaml
+              subPath: journeys.yaml
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: journey-config
+          configMap:
+            name: agent-platform-journeys
+            items:
+              - key: journeys.yaml
+                path: journeys.yaml

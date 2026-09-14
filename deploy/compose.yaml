@@ -1,0 +1,59 @@
+name: agent-platform-task-6
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: agent_platform
+      POSTGRES_USER: agent_platform
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_platform -d agent_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    stop_grace_period: 30s
+    volumes:
+      - agent-platform-task-6-pgdata:/var/lib/postgresql/data
+
+  agent-platform:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: az-agent-platform:task-6
+    deploy:
+      replicas: 3
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "8080"
+    environment:
+      AGENT_PLATFORM_PORT: "8080"
+      AGENT_PLATFORM_SHUTDOWN_GRACE: 25s
+      AGENT_PLATFORM_CONFIG: /app/configs/journeys.yaml
+      AGENT_PLATFORM_RETAINED_CONFIGS: ""
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+      TEST_JAVA_MCP_ENDPOINT: ${TEST_JAVA_MCP_ENDPOINT:?set TEST_JAVA_MCP_ENDPOINT}
+      KEYCLOAK_JWT_ISSUER: ${KEYCLOAK_JWT_ISSUER:?set KEYCLOAK_JWT_ISSUER}
+      KEYCLOAK_JWKS_URL: ${KEYCLOAK_JWKS_URL:?set KEYCLOAK_JWKS_URL}
+      KEYCLOAK_JWT_AUDIENCE: ${KEYCLOAK_JWT_AUDIENCE:?set KEYCLOAK_JWT_AUDIENCE}
+      KEYCLOAK_JWT_SOURCE: ${KEYCLOAK_JWT_SOURCE:?set KEYCLOAK_JWT_SOURCE}
+      KEYCLOAK_JWT_HEADER: ${KEYCLOAK_JWT_HEADER:?set KEYCLOAK_JWT_HEADER}
+      KEYCLOAK_USER_CLAIM_PATH: ${KEYCLOAK_USER_CLAIM_PATH:?set KEYCLOAK_USER_CLAIM_PATH}
+      KEYCLOAK_TENANT_CLAIM_PATH: ${KEYCLOAK_TENANT_CLAIM_PATH:?set KEYCLOAK_TENANT_CLAIM_PATH}
+      KEYCLOAK_JWT_ALLOWED_ALGORITHMS: ${KEYCLOAK_JWT_ALLOWED_ALGORITHMS:?set KEYCLOAK_JWT_ALLOWED_ALGORITHMS}
+      AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT: ${AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT:?set AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT}
+      AZ_AGENT_FOUNDRY_DEPLOYMENT: ${AZ_AGENT_FOUNDRY_DEPLOYMENT:?set AZ_AGENT_FOUNDRY_DEPLOYMENT}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:?set AZURE_CLIENT_ID}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:?set OTEL_SERVICE_NAME}
+      OTEL_SERVICE_VERSION: ${OTEL_SERVICE_VERSION:?set OTEL_SERVICE_VERSION}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
+    init: true
+    stop_grace_period: 30s
+
+volumes:
+  agent-platform-task-6-pgdata:
