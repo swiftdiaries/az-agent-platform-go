@@ -92,6 +92,10 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 	var requestHistory json.RawMessage
 	skillSource := platformskills.New(journey)
 	skillCatalog := skillSource.Catalog()
+	providerSkillCatalog := make([]SkillMetadata, len(skillCatalog))
+	for i, skill := range skillCatalog {
+		providerSkillCatalog[i] = SkillMetadata{Name: skill.Name, Description: skill.Description}
+	}
 	var skillMaterial []platformskills.Material
 	// The pinned graph resumes each outstanding tool result separately. The product
 	// owns batching and durable waiting; a bare MAF agent handles one provider turn.
@@ -105,7 +109,7 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 		req.PendingCommands = pending
 		req.History = requestHistory
 		req.DefinitionDigest = journey.Digest
-		req.SkillCatalog = append([]platformskills.Metadata(nil), skillCatalog...)
+		req.SkillCatalog = append([]SkillMetadata(nil), providerSkillCatalog...)
 		req.SkillMaterial = cloneSkillMaterial(skillMaterial)
 		req.Provenance = RequestProvenance{
 			Definition: MaterialProvenance{ID: journey.ID, Digest: journey.Digest},

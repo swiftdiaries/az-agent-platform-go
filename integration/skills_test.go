@@ -455,14 +455,18 @@ func TestSkillRuntimeLoadsOnlySelectedMaterial(t *testing.T) {
 			if len(request.SkillCatalog) != 1 || len(request.SkillMaterial) != 0 {
 				t.Fatalf("initial skill payload = %#v %#v", request.SkillCatalog, request.SkillMaterial)
 			}
+			catalog, err := json.Marshal(request.SkillCatalog)
+			if err != nil || string(catalog) != `[{"Name":"planner","Description":"Plan a trip"}]` {
+				t.Fatalf("provider skill metadata = %s, %v", catalog, err)
+			}
 			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "load", Name: "load_skill", Arguments: json.RawMessage(`{"skillName":"planner"}`)}}, nil
 		case 2:
-			if len(request.SkillMaterial) != 1 || request.SkillMaterial[0].Resource != "SKILL.md" || !strings.Contains(string(request.SkillMaterial[0].Body), "Use the destination tool") || len(request.Provenance.Skills) != 1 {
+			if len(request.SkillMaterial) != 1 || request.SkillMaterial[0].Resource != "SKILL.md" || !strings.Contains(string(request.SkillMaterial[0].Body), "Use the destination tool") || len(request.Provenance.Skills) != 1 || request.Provenance.Skills[0] != (agentruntime.MaterialProvenance{ID: "planner/SKILL.md", Digest: request.SkillMaterial[0].FileDigest}) {
 				t.Fatalf("selected instructions = %#v %#v", request.SkillMaterial, request.Provenance.Skills)
 			}
 			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "resource", Name: "read_skill_resource", Arguments: json.RawMessage(`{"skillName":"planner","resourceName":"guide.md"}`)}}, nil
 		default:
-			if len(request.SkillMaterial) != 2 || request.SkillMaterial[1].Resource != "guide.md" || string(request.SkillMaterial[1].Body) != "Prefer direct routes.\n" || len(request.Provenance.Skills) != 2 {
+			if len(request.SkillMaterial) != 2 || request.SkillMaterial[1].Resource != "guide.md" || string(request.SkillMaterial[1].Body) != "Prefer direct routes.\n" || len(request.Provenance.Skills) != 2 || request.Provenance.Skills[1] != (agentruntime.MaterialProvenance{ID: "planner/guide.md", Digest: request.SkillMaterial[1].FileDigest}) {
 				t.Fatalf("selected resource = %#v %#v", request.SkillMaterial, request.Provenance.Skills)
 			}
 			return agentruntime.ModelResponse{Text: "done"}, nil

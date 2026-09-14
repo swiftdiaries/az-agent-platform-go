@@ -47,10 +47,13 @@ type ModelRequest struct {
 	Tools            []ModelTool
 	ToolResults      []ToolResult
 	DefinitionDigest string
-	SkillCatalog     []platformskills.Metadata
+	SkillCatalog     []SkillMetadata
 	SkillMaterial    []platformskills.Material
 	Provenance       RequestProvenance
 }
+
+// SkillMetadata is the metadata-only skill catalog exposed to the provider.
+type SkillMetadata struct{ Name, Description string }
 
 type RequestProvenance struct {
 	Definition, System, Handoff, Catalog, Context, History MaterialProvenance
