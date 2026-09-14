@@ -33,7 +33,9 @@ export KEYCLOAK_TENANT_CLAIM_PATH='/tenant'
 export KEYCLOAK_JWT_ALLOWED_ALGORITHMS='RS256'
 export AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT='https://example.projects.ai.azure.com/projects/example'
 export AZ_AGENT_FOUNDRY_DEPLOYMENT='example-deployment'
+export AZURE_TENANT_ID='azure-tenant-id'
 export AZURE_CLIENT_ID='workload-identity-client-id'
+export AZURE_CLIENT_SECRET='from-your-secret-store'
 export OTEL_SERVICE_NAME='az-agent-platform'
 export OTEL_SERVICE_VERSION='local-task-6'
 export OTEL_EXPORTER_OTLP_ENDPOINT=''
@@ -45,7 +47,10 @@ docker compose -f deploy/compose.yaml up --build
 ```
 
 The example endpoints and IDs above are command-shape examples only; replace
-them before use. `docker compose down --volumes` from this project removes only
+them before use. Compose supports Azure environment credentials only:
+`AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` must come from
+your secret environment. A host Azure CLI login is not a container credential
+contract. `docker compose down --volumes` from this project removes only
 the task-6 Compose network and `agent-platform-task-6-pgdata` volume.
 
 ## Kubernetes
@@ -73,8 +78,9 @@ Before applying, replace every `<required-...>` marker in
 `deploy/kubernetes.yaml` with the supplied nonsecret deployment values. Set the
 workload identity client ID on the task-6 ServiceAccount and configure the
 cluster's Azure workload identity webhook. The application uses
-`DefaultAzureCredential`; no API key or credential value belongs in this
-repository.
+`DefaultAzureCredential`. The workload identity webhook must inject its
+federated-token and tenant settings into the pod; no API key or credential value
+belongs in this repository.
 
 Validate and inspect the rendered objects without changing the current context:
 

@@ -72,6 +72,13 @@ credential, so workload identity is the expected production path. The Foundry
 adapter refuses redirects before a redirected request can receive that bearer
 credential.
 
+For Compose, the supported AAD credential source is the environment credential:
+`AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` are required
+Secret-environment inputs. A host Azure CLI session is not part of the container
+contract. Kubernetes instead relies on its configured workload-identity webhook
+to inject the federated token and tenant settings; the checked-in ServiceAccount
+contains only its nonsecret client-ID placeholder.
+
 `OTEL_EXPORTER_OTLP_HEADERS` is optional and must be supplied only through a
 Secret reference. It is a comma-separated `Header=Value` list; malformed,
 duplicate, or newline-bearing entries fail startup without exposing the value.

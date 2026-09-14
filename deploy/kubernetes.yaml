@@ -56,6 +56,7 @@ metadata:
   labels:
     app.kubernetes.io/name: az-agent-platform
     app.kubernetes.io/managed-by: task-6
+immutable: true
 data:
   journeys.yaml: |
     {
