@@ -83,6 +83,9 @@ func (s *Source) Read(name, resource string) (Material, error) {
 }
 
 func secureRead(file definitions.SkillFile) ([]byte, error) {
+	if !unchangedRoot(file.Root) {
+		return nil, ErrChanged
+	}
 	current := file.Root
 	for _, part := range strings.Split(filepath.Clean(file.Relative), string(filepath.Separator)) {
 		current = filepath.Join(current, part)
@@ -109,5 +112,13 @@ func secureRead(file definitions.SkillFile) ([]byte, error) {
 	if _, err := io.ReadFull(opened, data); err != nil {
 		return nil, err
 	}
+	if !unchangedRoot(file.Root) {
+		return nil, ErrChanged
+	}
 	return data, nil
+}
+
+func unchangedRoot(root string) bool {
+	resolved, err := filepath.EvalSymlinks(root)
+	return err == nil && resolved == filepath.Clean(root)
 }

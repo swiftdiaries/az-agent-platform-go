@@ -107,6 +107,45 @@ func TestSkillPolicyFailsClosed(t *testing.T) {
 }
 
 func TestSkillReadRejectsReplacedAncestors(t *testing.T) {
+	t.Run("compiled root", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "bundle")
+		registry, err := definitions.Load(writeDefinitionBundle(t, root, "prompt\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		journey, _ := registry.Journey("planner")
+		real := filepath.Join(parent, "bundle-real")
+		if err := os.Rename(root, real); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(real, root); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := platformskills.New(journey).Read("planner", "SKILL.md"); !errors.Is(err, platformskills.ErrChanged) {
+			t.Fatalf("replaced compiled root read = %v", err)
+		}
+	})
+	t.Run("above compiled root", func(t *testing.T) {
+		parent := t.TempDir()
+		ancestor := filepath.Join(parent, "canonical")
+		root := filepath.Join(ancestor, "bundle")
+		registry, err := definitions.Load(writeDefinitionBundle(t, root, "prompt\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		journey, _ := registry.Journey("planner")
+		real := filepath.Join(parent, "canonical-real")
+		if err := os.Rename(ancestor, real); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(real, ancestor); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := platformskills.New(journey).Read("planner", "SKILL.md"); !errors.Is(err, platformskills.ErrChanged) {
+			t.Fatalf("replaced root ancestor read = %v", err)
+		}
+	})
 	t.Run("package", func(t *testing.T) {
 		root := t.TempDir()
 		registry, err := definitions.Load(writeDefinitionBundle(t, root, "prompt\n"))
