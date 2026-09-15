@@ -14,6 +14,8 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
+const maxTranscriptLines = 1000
+
 type question struct {
 	ID       string   `json:"id"`
 	Header   string   `json:"header"`
@@ -55,6 +57,8 @@ type Model struct {
 	events          chan tea.Msg
 	cancel          context.CancelFunc
 	resumeRun       string
+	terminal        bool
+	lastRequest     *Request
 }
 
 type streamEventMsg struct{ event Event }
@@ -74,7 +78,7 @@ func NewModel(client Client, threadID, runID, journeyID string) *Model {
 
 func (m *Model) Init() tea.Cmd {
 	if m.resumeRun != "" {
-		return m.startResume(m.resumeRun)
+		return tea.Batch(m.input.Focus(), m.startResume(m.resumeRun))
 	}
 	return m.input.Focus()
 }
@@ -95,6 +99,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cancel = nil
 		if msg.err != nil {
 			m.status = "error: " + sanitize(msg.err.Error())
+		} else if !m.terminal {
+			m.status = "stream ended; type /retry"
 		} else if m.pending != nil {
 			m.status = "awaiting input"
 		} else if m.status == "streaming" {
@@ -127,10 +133,19 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) View() tea.View {
 	m.refresh()
-	return tea.NewView(fmt.Sprintf("agent-platform  thread: %s  run: %s  journey: %s  %s\n%s\n%s\nPgUp/PgDown scroll · Ctrl+C quit", m.threadID, m.runID, m.journeyID, m.status, m.viewport.View(), m.input.View()))
+	return tea.NewView(fmt.Sprintf("agent-platform  thread: %s  run: %s  journey: %s  %s\n%s\n%s\nPgUp/PgDown scroll · Ctrl+C quit", sanitize(m.threadID), sanitize(m.runID), sanitize(m.journeyID), sanitize(m.status), m.viewport.View(), m.input.View()))
 }
 
 func (m *Model) apply(event Event) {
+	if event.Type == "CUSTOM" {
+		var custom struct {
+			Name  string          `json:"name"`
+			Value json.RawMessage `json:"value"`
+		}
+		if json.Unmarshal(event.Data, &custom) == nil && custom.Name != "" {
+			event.Type, event.Data = custom.Name, custom.Value
+		}
+	}
 	var payload struct {
 		Delta    string `json:"delta"`
 		Message  string `json:"message"`
@@ -150,9 +165,6 @@ func (m *Model) apply(event Event) {
 		if payload.Snapshot.ThreadID != "" {
 			m.threadID = payload.Snapshot.ThreadID
 		}
-		if payload.Snapshot.Answer != "" {
-			m.add("assistant: " + sanitize(payload.Snapshot.Answer))
-		}
 		m.pending, m.answers, m.questionIndex = payload.Snapshot.Interaction, map[string]map[string]string{}, 0
 		if payload.Snapshot.RunState == "awaiting_input" && m.pending != nil {
 			m.status = "awaiting input"
@@ -164,10 +176,12 @@ func (m *Model) apply(event Event) {
 			m.status = "awaiting input"
 		}
 	case "RUN_FINISHED":
+		m.terminal = true
 		if m.pending == nil {
 			m.status = "finished"
 		}
 	case "RUN_ERROR":
+		m.terminal = true
 		m.status = "error: " + sanitize(payload.Message)
 	default:
 		if strings.HasPrefix(event.Type, "tool.") {
@@ -187,6 +201,20 @@ func (m *Model) submit() tea.Cmd {
 		return nil
 	}
 	m.input.Reset()
+	if text == "/retry" {
+		if m.lastRequest != nil && !m.terminal {
+			return m.start(*m.lastRequest)
+		}
+		if m.runID != "" && !m.terminal {
+			return m.startResume(m.runID)
+		}
+		m.status = "nothing to retry"
+		return nil
+	}
+	if m.lastRequest != nil && !m.terminal {
+		m.status = "stream ended; type /retry"
+		return nil
+	}
 	if text == "/new" {
 		m.threadID, m.runID, m.pending, m.answers = "", "", nil, nil
 		m.transcript = nil
@@ -219,7 +247,6 @@ func (m *Model) submitInteraction(text string) tea.Cmd {
 			m.status = "type approve or deny"
 			return nil
 		}
-		m.pending = nil
 		m.runID = newID()
 		return m.start(Request{ThreadID: m.threadID, RunID: m.runID, Reply: &InteractionReply{InteractionID: pending.ID, Kind: "approval", Answer: map[string]string{"decision": decision, "binding": pending.Call.Binding}}})
 	}
@@ -239,14 +266,14 @@ func (m *Model) submitInteraction(text string) tea.Cmd {
 		m.refresh()
 		return nil
 	}
-	m.pending = nil
 	m.runID = newID()
 	return m.start(Request{ThreadID: m.threadID, RunID: m.runID, Reply: &InteractionReply{InteractionID: pending.ID, Kind: "clarification", Answer: map[string]any{"answers": m.answers}}})
 }
 
 func (m *Model) start(request Request) tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
-	m.cancel, m.streaming, m.status = cancel, true, "streaming"
+	m.cancel, m.streaming, m.status, m.terminal = cancel, true, "streaming", false
+	m.lastRequest = &request
 	go func(events chan tea.Msg, client Client) {
 		err := client.Stream(ctx, request, func(event Event) {
 			select {
@@ -264,7 +291,7 @@ func (m *Model) start(request Request) tea.Cmd {
 
 func (m *Model) startResume(runID string) tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
-	m.cancel, m.streaming, m.status = cancel, true, "resuming"
+	m.cancel, m.streaming, m.status, m.terminal = cancel, true, "resuming", false
 	go func(events chan tea.Msg, client Client) {
 		err := client.Resume(ctx, m.threadID, runID, func(event Event) {
 			select {
@@ -288,9 +315,13 @@ func (m *Model) add(line string) {
 		return
 	}
 	m.transcript = append(m.transcript, line)
+	if len(m.transcript) > maxTranscriptLines {
+		m.transcript = m.transcript[len(m.transcript)-maxTranscriptLines:]
+	}
 }
 
 func (m *Model) refresh() {
+	wasAtBottom := m.viewport.AtBottom()
 	content := append([]string{}, m.transcript...)
 	if m.pending != nil {
 		if m.pending.Kind == "approval" {
@@ -304,7 +335,7 @@ func (m *Model) refresh() {
 		}
 	}
 	m.viewport.SetContent(strings.Join(content, "\n"))
-	if !m.viewport.AtBottom() {
+	if !wasAtBottom {
 		return
 	}
 	m.viewport.GotoBottom()

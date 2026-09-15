@@ -3,11 +3,14 @@ package devtui
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 )
 
 func TestClientStreamsAGUIRequest(t *testing.T) {
@@ -20,7 +23,7 @@ func TestClientStreamsAGUIRequest(t *testing.T) {
 			t.Fatal(err)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("event: TEXT_MESSAGE_CONTENT\ndata: {\"type\":\"TEXT_MESSAGE_CONTENT\",\"delta\":\"hello\"}\n\n"))
+		_, _ = w.Write([]byte("event: TEXT_MESSAGE_CONTENT\ndata: {\"type\":\"TEXT_MESSAGE_CONTENT\",\"delta\":\"hello\"}\n\nevent: RUN_FINISHED\ndata: {\"type\":\"RUN_FINISHED\"}\n\n"))
 	}))
 	defer server.Close()
 
@@ -31,7 +34,7 @@ func TestClientStreamsAGUIRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 || events[0].Type != "TEXT_MESSAGE_CONTENT" || string(events[0].Data) != `{"type":"TEXT_MESSAGE_CONTENT","delta":"hello"}` {
+	if len(events) != 2 || events[0].Type != "TEXT_MESSAGE_CONTENT" || string(events[0].Data) != `{"type":"TEXT_MESSAGE_CONTENT","delta":"hello"}` {
 		t.Fatalf("events = %#v", events)
 	}
 	if got.ThreadID != "thread" || got.RunID != "run" || got.Messages[0].Content != "help" || got.ForwardedProps.JourneyID != "support" {
@@ -61,6 +64,7 @@ func TestClientSendsEmptyMessagesForInteractionReply(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
 			t.Fatal(err)
 		}
+		_, _ = w.Write([]byte("event: RUN_FINISHED\ndata: {\"type\":\"RUN_FINISHED\"}\n\n"))
 	}))
 	defer server.Close()
 	err := (Client{BaseURL: server.URL}).Stream(context.Background(), Request{
@@ -112,6 +116,7 @@ func TestClientEmitsEventBeforeStreamEOF(t *testing.T) {
 		_, _ = w.Write([]byte("event: TEXT_MESSAGE_CONTENT\ndata: {\"delta\":\"first\"}\n\n"))
 		w.(http.Flusher).Flush()
 		<-release
+		_, _ = w.Write([]byte("event: RUN_FINISHED\ndata: {\"type\":\"RUN_FINISHED\"}\n\n"))
 	}))
 	defer server.Close()
 	done := make(chan error, 1)
@@ -137,5 +142,47 @@ func TestParseSSEBoundsAggregateEvent(t *testing.T) {
 	err := parseSSE(strings.NewReader("data: "+data+"\ndata: "+data+"\n\n"), nil)
 	if err == nil {
 		t.Fatal("accepted an overlong aggregate SSE event")
+	}
+}
+
+func TestClientDeliversSDKCustomInteractionEvent(t *testing.T) {
+	payload, err := aguievents.NewCustomEvent("interaction.requested", aguievents.WithValue(map[string]any{
+		"id": "ask-1", "kind": "approval", "call": map[string]any{"name": "delete_record", "arguments": map[string]any{"record": "x"}},
+	})).ToJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, "event: CUSTOM\ndata: %s\n\nevent: RUN_FINISHED\ndata: {\"type\":\"RUN_FINISHED\"}\n\n", payload)
+	}))
+	defer server.Close()
+	var received Event
+	err = (Client{BaseURL: server.URL}).Resume(context.Background(), "thread", "run", func(event Event) {
+		if event.Type == "CUSTOM" {
+			received = event
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := NewModel(Client{}, "thread", "", "journey")
+	m.apply(received)
+	if m.pending == nil || m.pending.ID != "ask-1" || m.pending.Call.Name != "delete_record" {
+		t.Fatalf("custom interaction was not applied: %#v", m.pending)
+	}
+}
+
+func TestClientRejectsRedirectBeforeSendingBearerTokenElsewhere(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("redirect target received authorization %q", r.Header.Get("Authorization"))
+	}))
+	defer target.Close()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer server.Close()
+	err := (Client{BaseURL: server.URL, Token: "secret"}).Resume(context.Background(), "thread", "run", nil)
+	if err == nil || !strings.Contains(err.Error(), "302") {
+		t.Fatalf("err = %v", err)
 	}
 }

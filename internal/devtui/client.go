@@ -113,7 +113,9 @@ func (c Client) do(request *http.Request, receive func(Event)) error {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	response, err := client.Do(request)
+	copy := *client
+	copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err := copy.Do(request)
 	if err != nil {
 		return err
 	}
@@ -129,6 +131,7 @@ func parseSSE(body io.Reader, receive func(Event)) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 4<<10), maxSSELine)
 	var event Event
+	terminal := false
 	emit := func() {
 		if len(event.Data) == 0 {
 			return
@@ -143,6 +146,7 @@ func parseSSE(body io.Reader, receive func(Event)) error {
 		if receive != nil {
 			receive(event)
 		}
+		terminal = terminal || event.Type == "RUN_FINISHED" || event.Type == "RUN_ERROR"
 	}
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -167,5 +171,8 @@ func parseSSE(body io.Reader, receive func(Event)) error {
 		return err
 	}
 	emit()
+	if !terminal {
+		return io.ErrUnexpectedEOF
+	}
 	return nil
 }
