@@ -20,6 +20,8 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/provider/foundry"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/provider/litellm"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/service"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/telemetry"
 )
@@ -30,6 +32,7 @@ const (
 	envRetained      = "AGENT_PLATFORM_RETAINED_CONFIGS"
 	envPort          = "AGENT_PLATFORM_PORT"
 	envShutdownGrace = "AGENT_PLATFORM_SHUTDOWN_GRACE"
+	envModelProvider = "AZ_AGENT_MODEL_PROVIDER"
 )
 
 type config struct {
@@ -41,6 +44,8 @@ type config struct {
 	keycloak          chat.KeycloakConfig
 	foundryEndpoint   string
 	foundryDeployment string
+	modelProvider     string
+	litellm           litellm.Config
 	telemetry         telemetry.Config
 }
 
@@ -94,15 +99,9 @@ func run(ctx context.Context, lookup func(string) string) error {
 	if err != nil {
 		return errors.New("invalid identity configuration")
 	}
-	credential, err := azidentity.NewDefaultAzureCredential(nil)
+	model, err := newModel(config)
 	if err != nil {
-		return errors.New("Azure credential unavailable")
-	}
-	model, err := foundry.New(foundry.Config{
-		ProjectEndpoint: config.foundryEndpoint, Deployment: config.foundryDeployment, Credential: credential,
-	})
-	if err != nil {
-		return errors.New("invalid Foundry configuration")
+		return errors.New("invalid model configuration")
 	}
 	app, err := service.New(service.Dependencies{
 		Pool: pool, Registry: registry, Authenticator: authenticator, Model: model,
@@ -133,6 +132,19 @@ func run(ctx context.Context, lookup func(string) string) error {
 	case <-serveErr:
 		return errors.New("service stopped")
 	}
+}
+
+func newModel(config config) (runtime.Model, error) {
+	if config.modelProvider == "litellm" {
+		return litellm.New(config.litellm)
+	}
+	credential, err := azidentity.NewDefaultAzureCredential(nil)
+	if err != nil {
+		return nil, err
+	}
+	return foundry.New(foundry.Config{
+		ProjectEndpoint: config.foundryEndpoint, Deployment: config.foundryDeployment, Credential: credential,
+	})
 }
 
 func loadConfig(lookup func(string) string) (config, error) {
@@ -174,13 +186,29 @@ func loadConfig(lookup func(string) string) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	foundryEndpoint, err := require(foundry.EnvProjectEndpoint)
-	if err != nil {
-		return config{}, err
+	modelProvider := strings.TrimSpace(lookup(envModelProvider))
+	if modelProvider == "" {
+		modelProvider = "foundry"
 	}
-	foundryDeployment, err := require(foundry.EnvDeployment)
-	if err != nil {
-		return config{}, err
+	var foundryEndpoint, foundryDeployment string
+	var litellmConfig litellm.Config
+	switch modelProvider {
+	case "foundry":
+		foundryEndpoint, err = require(foundry.EnvProjectEndpoint)
+		if err != nil {
+			return config{}, err
+		}
+		foundryDeployment, err = require(foundry.EnvDeployment)
+		if err != nil {
+			return config{}, err
+		}
+	case "litellm":
+		litellmConfig, err = litellm.ConfigFromEnv(lookup)
+		if err != nil {
+			return config{}, err
+		}
+	default:
+		return config{}, errors.New("invalid model provider")
 	}
 	telemetryConfig, err := telemetryConfig(require, lookup, grace)
 	if err != nil {
@@ -190,6 +218,7 @@ func loadConfig(lookup func(string) string) (config, error) {
 		databaseURL: databaseURL, definitionPath: definitionPath,
 		retainedConfigs: splitValues(lookup(envRetained)), port: port, grace: grace, keycloak: keycloak,
 		foundryEndpoint: foundryEndpoint, foundryDeployment: foundryDeployment,
+		modelProvider: modelProvider, litellm: litellmConfig,
 		telemetry: telemetryConfig,
 	}, nil
 }

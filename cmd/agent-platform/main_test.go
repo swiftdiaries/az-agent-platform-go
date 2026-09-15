@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/provider/litellm"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/telemetry"
 )
 
@@ -20,6 +21,38 @@ func TestLoadConfigRequiresEveryProductionBoundary(t *testing.T) {
 				t.Fatalf("missing %s accepted", name)
 			}
 		})
+	}
+}
+
+func TestLoadConfigSelectsLiteLLMWithoutFoundryCredentialConfiguration(t *testing.T) {
+	values := validEnvironment()
+	delete(values, "AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT")
+	delete(values, "AZ_AGENT_FOUNDRY_DEPLOYMENT")
+	values[envModelProvider] = "litellm"
+	values[litellm.EnvBaseURL] = "http://localhost:4000"
+	values[litellm.EnvAPIKey] = "proxy-secret"
+	values[litellm.EnvModel] = "azure-alias"
+	loaded, err := loadConfig(missingValue(values))
+	if err != nil || loaded.modelProvider != "litellm" || loaded.litellm.Model != "azure-alias" {
+		t.Fatalf("LiteLLM config/error = %+v/%v", loaded, err)
+	}
+	model, err := newModel(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := model.(*litellm.Adapter); !ok {
+		t.Fatalf("model type = %T", model)
+	}
+	for _, name := range []string{litellm.EnvBaseURL, litellm.EnvAPIKey, litellm.EnvModel} {
+		missing := mapsClone(values)
+		delete(missing, name)
+		if _, err := loadConfig(missingValue(missing)); err == nil {
+			t.Errorf("missing %s accepted", name)
+		}
+	}
+	values[envModelProvider] = "unknown"
+	if _, err := loadConfig(missingValue(values)); err == nil {
+		t.Error("unknown provider accepted")
 	}
 }
 
