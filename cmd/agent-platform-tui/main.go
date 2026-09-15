@@ -86,12 +86,12 @@ func runContext(ctx context.Context, args []string, lookup func(string) string, 
 		printUsage(stdout)
 		return nil
 	}
-	if !isTerminal(stdin) || !isTerminal(stdout) {
-		return errors.New("agent-platform-tui requires an interactive TTY")
-	}
 	result, err := parseFlags(args, lookup)
 	if err != nil {
 		return err
+	}
+	if !isTerminal(stdin) || !isTerminal(stdout) {
+		return errors.New("agent-platform-tui requires an interactive TTY")
 	}
 	if lookup == nil {
 		lookup = os.Getenv
