@@ -34,3 +34,16 @@ AZ_AGENT_LITELLM_MODEL=azure-alias
 See [LiteLLM's Azure Responses guide](https://docs.litellm.ai/docs/providers/azure/azure_responses) and [OpenAI Go SDK](https://github.com/openai/openai-go) for proxy and client details.
 
 [Provenance](docs/PROVENANCE.md) records the original copied records and the subsequent user-requested simplification. Source-repository paths in the design are historical evidence references.
+
+## Local TUI
+
+After the local Compose stack is running, start the interactive client:
+
+```sh
+export KEYCLOAK_ACCESS_TOKEN=...
+go run ./cmd/agent-platform-tui --journey vacation-planner
+```
+
+`--url` selects the API (or uses `AGENT_PLATFORM_URL`, defaulting to `http://localhost:8080`). `--journey` selects a journey. `--thread THREAD` starts a new run on an existing thread; add `--run RUN` to resume that run with the server's event stream. `--run` requires `--thread`.
+
+Press Enter to send a message or choose a clarification option. Approval prompts accept `approve` or `reject`. Use PgUp/PgDown to scroll and Ctrl+C (or `q` with an empty input) to quit.
