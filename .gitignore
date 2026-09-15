@@ -1,3 +1,19 @@
 # Local planning and execution artifacts
 .cache/
 .worktrees/
+
+# Go build and test outputs
+/agent-platform
+/bin/
+*.test
+*.out
+coverage.out
+*.prof
+
+# Local Go workspace files
+go.work
+go.work.sum
+
+# Local deployment configuration
+deploy/config/*.env
+!deploy/config/*.env.example
