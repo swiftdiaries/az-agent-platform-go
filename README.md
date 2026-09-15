@@ -46,4 +46,4 @@ go run ./cmd/agent-platform-tui --journey vacation-planner
 
 `--url` selects the API (or uses `AGENT_PLATFORM_URL`, defaulting to `http://localhost:8080`). `--journey` selects a journey. `--thread THREAD` starts a new run on an existing thread; add `--run RUN` to resume that run with the server's event stream. `--run` requires `--thread`.
 
-Press Enter to send a message or choose a clarification option. Approval prompts accept `approve` or `deny`. Use PgUp/PgDown to scroll and Ctrl+C to quit.
+Press Enter to send a message or choose a clarification option. Approval prompts accept `approve` or `deny`. Use PgUp/PgDown to scroll and Ctrl+C to quit. If a stream ends before a terminal event or reports a retryable transport error, use `/retry` to resend the exact request.

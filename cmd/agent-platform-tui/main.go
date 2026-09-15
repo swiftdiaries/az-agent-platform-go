@@ -136,6 +136,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  --thread ID     existing thread for a new run or resume")
 	fmt.Fprintln(w, "  --run ID        run ID to resume (requires --thread)")
 	fmt.Fprintln(w, "Authentication: set KEYCLOAK_ACCESS_TOKEN in the environment")
+	fmt.Fprintln(w, "Commands: /new starts over; /journey ID selects a journey; /retry resends a retryable request")
 }
 
 func checkReadiness(ctx context.Context, baseURL string, client *http.Client) error {

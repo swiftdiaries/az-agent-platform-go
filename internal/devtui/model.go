@@ -8,13 +8,17 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 )
 
-const maxTranscriptLines = 1000
+const (
+	maxTranscriptLines = 1000
+	maxTranscriptBytes = 256 << 10
+)
 
 type question struct {
 	ID       string   `json:"id"`
@@ -59,6 +63,7 @@ type Model struct {
 	resumeRun       string
 	terminal        bool
 	lastRequest     *Request
+	screenHeight    int
 }
 
 type streamEventMsg struct{ event Event }
@@ -88,7 +93,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.input.SetWidth(max(1, msg.Width-2))
 		m.viewport.SetWidth(max(1, msg.Width))
-		m.viewport.SetHeight(max(1, msg.Height-5))
+		m.screenHeight = msg.Height
+		m.layout()
 		m.refresh()
 		return m, nil
 	case streamEventMsg:
@@ -99,6 +105,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cancel = nil
 		if msg.err != nil {
 			m.status = "error: " + sanitize(msg.err.Error())
+			if m.canRetry() {
+				m.status += "; type /retry"
+			}
 		} else if !m.terminal {
 			m.status = "stream ended; type /retry"
 		} else if m.pending != nil {
@@ -132,8 +141,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) View() tea.View {
+	m.layout()
 	m.refresh()
-	return tea.NewView(fmt.Sprintf("agent-platform  thread: %s  run: %s  journey: %s  %s\n%s\n%s\nPgUp/PgDown scroll · Ctrl+C quit", sanitize(m.threadID), sanitize(m.runID), sanitize(m.journeyID), sanitize(m.status), m.viewport.View(), m.input.View()))
+	footer := "PgUp/PgDown scroll · Ctrl+C quit"
+	if m.canRetry() {
+		footer = "/retry resend last request · " + footer
+	}
+	return tea.NewView(fmt.Sprintf("%s\n%s\n%s\n%s", m.header(), m.viewport.View(), m.input.View(), footer))
 }
 
 func (m *Model) apply(event Event) {
@@ -201,6 +215,14 @@ func (m *Model) submit() tea.Cmd {
 		return nil
 	}
 	m.input.Reset()
+	if text == "/new" {
+		m.threadID, m.runID, m.pending, m.answers, m.lastRequest = "", "", nil, nil, nil
+		m.terminal = false
+		m.transcript = nil
+		m.status = "new conversation"
+		m.refresh()
+		return nil
+	}
 	if text == "/retry" {
 		if m.lastRequest != nil && !m.terminal {
 			return m.start(*m.lastRequest)
@@ -213,13 +235,6 @@ func (m *Model) submit() tea.Cmd {
 	}
 	if m.lastRequest != nil && !m.terminal {
 		m.status = "stream ended; type /retry"
-		return nil
-	}
-	if text == "/new" {
-		m.threadID, m.runID, m.pending, m.answers = "", "", nil, nil
-		m.transcript = nil
-		m.status = "new conversation"
-		m.refresh()
 		return nil
 	}
 	if journey, ok := strings.CutPrefix(text, "/journey "); ok && strings.TrimSpace(journey) != "" {
@@ -312,12 +327,83 @@ func waitForStream(events <-chan tea.Msg) tea.Cmd { return func() tea.Msg { retu
 func (m *Model) add(line string) {
 	if len(m.transcript) > 0 && strings.HasPrefix(line, "assistant: ") && strings.HasPrefix(m.transcript[len(m.transcript)-1], "assistant: ") {
 		m.transcript[len(m.transcript)-1] += strings.TrimPrefix(line, "assistant: ")
+		m.trimTranscript()
 		return
 	}
 	m.transcript = append(m.transcript, line)
+	m.trimTranscript()
+}
+
+func (m *Model) trimTranscript() {
 	if len(m.transcript) > maxTranscriptLines {
 		m.transcript = m.transcript[len(m.transcript)-maxTranscriptLines:]
 	}
+	bytes := len(m.transcript) - 1
+	for _, line := range m.transcript {
+		bytes += len(line)
+	}
+	for bytes > maxTranscriptBytes && len(m.transcript) > 0 {
+		excess := bytes - maxTranscriptBytes
+		if len(m.transcript[0]) <= excess {
+			bytes -= len(m.transcript[0]) + 1
+			m.transcript = m.transcript[1:]
+			continue
+		}
+		m.transcript[0] = utf8Suffix(m.transcript[0], len(m.transcript[0])-excess)
+		break
+	}
+}
+
+func utf8Suffix(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	start := len(value) - limit
+	for start < len(value) && value[start]&0xc0 == 0x80 {
+		start++
+	}
+	return value[start:]
+}
+
+func (m *Model) canRetry() bool {
+	return !m.terminal && (m.lastRequest != nil || m.runID != "")
+}
+
+func (m *Model) header() string {
+	content := strings.Join([]string{
+		"agent-platform  " + sanitize(m.status),
+		"url: " + sanitize(m.client.BaseURL),
+		"thread: " + sanitize(m.threadID),
+		"run: " + sanitize(m.runID),
+		"journey: " + sanitize(m.journeyID),
+	}, "\n")
+	return wrap(content, max(1, m.viewport.Width()))
+}
+
+func (m *Model) layout() {
+	if m.screenHeight > 0 {
+		m.viewport.SetHeight(max(1, m.screenHeight-strings.Count(m.header(), "\n")-3))
+	}
+}
+
+func wrap(value string, width int) string {
+	var output strings.Builder
+	for _, line := range strings.Split(value, "\n") {
+		for len(line) > 0 {
+			end := 0
+			for end < len(line) && end < width {
+				_, size := utf8.DecodeRuneInString(line[end:])
+				end += size
+			}
+			output.WriteString(line[:end])
+			line = line[end:]
+			if line != "" {
+				output.WriteByte('\n')
+			}
+		}
+		output.WriteByte('\n')
+	}
+	return strings.TrimSuffix(output.String(), "\n")
 }
 
 func (m *Model) refresh() {

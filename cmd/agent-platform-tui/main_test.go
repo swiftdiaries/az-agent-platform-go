@@ -89,7 +89,7 @@ func TestRunHelpSkipsTTYAndTokenChecks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(usage), "--journey") || !strings.Contains(string(usage), "--run") {
+	if !strings.Contains(string(usage), "--journey") || !strings.Contains(string(usage), "--run") || !strings.Contains(string(usage), "/retry") {
 		t.Fatalf("incomplete usage: %s", usage)
 	}
 }

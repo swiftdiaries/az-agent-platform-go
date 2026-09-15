@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -133,5 +134,37 @@ func TestModelUpdateCollectsClarificationsFromSnapshot(t *testing.T) {
 	_, _ = m.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
 	if m.pending == nil || m.questionIndex != 1 || m.answers["first"]["option"] != "A" {
 		t.Fatalf("pending = %#v index = %d answers = %#v", m.pending, m.questionIndex, m.answers)
+	}
+}
+
+func TestNewEscapesRetryableStreamState(t *testing.T) {
+	m := NewModel(Client{}, "thread", "run", "journey")
+	m.lastRequest = &Request{ThreadID: "thread", RunID: "run", Text: "failed"}
+	m.input.SetValue("/new")
+	_, _ = m.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	if m.threadID != "" || m.runID != "" || m.status != "new conversation" {
+		t.Fatalf("new was blocked by retry state: thread=%q run=%q status=%q", m.threadID, m.runID, m.status)
+	}
+}
+
+func TestTranscriptBoundsMergedAssistantTextOnUTF8Boundary(t *testing.T) {
+	m := NewModel(Client{}, "thread", "", "journey")
+	chunk := strings.Repeat("é", maxTranscriptBytes/2)
+	m.add("assistant: " + chunk)
+	m.add("assistant: " + chunk)
+	text := strings.Join(m.transcript, "\n")
+	if len(text) > maxTranscriptBytes || !utf8.ValidString(text) {
+		t.Fatalf("bytes=%d valid=%t", len(text), utf8.ValidString(text))
+	}
+}
+
+func TestViewShowsRetryHintAndWrappedConnectionHeader(t *testing.T) {
+	m := NewModel(Client{BaseURL: "http://example.test/very/long/path"}, strings.Repeat("thread", 20), strings.Repeat("run", 20), strings.Repeat("journey", 20))
+	m.lastRequest = &Request{ThreadID: m.threadID, RunID: m.runID}
+	m.status = "error: unexpected EOF"
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	view := m.View().Content
+	if !strings.Contains(view, "url: http://example.test/very/long/path") || !strings.Contains(view, "/retry") || m.viewport.Height() >= 24 {
+		t.Fatalf("view=%q height=%d", view, m.viewport.Height())
 	}
 }
