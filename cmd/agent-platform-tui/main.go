@@ -7,12 +7,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/term"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/devtui"
 )
@@ -20,6 +23,8 @@ import (
 const (
 	envURL   = "AGENT_PLATFORM_URL"
 	envToken = "KEYCLOAK_ACCESS_TOKEN"
+
+	readinessTimeout = 5 * time.Second
 )
 
 type options struct {
@@ -77,6 +82,10 @@ func run(args []string, lookup func(string) string, stdin, stdout *os.File) erro
 }
 
 func runContext(ctx context.Context, args []string, lookup func(string) string, stdin, stdout *os.File) error {
+	if wantsHelp(args) {
+		printUsage(stdout)
+		return nil
+	}
 	if !isTerminal(stdin) || !isTerminal(stdout) {
 		return errors.New("agent-platform-tui requires an interactive TTY")
 	}
@@ -91,6 +100,9 @@ func runContext(ctx context.Context, args []string, lookup func(string) string, 
 	if result.token == "" {
 		return errors.New("KEYCLOAK_ACCESS_TOKEN is required")
 	}
+	if err := checkReadiness(ctx, result.baseURL, nil); err != nil {
+		return err
+	}
 
 	model := altScreenModel{Model: devtui.NewModel(devtui.Client{
 		BaseURL:    result.baseURL,
@@ -103,8 +115,68 @@ func runContext(ctx context.Context, args []string, lookup func(string) string, 
 }
 
 func isTerminal(file *os.File) bool {
-	info, err := file.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
+	return file != nil && term.IsTerminal(file.Fd())
+}
+
+func wantsHelp(args []string) bool {
+	for _, arg := range args {
+		if arg == "--help" || arg == "-h" {
+			return true
+		}
+	}
+	return false
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage: go run ./cmd/agent-platform-tui [flags]")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --url URL       agent platform URL (default: AGENT_PLATFORM_URL or http://localhost:8080)")
+	fmt.Fprintln(w, "  --journey ID    journey ID")
+	fmt.Fprintln(w, "  --thread ID     existing thread for a new run or resume")
+	fmt.Fprintln(w, "  --run ID        run ID to resume (requires --thread)")
+	fmt.Fprintln(w, "Authentication: set KEYCLOAK_ACCESS_TOKEN in the environment")
+}
+
+func checkReadiness(ctx context.Context, baseURL string, client *http.Client) error {
+	endpoint, err := readinessEndpoint(baseURL)
+	if err != nil {
+		return errors.New("invalid agent platform URL")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return errors.New("invalid agent platform URL")
+	}
+	if client == nil {
+		client = &http.Client{}
+	} else {
+		copy := *client
+		client = &copy
+	}
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	if client.Timeout <= 0 || client.Timeout > readinessTimeout {
+		client.Timeout = readinessTimeout
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return errors.New("agent platform readiness check failed")
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("agent platform readiness check returned HTTP %d", response.StatusCode)
+	}
+	return nil
+}
+
+func readinessEndpoint(baseURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", errors.New("invalid URL")
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/readyz"
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
 }
 
 type altScreenModel struct{ tea.Model }
