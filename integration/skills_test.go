@@ -202,7 +202,7 @@ func TestSkillReadRejectsReplacedAncestors(t *testing.T) {
 	})
 }
 
-func writeTwoJourneyBundle(t *testing.T, root, endpoint string) string {
+func writeTwoJourneyBundle(t *testing.T, root string) string {
 	t.Helper()
 	for _, dir := range []string{"prompts", "skills/planner", "skills/shift-swap"} {
 		if err := os.MkdirAll(filepath.Join(root, dir), 0700); err != nil {
@@ -219,7 +219,7 @@ func writeTwoJourneyBundle(t *testing.T, root, endpoint string) string {
 			t.Fatal(err)
 		}
 	}
-	config := fmt.Sprintf(`{"mcp_servers":[{"id":"s","endpoint":%q,"tools":["lookup_destination","lookup_shift"],"policies":{"lookup_destination":{"class":"read_only"},"lookup_shift":{"class":"read_only"}}}],"skill_packages":[{"name":"planner","root":"skills/planner"},{"name":"shift-swap","root":"skills/shift-swap"}],"journeys":[{"id":"vacation-planner","description":"travel","routing":{"default":true},"system_prompt":"prompts/planner.md","mcp":{"server":"s","tools":["lookup_destination"]},"skills":["planner"]},{"id":"shift-swap","description":"exchange work time","routing":{"keywords":["shift","swap"],"priority":10},"system_prompt":"prompts/shift-swap.md","mcp":{"server":"s","tools":["lookup_shift"]},"skills":["shift-swap"]}]}`, endpoint)
+	config := `{"mcp_servers":[{"id":"s","tools":["lookup_destination","lookup_shift"],"policies":{"lookup_destination":{"class":"read_only"},"lookup_shift":{"class":"read_only"}}}],"skill_packages":[{"name":"planner","root":"skills/planner"},{"name":"shift-swap","root":"skills/shift-swap"}],"journeys":[{"id":"vacation-planner","description":"travel","routing":{"default":true},"system_prompt":"prompts/planner.md","mcp":{"server":"s","tools":["lookup_destination"]},"skills":["planner"]},{"id":"shift-swap","description":"exchange work time","routing":{"keywords":["shift","swap"],"priority":10},"system_prompt":"prompts/shift-swap.md","mcp":{"server":"s","tools":["lookup_shift"]},"skills":["shift-swap"]}]}`
 	path := filepath.Join(root, "journeys.yaml")
 	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
 		t.Fatal(err)
@@ -237,7 +237,7 @@ func TestJourneyDefinitionRoutesAndMaterializesContext(t *testing.T) {
 	})
 	endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return sdk }, nil))
 	t.Cleanup(endpoint.Close)
-	registry, err := definitions.Load(writeTwoJourneyBundle(t, t.TempDir(), endpoint.URL))
+	registry, err := definitions.Load(writeTwoJourneyBundle(t, t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +245,7 @@ func TestJourneyDefinitionRoutesAndMaterializesContext(t *testing.T) {
 	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		requests = append(requests, request)
 		return agentruntime.ModelResponse{Text: request.Handoff.JourneyID + " answer"}, nil
-	}))
+	}), testTenancy(t, endpoint.URL))
 	store := journal.New(database(t))
 	run := func(id, text, target string) {
 		t.Helper()
@@ -254,7 +254,7 @@ func TestJourneyDefinitionRoutesAndMaterializesContext(t *testing.T) {
 			t.Fatal(err)
 		}
 		owner := claimForTest(t, store, command, false)
-		input := agentruntime.RunInput{Store: store, Owner: owner, ThreadID: "thread", RunID: id, Text: text, TargetJourney: target}
+		input := scoped(t, runner, agentruntime.RunInput{Store: store, Owner: owner, ThreadID: "thread", RunID: id, Text: text, TargetJourney: target})
 		journey, digest, err := runner.Binding(t.Context(), input)
 		if err != nil {
 			t.Fatal(err)
@@ -336,7 +336,6 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		config = []byte(strings.Replace(string(config), "http://example", endpoint.URL, 1))
 		config = []byte(strings.ReplaceAll(string(config), `"id":"s"`, fmt.Sprintf(`"id":%q`, serverName)))
 		config = []byte(strings.ReplaceAll(string(config), `"server":"s"`, fmt.Sprintf(`"server":%q`, serverName)))
 		if err := os.WriteFile(path, config, 0600); err != nil {
@@ -376,8 +375,8 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 		}
 		return agentruntime.ModelResponse{Text: "done"}, nil
 	})
-	service := platform.New(agentruntime.NewRunner(registry, platformmcp.NewClient(), model), store)
-	command := platform.Command{ThreadID: "retained", RunID: "wait", CommunicationID: "wait", Principal: "alice", Text: "ask", TargetJourney: "planner"}
+	service := platform.New(agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, endpoint.URL)), store)
+	command := platform.Command{ThreadID: "retained", RunID: "wait", CommunicationID: "wait", Principal: "alice", Tenant: testTenant, Text: "ask", TargetJourney: "planner"}
 	if _, err := service.Submit(t.Context(), command, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -396,14 +395,14 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	replacement := platform.New(agentruntime.NewRunner(registry, platformmcp.NewClient(), model), store)
+	replacement := platform.New(agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, endpoint.URL)), store)
 	t.Cleanup(replacement.Close)
-	reply := platform.Command{ThreadID: "retained", RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: interaction.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
+	reply := platform.Command{ThreadID: "retained", RunID: "reply", CommunicationID: "reply", Principal: "alice", Tenant: testTenant, InteractionID: interaction.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
 	if _, err := replacement.Submit(t.Context(), reply, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	awaitState(t, replacement, "retained", "reply", journal.RunCompleted)
-	newCommand := platform.Command{ThreadID: "fresh", RunID: "fresh", CommunicationID: "fresh", Principal: "alice", Text: "plan", TargetJourney: "planner"}
+	newCommand := platform.Command{ThreadID: "fresh", RunID: "fresh", CommunicationID: "fresh", Principal: "alice", Tenant: testTenant, Text: "plan", TargetJourney: "planner"}
 	if _, err := replacement.Submit(t.Context(), newCommand, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -436,15 +435,7 @@ func TestSkillRuntimeLoadsOnlySelectedMaterial(t *testing.T) {
 	endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return sdk }, nil))
 	t.Cleanup(endpoint.Close)
 	root := t.TempDir()
-	path := writeDefinitionBundle(t, root, "prompt\n")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(strings.Replace(string(data), "http://example", endpoint.URL, 1)), 0600); err != nil {
-		t.Fatal(err)
-	}
-	registry, err := definitions.Load(path)
+	registry, err := definitions.Load(writeDefinitionBundle(t, root, "prompt\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,8 +470,8 @@ func TestSkillRuntimeLoadsOnlySelectedMaterial(t *testing.T) {
 		t.Fatal(err)
 	}
 	owner := claimForTest(t, store, command, false)
-	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model)
-	input := agentruntime.RunInput{Store: store, Owner: owner, ThreadID: command.ThreadID, RunID: command.RunID, Text: command.Text}
+	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, endpoint.URL))
+	input := scoped(t, runner, agentruntime.RunInput{Store: store, Owner: owner, ThreadID: command.ThreadID, RunID: command.RunID, Text: command.Text})
 	journey, digest, err := runner.Binding(t.Context(), input)
 	if err != nil {
 		t.Fatal(err)

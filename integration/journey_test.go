@@ -103,7 +103,6 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 		streamableHandler.ServeHTTP(writer, request)
 	}))
 	t.Cleanup(httpMCP.Close)
-	t.Setenv("TEST_JAVA_MCP_ENDPOINT", httpMCP.URL)
 
 	registry, err := definitions.Load(filepath.Join("..", "configs", "journeys.yaml"))
 	if err != nil {
@@ -134,11 +133,11 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 		}
 		return agentruntime.ModelResponse{Text: "Kyoto is available"}, nil
 	})
-	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model)
+	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, httpMCP.URL))
 	pool := database(t)
 	service := platform.New(runner, journal.New(pool))
 	t.Cleanup(service.Close)
-	handler := chat.NewHandler(chat.StaticBearerTokens{"alice-token": "alice", "bob-token": "bob"}, service, pool, []string{"Authorization", "Cookie"})
+	handler := chat.NewHandler(chat.StaticBearerTokens{"alice-token": testPrincipal, "bob-token": "tenant-a/bob"}, service, pool, []string{"Authorization", "Cookie"})
 	api := httptest.NewServer(handler)
 	t.Cleanup(api.Close)
 
@@ -177,7 +176,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 		strings.Contains(response.Body, internalThreadID) || strings.Contains(response.Body, internalRunID) {
 		t.Fatalf("AG-UI response did not preserve external correlation at the edge: %s", response.Body)
 	}
-	firstSnapshot, err := service.Snapshot(context.Background(), internalThreadID, "alice")
+	firstSnapshot, err := service.Snapshot(context.Background(), internalThreadID, testPrincipal)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +196,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	if bobThreadID == "" || bobRunID == "" || bobThreadID == internalThreadID || bobRunID == internalRunID {
 		t.Fatalf("principal-scoped identity mapping was not isolated: alice=(%q,%q) bob=(%q,%q)", internalThreadID, internalRunID, bobThreadID, bobRunID)
 	}
-	if _, err := service.Snapshot(context.Background(), bobThreadID, "bob"); err != nil {
+	if _, err := service.Snapshot(context.Background(), bobThreadID, "tenant-a/bob"); err != nil {
 		t.Fatalf("bob snapshot through mapped identity: %v", err)
 	}
 	mu.Lock()
@@ -266,7 +265,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 		t.Fatalf("expired downstream auth response = %#v", expired)
 	}
 	expiredThreadID, _ := latestChatIdentity(spanRecorder.Ended())
-	expiredSnapshot, err := service.Snapshot(context.Background(), expiredThreadID, "alice")
+	expiredSnapshot, err := service.Snapshot(context.Background(), expiredThreadID, testPrincipal)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,14 +287,14 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 		t.Fatalf("internal failure response = %#v", internal)
 	}
 	failedThreadID, _ := latestChatIdentity(spanRecorder.Ended())
-	internalSnapshot, err := service.Snapshot(context.Background(), failedThreadID, "alice")
+	internalSnapshot, err := service.Snapshot(context.Background(), failedThreadID, testPrincipal)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if internalSnapshot.RunState != platform.RunFailed || !slices.ContainsFunc(internalSnapshot.Events, func(event platform.Event) bool { return event.Type == "run.failed" }) {
 		t.Fatalf("internal failure snapshot = %#v", internalSnapshot)
 	}
-	snapshot, err := service.Snapshot(context.Background(), internalThreadID, "alice")
+	snapshot, err := service.Snapshot(context.Background(), internalThreadID, testPrincipal)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +304,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	if _, err := service.Snapshot(context.Background(), internalThreadID, "mallory"); err == nil {
 		t.Fatal("forged principal read another principal's thread")
 	}
-	if _, err := service.Snapshot(context.Background(), body.ThreadID, "alice"); err == nil {
+	if _, err := service.Snapshot(context.Background(), body.ThreadID, testPrincipal); err == nil {
 		t.Fatal("raw external thread ID reached platform state")
 	}
 }
@@ -384,7 +383,7 @@ func TestToolBindingFailsClosed(t *testing.T) {
 			}
 			endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{Stateless: false}))
 			t.Cleanup(endpoint.Close)
-			_, err := platformmcp.NewClient().Bind(t.Context(), definitions.MCPServer{ID: "s", Endpoint: endpoint.URL}, test.allowed, credential.Credential{})
+			_, err := platformmcp.NewClient().Bind(t.Context(), definitions.MCPServer{ID: "s"}, testEndpoint(t, endpoint.URL), test.allowed, credential.Credential{})
 			if err == nil {
 				t.Fatal("Bind accepted unsafe tool registry")
 			}
@@ -412,8 +411,8 @@ func TestToolBindingDoesNotForwardCredentialsAcrossRedirect(t *testing.T) {
 	headers.Set("Authorization", "Bearer redirect-secret")
 	headers.Set("Cookie", "session=redirect-secret")
 	_, err := platformmcp.NewClient().Bind(t.Context(), definitions.MCPServer{
-		ID: "redirect", Endpoint: redirect.URL,
-	}, []string{"lookup_destination"}, credential.FromRequest(&http.Request{Header: headers}, []string{"Authorization", "Cookie"}))
+		ID: "redirect",
+	}, testEndpoint(t, redirect.URL), []string{"lookup_destination"}, credential.FromRequest(&http.Request{Header: headers}, []string{"Authorization", "Cookie"}))
 	if err == nil {
 		t.Fatal("Bind followed an MCP redirect")
 	}
@@ -449,13 +448,13 @@ func statefulSessionID(observations []transportObservation, cookie, authorizatio
 
 func TestJourneyConfigFailsClosed(t *testing.T) {
 	cases := map[string]string{
-		"empty tools":       `{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":[]}}]}`,
-		"missing tools":     `{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s"}}]}`,
+		"empty tools":       `{"mcp_servers":[{"id":"s","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":[]}}]}`,
+		"missing tools":     `{"mcp_servers":[{"id":"s","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s"}}]}`,
 		"unknown field":     `{"extra":true,"mcp_servers":[],"journeys":[]}`,
-		"duplicate journey": `{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}},{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}}]}`,
-		"escaping prompt":   `{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"../p.md","mcp":{"server":"s","tools":["t"]}}]}`,
-		"missing prompt":    `{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"missing.md","mcp":{"server":"s","tools":["t"]}}]}`,
-		"undeclared tool":   `{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["registered"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["registred"]}}]}`,
+		"duplicate journey": `{"mcp_servers":[{"id":"s","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}},{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}}]}`,
+		"escaping prompt":   `{"mcp_servers":[{"id":"s","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"../p.md","mcp":{"server":"s","tools":["t"]}}]}`,
+		"missing prompt":    `{"mcp_servers":[{"id":"s","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"missing.md","mcp":{"server":"s","tools":["t"]}}]}`,
+		"undeclared tool":   `{"mcp_servers":[{"id":"s","tools":["registered"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["registred"]}}]}`,
 	}
 	for name, config := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -470,6 +469,30 @@ func TestJourneyConfigFailsClosed(t *testing.T) {
 				t.Fatal("Load accepted invalid config")
 			}
 		})
+	}
+}
+
+// MCP URLs come only from the deploy-time allowlist, so a config that still
+// carries one is rejected rather than silently ignored.
+func TestJourneyConfigRejectsEndpoint(t *testing.T) {
+	const valid = `{"mcp_servers":[{"id":"s",%s"tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}}]}`
+	load := func(config string) error {
+		dir := t.TempDir()
+		if err := writeFixture(filepath.Join(dir, "p.md"), "fixture prompt"); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeFixture(filepath.Join(dir, "journeys.yaml"), config); err != nil {
+			t.Fatal(err)
+		}
+		_, err := definitions.Load(filepath.Join(dir, "journeys.yaml"))
+		return err
+	}
+	if err := load(fmt.Sprintf(valid, "")); err != nil {
+		t.Fatalf("control config without endpoint: %v", err)
+	}
+	err := load(fmt.Sprintf(valid, `"endpoint":"http://attacker.example/mcp",`))
+	if err == nil || !strings.Contains(err.Error(), "endpoint") {
+		t.Fatalf("config with endpoint = %v, want unknown-field rejection", err)
 	}
 }
 

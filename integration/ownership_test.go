@@ -246,7 +246,7 @@ func TestOwnershipLossDuringModelRejectsResultAndRequiresFreshIngress(t *testing
 	defer a.Close()
 	b := platform.New(runner, journal.New(pool))
 	defer b.Close()
-	command := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "comm", Principal: "alice", Text: "initial"}
+	command := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "comm", Principal: "alice", Tenant: testTenant, Text: "initial"}
 	if _, err := a.Submit(ctx, command, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}

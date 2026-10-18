@@ -83,7 +83,7 @@ func TestHITLDurableWaitReply(t *testing.T) {
 	}))
 	p := platform.New(runner, store)
 	defer p.Close()
-	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "comm", Principal: "alice", Text: "ask"}
+	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "comm", Principal: "alice", Tenant: testTenant, Text: "ask"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestHITLDurableWaitReply(t *testing.T) {
 	p.Close()
 	p2 := platform.New(runner, journal.New(pool))
 	defer p2.Close()
-	reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: wait.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
+	reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", Tenant: testTenant, InteractionID: wait.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
 	bad := reply
 	bad.Principal = "mallory"
 	if _, err := p2.Submit(t.Context(), bad, credential.Credential{}); !errors.Is(err, journal.ErrForbidden) {
@@ -277,7 +277,7 @@ func TestHITLSeparateProcessAfterWaitAndReplyCommit(t *testing.T) {
 			return agentruntime.ModelResponse{ToolCall: questionCall("process-call")}, nil
 		})), store)
 		defer p.Close()
-		if _, err := p.Submit(t.Context(), platform.Command{ThreadID: "process", RunID: "wait", CommunicationID: "wait", Principal: "alice", Text: "ask"}, credential.Credential{}); err != nil {
+		if _, err := p.Submit(t.Context(), platform.Command{ThreadID: "process", RunID: "wait", CommunicationID: "wait", Principal: "alice", Tenant: testTenant, Text: "ask"}, credential.Credential{}); err != nil {
 			t.Fatal(err)
 		}
 		awaitState(t, p, "process", "wait", journal.RunAwaitingInput)
@@ -312,7 +312,7 @@ func TestHITLSeparateProcessAfterWaitAndReplyCommit(t *testing.T) {
 	if err := json.Unmarshal(artifact, &i); err != nil {
 		t.Fatal(err)
 	}
-	reply := journal.Command{ThreadID: "process", RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: i.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"custom":"fresh answer"}}}`}
+	reply := journal.Command{ThreadID: "process", RunID: "reply", CommunicationID: "reply", Principal: "alice", Tenant: testTenant, InteractionID: i.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"custom":"fresh answer"}}}`}
 	child("reply", reply)
 	if _, err := pool.Exec(t.Context(), "UPDATE agent_runs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", reply.RunID); err != nil {
 		t.Fatal(err)
@@ -334,7 +334,7 @@ func TestHITLSeparateProcessAfterWaitAndReplyCommit(t *testing.T) {
 		return agentruntime.ModelResponse{Text: "process resumed"}, nil
 	})), journal.New(pool))
 	defer p.Close()
-	c := platform.Command{ThreadID: reply.ThreadID, RunID: reply.RunID, CommunicationID: reply.CommunicationID, Principal: reply.Principal, InteractionID: reply.InteractionID, ReplyKind: reply.ReplyKind, ReplyJSON: reply.ReplyJSON}
+	c := platform.Command{ThreadID: reply.ThreadID, RunID: reply.RunID, CommunicationID: reply.CommunicationID, Principal: reply.Principal, Tenant: testTenant, InteractionID: reply.InteractionID, ReplyKind: reply.ReplyKind, ReplyJSON: reply.ReplyJSON}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +383,7 @@ func TestReplyChatProjectionAndOutstandingOrdering(t *testing.T) {
 	}))
 	p := platform.New(runner, journal.New(pool))
 	defer p.Close()
-	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, p, pool, []string{"Authorization", "Cookie"}))
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": testPrincipal}, p, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	first := postJSONAGUI(t, api.URL, `{"threadId":"external-thread","runId":"external-wait","messages":[{"id":"user","role":"user","content":"ask"}],"tools":[],"context":[],"state":{},"forwardedProps":{}}`, "token", "", "")
 	if first.StatusCode != 200 || !strings.Contains(first.Body, "interaction.requested") {
@@ -447,7 +447,7 @@ func TestHITLCompletedToolNotReplayed(t *testing.T) {
 		}
 	})
 	p := platform.New(policyRunner(t, backend.URL, "read_only", model), journal.New(pool))
-	c := platform.Command{ThreadID: "replay", RunID: "replay", CommunicationID: "replay", Principal: "alice", Text: "go"}
+	c := platform.Command{ThreadID: "replay", RunID: "replay", CommunicationID: "replay", Principal: "alice", Tenant: testTenant, Text: "go"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -456,7 +456,7 @@ func TestHITLCompletedToolNotReplayed(t *testing.T) {
 	p.Close()
 	p2 := platform.New(policyRunner(t, backend.URL, "read_only", model), journal.New(pool))
 	defer p2.Close()
-	reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: i.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
+	reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", Tenant: testTenant, InteractionID: i.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
 	if _, err := p2.Submit(t.Context(), reply, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}

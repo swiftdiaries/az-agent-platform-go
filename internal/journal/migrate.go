@@ -13,7 +13,16 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
+// migrationNames lists the forward-only migrations in order; version = index+1.
+var migrationNames = []string{"000001_conversations.sql", "000002_ownership.sql", "000003_command_dispositions.sql", "000004_interactions_operations.sql", "000005_definition_current.sql", "000006_consumed_commands.sql", "000007_run_scope.sql"}
+
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	return migrateTo(ctx, pool, len(migrationNames))
+}
+
+// migrateTo applies the first n migrations. Tests use it to build a populated
+// pre-upgrade database; a database already past n is still "newer than this binary".
+func migrateTo(ctx context.Context, pool *pgxpool.Pool, n int) error {
 	return pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(789134627)"); err != nil {
 			return err
@@ -25,7 +34,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		if err := tx.QueryRow(ctx, "SELECT COALESCE(max(version),0) FROM agent_schema_migrations").Scan(&version); err != nil {
 			return err
 		}
-		names := []string{"000001_conversations.sql", "000002_ownership.sql", "000003_command_dispositions.sql", "000004_interactions_operations.sql", "000005_definition_current.sql", "000006_consumed_commands.sql"}
+		names := migrationNames[:n]
 		if version > len(names) {
 			return fmt.Errorf("database schema is newer than this binary")
 		}

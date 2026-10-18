@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
 
@@ -20,7 +21,9 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/settings"
 	platformskills "github.com/swiftdiaries/az-agent-platform-go/internal/skills"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/tenantdir"
 )
 
 type ModelTool struct {
@@ -90,6 +93,26 @@ type Runner struct {
 	definitions *definitions.Registry
 	mcp         *platformmcp.Client
 	model       Model
+	tenancy     Tenancy
+}
+
+// Tenancy is what a Runner needs to resolve a tenant at run start.
+type Tenancy struct {
+	Directory tenantdir.Directory
+	Endpoints tenantdir.Allowlist
+	Settings  settings.Source
+}
+
+// ErrDependencyUnavailable marks a tenant directory, allowlist, settings or MCP
+// endpoint failure. The run ends dependency_unavailable and no request that
+// could carry a credential has been sent.
+var ErrDependencyUnavailable = errors.New("dependency unavailable")
+
+// RunScope is the resolved, recorded scope of one run.
+type RunScope struct {
+	Entry    tenantdir.Entry
+	Endpoint tenantdir.Endpoint
+	Settings settings.Settings
 }
 
 type RunInput struct {
@@ -100,10 +123,14 @@ type RunInput struct {
 	ThreadID         string
 	RunID            string
 	Principal        string
+	Tenant           string
 	Text             string
 	TargetJourney    string
 	DefinitionDigest string
 	Credential       credential.Credential
+	// Endpoint and Settings are filled from Scope before Run.
+	Endpoint tenantdir.Endpoint
+	Settings settings.Settings
 }
 
 type RunOutput struct {
@@ -115,8 +142,41 @@ type RunOutput struct {
 	ToolName  string
 }
 
-func NewRunner(registry *definitions.Registry, client *platformmcp.Client, model Model) *Runner {
-	return &Runner{definitions: registry, mcp: client, model: model}
+func NewRunner(registry *definitions.Registry, client *platformmcp.Client, model Model, tenancy Tenancy) *Runner {
+	return &Runner{definitions: registry, mcp: client, model: model, tenancy: tenancy}
+}
+
+// Scope resolves directory, then allowlist, then settings, and records them on
+// the run (fenced) before any dispatch. A resolution failure is
+// ErrDependencyUnavailable and nothing has been sent anywhere.
+func (r *Runner) Scope(ctx context.Context, in RunInput) (RunScope, error) {
+	entry, endpoint, err := tenantdir.Lookup(ctx, r.tenancy.Directory, r.tenancy.Endpoints, in.Tenant)
+	if err != nil {
+		return RunScope{}, unavailable(ctx, err)
+	}
+	if r.tenancy.Settings == nil {
+		return RunScope{}, unavailable(ctx, settings.ErrUnavailable)
+	}
+	resolved, err := r.tenancy.Settings.Resolve(ctx, settings.Scope{Tenant: in.Tenant, Principal: in.Principal})
+	if err != nil {
+		return RunScope{}, unavailable(ctx, err)
+	}
+	if in.Store == nil {
+		return RunScope{}, journal.ErrDefinition
+	}
+	if err := in.Store.RecordRunScope(ctx, in.Owner, journal.RunScope{ProductVersion: entry.ProductVersion, EndpointID: entry.EndpointID, Settings: resolved.Record()}); err != nil {
+		return RunScope{}, err
+	}
+	return RunScope{Entry: entry, Endpoint: endpoint, Settings: resolved}, nil
+}
+
+// unavailable fails closed, except that the caller's own cancellation stays a
+// cancellation rather than a dependency verdict.
+func unavailable(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrDependencyUnavailable, err)
 }
 
 // Ready verifies only durable definition availability. It deliberately does
@@ -148,6 +208,9 @@ func (r *Runner) Binding(ctx context.Context, in RunInput) (string, string, erro
 }
 
 func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
+	if !input.Endpoint.Valid() {
+		return RunOutput{}, fmt.Errorf("%w: no allowlisted endpoint", ErrDependencyUnavailable)
+	}
 	journey, ok := r.definitions.Version(input.DefinitionDigest)
 	if !ok || journey.ID != input.TargetJourney {
 		return RunOutput{}, journal.ErrDefinition
@@ -165,11 +228,25 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 	if err := input.Store.Check(ctx, input.Owner); err != nil {
 		return RunOutput{}, err
 	}
-	bound, err := r.mcp.Bind(ctx, server, journey.MCP.Tools, input.Credential)
+	bound, err := r.mcp.Bind(ctx, server, input.Endpoint, journey.MCP.Tools, input.Credential)
 	if err != nil {
+		if errors.Is(err, platformmcp.ErrEndpointUnavailable) {
+			return RunOutput{}, fmt.Errorf("%w: %w", ErrDependencyUnavailable, err)
+		}
 		return RunOutput{}, err
 	}
 	defer bound.Close()
+	name, version := bound.ServerInfo()
+	info, err := json.Marshal(struct {
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	}{name, version})
+	if err != nil {
+		return RunOutput{}, err
+	}
+	if err := input.Store.RecordServerInfo(ctx, input.Owner, info); err != nil {
+		return RunOutput{}, err
+	}
 
 	if err := input.Store.Check(ctx, input.Owner); err != nil {
 		return RunOutput{}, err

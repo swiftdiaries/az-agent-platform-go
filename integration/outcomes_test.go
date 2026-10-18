@@ -38,7 +38,6 @@ func policyRunner(t *testing.T, url, class string, model agentruntime.Model) *ag
 		t.Fatal(err)
 	}
 	server := config["mcp_servers"].([]any)[0].(map[string]any)
-	server["endpoint"] = url
 	server["policies"] = map[string]any{"lookup_destination": map[string]any{"class": class, "deduplication_evidence": "fixture verifies same X-Platform-Call-ID yields one mutation"}}
 	server["tools"] = []any{"lookup_destination"}
 	config["journeys"] = config["journeys"].([]any)[:1]
@@ -76,7 +75,7 @@ func policyRunner(t *testing.T, url, class string, model agentruntime.Model) *ag
 	if err != nil {
 		t.Fatal(err)
 	}
-	return agentruntime.NewRunner(registry, platformmcp.NewClient(), model)
+	return agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, url))
 }
 
 func TestToolCallLostAfterEffectNoRetry(t *testing.T) {
@@ -112,7 +111,7 @@ func TestToolCallLostAfterEffectNoRetry(t *testing.T) {
 	})
 	p := platform.New(policyRunner(t, backend.URL, "effectful", model), journal.New(pool))
 	defer p.Close()
-	c := platform.Command{ThreadID: "effect-thread", RunID: "effect-run", CommunicationID: "effect-comm", Principal: "alice", Text: "change"}
+	c := platform.Command{ThreadID: "effect-thread", RunID: "effect-run", CommunicationID: "effect-comm", Principal: "alice", Tenant: testTenant, Text: "change"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +125,7 @@ func TestToolCallLostAfterEffectNoRetry(t *testing.T) {
 	if i == nil {
 		t.Fatal("missing approval")
 	}
-	reply := platform.Command{ThreadID: c.ThreadID, RunID: "approve", CommunicationID: "approve", Principal: "alice", InteractionID: i.ID, ReplyKind: "approval", ReplyJSON: fmt.Sprintf(`{"decision":"approve","binding":%q}`, i.Call.Binding)}
+	reply := platform.Command{ThreadID: c.ThreadID, RunID: "approve", CommunicationID: "approve", Principal: "alice", Tenant: testTenant, InteractionID: i.ID, ReplyKind: "approval", ReplyJSON: fmt.Sprintf(`{"decision":"approve","binding":%q}`, i.Call.Binding)}
 	if _, err := p.Submit(t.Context(), reply, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +271,7 @@ func TestToolCallVerifiedRetryStableID(t *testing.T) {
 			})
 			p := platform.New(policyRunner(t, backend.URL, class, model), journal.New(pool))
 			defer p.Close()
-			c := platform.Command{ThreadID: "retry-thread", RunID: "retry", CommunicationID: "retry", Principal: "alice", Text: "go"}
+			c := platform.Command{ThreadID: "retry-thread", RunID: "retry", CommunicationID: "retry", Principal: "alice", Tenant: testTenant, Text: "go"}
 			if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 				t.Fatal(err)
 			}
@@ -283,7 +282,7 @@ func TestToolCallVerifiedRetryStableID(t *testing.T) {
 				if i == nil {
 					t.Fatal("missing approval")
 				}
-				reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: i.ID, ReplyKind: "approval", ReplyJSON: fmt.Sprintf(`{"decision":"approve","binding":%q}`, i.Call.Binding)}
+				reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", Tenant: testTenant, InteractionID: i.ID, ReplyKind: "approval", ReplyJSON: fmt.Sprintf(`{"decision":"approve","binding":%q}`, i.Call.Binding)}
 				if _, err := p.Submit(t.Context(), reply, credential.Credential{}); err != nil {
 					t.Fatal(err)
 				}
@@ -308,7 +307,6 @@ func TestToolCallPredispatchPersistenceFailure(t *testing.T) {
 	mock := newMockMCP(t)
 	backend := httptest.NewServer(mock)
 	defer backend.Close()
-	t.Setenv("TEST_JAVA_MCP_ENDPOINT", backend.URL)
 	registry, err := definitions.Load("../configs/journeys.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -318,9 +316,9 @@ func TestToolCallPredispatchPersistenceFailure(t *testing.T) {
 	}
 	p := platform.New(agentruntime.NewRunner(registry, platformmcp.NewClient(), modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "pre", Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
-	})), journal.New(pool))
+	}), testTenancy(t, backend.URL)), journal.New(pool))
 	defer p.Close()
-	c := platform.Command{ThreadID: "pre", RunID: "pre", CommunicationID: "pre", Principal: "alice", Text: "go"}
+	c := platform.Command{ThreadID: "pre", RunID: "pre", CommunicationID: "pre", Principal: "alice", Tenant: testTenant, Text: "go"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +348,7 @@ func TestToolCallCompletionPersistenceFailurePublishesUnknownBeforeRunFailure(t 
 	}))
 	p := platform.New(runner, journal.New(pool))
 	defer p.Close()
-	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, p, pool, []string{"Authorization", "Cookie"}))
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": testPrincipal}, p, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	response := postJSONAGUI(t, api.URL, `{"threadId":"completion-thread","runId":"completion-run","messages":[{"id":"user","role":"user","content":"go"}],"tools":[],"context":[],"state":{},"forwardedProps":{}}`, "token", "", "")
 	unknownAt := strings.Index(response.Body, "tool.outcome_unknown")
@@ -362,7 +360,7 @@ func TestToolCallCompletionPersistenceFailurePublishesUnknownBeforeRunFailure(t 
 	if err := pool.QueryRow(t.Context(), "SELECT o.thread_id,o.call_id,o.name,o.outcome,a.outcome,r.state FROM agent_operations o JOIN agent_attempts a ON a.call_id=o.call_id JOIN agent_runs r ON r.id=o.run_id").Scan(&thread, &productCallID, &toolName, &operation, &attempt, &run); err != nil || productCallID == providerCallID || operation != "outcome_unknown" || attempt != "outcome_unknown" || run != "failed" {
 		t.Fatal(thread, productCallID, toolName, operation, attempt, run, err)
 	}
-	snapshot, err := journal.New(pool).Snapshot(t.Context(), thread, "alice")
+	snapshot, err := journal.New(pool).Snapshot(t.Context(), thread, testPrincipal)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +404,7 @@ func TestToolCallZeroOneMultipleAndDelayed(t *testing.T) {
 			})
 			p := platform.New(policyRunner(t, backend.URL, "read_only", model), journal.New(pool))
 			defer p.Close()
-			c := platform.Command{ThreadID: "multi", RunID: "multi", CommunicationID: "multi", Principal: "alice", Text: "go"}
+			c := platform.Command{ThreadID: "multi", RunID: "multi", CommunicationID: "multi", Principal: "alice", Tenant: testTenant, Text: "go"}
 			if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 				t.Fatal(err)
 			}
@@ -451,7 +449,7 @@ func TestApprovalFreshCredentialsAndRejectedReplies(t *testing.T) {
 				return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "write", Name: "lookup_destination", Arguments: json.RawMessage(`{"amount":9007199254740993}`)}}, nil
 			})), journal.New(pool))
 			defer p.Close()
-			c := platform.Command{ThreadID: "approval", RunID: "approval", CommunicationID: "approval", Principal: "alice", Text: "change"}
+			c := platform.Command{ThreadID: "approval", RunID: "approval", CommunicationID: "approval", Principal: "alice", Tenant: testTenant, Text: "change"}
 			if _, err := p.Submit(t.Context(), c, liveCredential("old-live-auth")); err != nil {
 				t.Fatal(err)
 			}
@@ -460,7 +458,7 @@ func TestApprovalFreshCredentialsAndRejectedReplies(t *testing.T) {
 			if i == nil {
 				t.Fatal("missing approval")
 			}
-			reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: i.ID, ReplyKind: "approval"}
+			reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", Tenant: testTenant, InteractionID: i.ID, ReplyKind: "approval"}
 			for _, bad := range []string{`{"decision":"approve","binding":"forged"}`, `{"answers":{"free":{"custom":"approve"}}}`, fmt.Sprintf(`{"decision":"approve","binding":%q,"arguments":{}}`, i.Call.Binding)} {
 				reply.ReplyJSON = bad
 				if _, err := p.Submit(t.Context(), reply, credential.Credential{}); !errors.Is(err, journal.ErrState) {
@@ -557,14 +555,14 @@ func TestBusinessErrorChangedActionRequiresNewApproval(t *testing.T) {
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: fmt.Sprintf("call-%d", round), Name: "lookup_destination", Arguments: json.RawMessage(fmt.Sprintf(`{"attempt":%d}`, round))}}, nil
 	})), journal.New(pool))
 	defer p.Close()
-	c := platform.Command{ThreadID: "repair", RunID: "repair", CommunicationID: "repair", Principal: "alice", Text: "go"}
+	c := platform.Command{ThreadID: "repair", RunID: "repair", CommunicationID: "repair", Principal: "alice", Tenant: testTenant, Text: "go"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	s := awaitState(t, p, c.ThreadID, c.RunID, journal.RunAwaitingInput)
 	i := s.Runs[0].Interaction
 	approve := func(id string, wait *journal.Interaction) platform.Command {
-		return platform.Command{ThreadID: c.ThreadID, RunID: id, CommunicationID: id, Principal: "alice", InteractionID: wait.ID, ReplyKind: "approval", ReplyJSON: fmt.Sprintf(`{"decision":"approve","binding":%q}`, wait.Call.Binding)}
+		return platform.Command{ThreadID: c.ThreadID, RunID: id, CommunicationID: id, Principal: "alice", Tenant: testTenant, InteractionID: wait.ID, ReplyKind: "approval", ReplyJSON: fmt.Sprintf(`{"decision":"approve","binding":%q}`, wait.Call.Binding)}
 	}
 	reply := approve("reply1", i)
 	if _, err := p.Submit(t.Context(), reply, credential.Credential{}); err != nil {
@@ -624,7 +622,7 @@ func TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted(t *testing.T) {
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: providerCallID, Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
 	})), journal.New(ownerPool))
 	defer p.Close()
-	c := platform.Command{ThreadID: "loss", RunID: "loss", CommunicationID: "loss", Principal: "alice", Text: "go"}
+	c := platform.Command{ThreadID: "loss", RunID: "loss", CommunicationID: "loss", Principal: testPrincipal, Tenant: testTenant, Text: "go"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -658,7 +656,7 @@ func TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted(t *testing.T) {
 	if unknownEvent.Type != "tool.outcome_unknown" || unknownEvent.CallID != productCallID || unknownEvent.ToolName != toolName || interruptedEvent.Type != "run.interrupted" {
 		t.Fatal("owner-loss event order", unknownEvent, interruptedEvent)
 	}
-	if _, err := pool.Exec(t.Context(), "INSERT INTO chat_threads(principal,external_id,id) VALUES('alice','external-loss-thread','loss'); INSERT INTO chat_runs(thread_id,external_id,id,communication_id) VALUES('loss','external-loss-run','loss','loss')"); err != nil {
+	if _, err := pool.Exec(t.Context(), "INSERT INTO chat_threads(principal,external_id,id) VALUES('tenant-a/alice','external-loss-thread','loss'); INSERT INTO chat_runs(thread_id,external_id,id,communication_id) VALUES('loss','external-loss-run','loss','loss')"); err != nil {
 		t.Fatal(err)
 	}
 	observer := platform.New(fixtureRunner(t, modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
@@ -666,7 +664,7 @@ func TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted(t *testing.T) {
 		return agentruntime.ModelResponse{}, nil
 	})), journal.New(pool))
 	defer observer.Close()
-	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, observer, pool, []string{"Authorization", "Cookie"}))
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": testPrincipal}, observer, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	for _, cursor := range []int64{0, snapshot.Watermark} {
 		req, _ := http.NewRequest(http.MethodGet, api.URL+"?threadId=external-loss-thread&runId=external-loss-run", nil)
@@ -697,7 +695,7 @@ func TestToolCallPartialProviderFailureIsNotVisible(t *testing.T) {
 		return agentruntime.ModelResponse{Text: "private partial output", ToolCall: &agentruntime.ToolCall{CallID: "partial", Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, errors.New("private stream failure")
 	})), journal.New(pool))
 	defer p.Close()
-	c := platform.Command{ThreadID: "partial", RunID: "partial", CommunicationID: "partial", Principal: "alice", Text: "go"}
+	c := platform.Command{ThreadID: "partial", RunID: "partial", CommunicationID: "partial", Principal: "alice", Tenant: testTenant, Text: "go"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}

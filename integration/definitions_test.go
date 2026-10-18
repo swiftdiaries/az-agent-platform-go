@@ -34,7 +34,7 @@ func writeDefinitionBundle(t *testing.T, root, prompt string) string {
 	if err := os.WriteFile(filepath.Join(root, "skills/planner/guide.md"), []byte("Prefer direct routes.\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	config := `{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["lookup"],"policies":{"lookup":{"class":"read_only"}}}],"skill_packages":[{"name":"planner","root":"skills/planner","supporting_files":["guide.md"],"allow_supporting_files":true}],"journeys":[{"id":"planner","description":"Plan a trip","system_prompt":"prompts/planner.md","mcp":{"server":"s","tools":["lookup"]},"skills":["planner"]}]}`
+	config := `{"mcp_servers":[{"id":"s","tools":["lookup"],"policies":{"lookup":{"class":"read_only"}}}],"skill_packages":[{"name":"planner","root":"skills/planner","supporting_files":["guide.md"],"allow_supporting_files":true}],"journeys":[{"id":"planner","description":"Plan a trip","system_prompt":"prompts/planner.md","mcp":{"server":"s","tools":["lookup"]},"skills":["planner"]}]}`
 	path := filepath.Join(root, "journeys.yaml")
 	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
 		t.Fatal(err)
@@ -122,7 +122,7 @@ func TestCrossJourneyActivationCannotMutateCurrentOrPin(t *testing.T) {
 	oldRoot, currentRoot, secondJourneyRoot := t.TempDir(), t.TempDir(), t.TempDir()
 	oldPath := writeDefinitionBundle(t, oldRoot, "old prompt\n")
 	currentPath := writeDefinitionBundle(t, currentRoot, "current prompt\n")
-	secondJourneyPath := writeTwoJourneyBundle(t, secondJourneyRoot, "http://example")
+	secondJourneyPath := writeTwoJourneyBundle(t, secondJourneyRoot)
 	oldRegistry, err := definitions.Load(oldPath)
 	if err != nil {
 		t.Fatal(err)
@@ -182,7 +182,7 @@ func TestCrossJourneyActivationCannotMutateCurrentOrPin(t *testing.T) {
 
 func TestDeclarativeJourneyRouting(t *testing.T) {
 	root := t.TempDir()
-	path := writeTwoJourneyBundle(t, root, "http://example")
+	path := writeTwoJourneyBundle(t, root)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -197,7 +197,7 @@ func TestDeclarativeJourneyRouting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), nil)
+	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), nil, agentruntime.Tenancy{}) // Binding only: no tenancy needed
 	store := journal.New(database(t))
 	bind := func(thread, text, target, want string) {
 		command := journal.Command{ThreadID: thread, RunID: thread, CommunicationID: thread, Principal: "alice", Text: text, TargetJourney: target}
@@ -400,7 +400,7 @@ func TestDefinitionRejectsAggregateSkillLimits(t *testing.T) {
 				SkillPackages []definitions.SkillDeclaration `json:"skill_packages"`
 				Journeys      []definitions.Journey          `json:"journeys"`
 			}{
-				MCPServers:    []definitions.MCPServer{{ID: "s", Endpoint: "http://example", Tools: []string{"lookup"}}},
+				MCPServers:    []definitions.MCPServer{{ID: "s", Tools: []string{"lookup"}}},
 				SkillPackages: []definitions.SkillDeclaration{{Name: "planner", Root: "skills/planner", SupportingFiles: files, AllowSupportingFiles: true}},
 				Journeys:      []definitions.Journey{{ID: "planner", Description: "Plan", SystemPrompt: "prompt.md", MCP: definitions.MCPBinding{Server: "s", Tools: []string{"lookup"}}, SkillNames: []string{"planner"}}},
 			})

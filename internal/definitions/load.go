@@ -24,7 +24,6 @@ const (
 
 type MCPServer struct {
 	ID           string                `json:"id"`
-	Endpoint     string                `json:"endpoint"`
 	CallIDHeader string                `json:"call_id_header"`
 	Tools        []string              `json:"tools"`
 	Policies     map[string]ToolPolicy `json:"policies,omitempty"`
@@ -154,17 +153,12 @@ func loadOne(path string) (*Registry, error) {
 
 	registry := &Registry{servers: make(map[string]MCPServer), journeys: make(map[string]Journey), versions: make(map[string]Journey), versionServers: make(map[string]MCPServer), canonical: make(map[string][]byte)}
 	for _, server := range raw.MCPServers {
-		if server.ID == "" || server.Endpoint == "" {
-			return nil, fmt.Errorf("MCP server id and endpoint are required")
+		if server.ID == "" {
+			return nil, fmt.Errorf("MCP server id is required")
 		}
 		if _, exists := registry.servers[server.ID]; exists {
 			return nil, fmt.Errorf("duplicate MCP server %q", server.ID)
 		}
-		endpoint, err := expandEndpoint(server.Endpoint)
-		if err != nil {
-			return nil, fmt.Errorf("MCP server %q: %w", server.ID, err)
-		}
-		server.Endpoint = endpoint
 		if server.CallIDHeader != "" {
 			server.CallIDHeader = textproto.CanonicalMIMEHeaderKey(server.CallIDHeader)
 			if server.CallIDHeader == "" {
@@ -313,21 +307,6 @@ func loadOne(path string) (*Registry, error) {
 		return nil, fmt.Errorf("at least one journey is required")
 	}
 	return registry, nil
-}
-
-func expandEndpoint(value string) (string, error) {
-	if !strings.HasPrefix(value, "${") || !strings.HasSuffix(value, "}") {
-		return value, nil
-	}
-	name := strings.TrimSuffix(strings.TrimPrefix(value, "${"), "}")
-	if name == "" {
-		return "", fmt.Errorf("empty endpoint environment variable")
-	}
-	resolved, ok := os.LookupEnv(name)
-	if !ok || resolved == "" {
-		return "", fmt.Errorf("endpoint environment variable %s is unset", name)
-	}
-	return resolved, nil
 }
 
 func confinedPath(root, relative string) (string, error) {

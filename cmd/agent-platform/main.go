@@ -24,7 +24,9 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/provider/litellm"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/service"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/settings"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/telemetry"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/tenantdir"
 )
 
 const (
@@ -36,6 +38,12 @@ const (
 	envModelProvider = "AZ_AGENT_MODEL_PROVIDER"
 	// envCredentialHeaders optionally names the inbound headers forwarded to MCP.
 	envCredentialHeaders = "AGENT_PLATFORM_CREDENTIAL_HEADERS"
+	// envTenantDirectory is the path of the tenant directory YAML file.
+	envTenantDirectory = "AGENT_PLATFORM_TENANT_DIRECTORY"
+	// envMCPEndpoints is the MCP endpoint allowlist, as id=url,id2=url2.
+	envMCPEndpoints = "AGENT_PLATFORM_MCP_ENDPOINTS"
+	// envSettings is the path of the settings YAML file.
+	envSettings = "AGENT_PLATFORM_SETTINGS"
 )
 
 type config struct {
@@ -51,6 +59,10 @@ type config struct {
 	litellm           litellm.Config
 	telemetry         telemetry.Config
 	credentialHeaders []string
+
+	tenantDirectoryPath string
+	settingsPath        string
+	mcpEndpoints        tenantdir.Allowlist
 }
 
 func main() {
@@ -88,6 +100,10 @@ func run(ctx context.Context, lookup func(string) string) error {
 	if err != nil {
 		return errors.New("invalid definitions")
 	}
+	directory, endpoints, settingsSource, err := loadTenancy(config)
+	if err != nil {
+		return err
+	}
 	pool, err := pgxpool.New(ctx, config.databaseURL)
 	if err != nil {
 		return errors.New("database unavailable")
@@ -110,6 +126,7 @@ func run(ctx context.Context, lookup func(string) string) error {
 	app, err := service.New(service.Dependencies{
 		Pool: pool, Registry: registry, Authenticator: authenticator, Model: model,
 		CredentialHeaders: config.credentialHeaders,
+		Directory:         directory, Endpoints: endpoints, Settings: settingsSource,
 	})
 	if err != nil {
 		return errors.New("service initialization failed")
@@ -137,6 +154,20 @@ func run(ctx context.Context, lookup func(string) string) error {
 	case <-serveErr:
 		return errors.New("service stopped")
 	}
+}
+
+// loadTenancy loads the tenant directory and settings files named by config.
+// Errors are fixed messages: file contents and paths are never echoed.
+func loadTenancy(config config) (tenantdir.Directory, tenantdir.Allowlist, settings.Source, error) {
+	directory, err := tenantdir.LoadStatic(config.tenantDirectoryPath)
+	if err != nil {
+		return nil, tenantdir.Allowlist{}, nil, errors.New("invalid tenant directory")
+	}
+	source, err := settings.LoadStatic(config.settingsPath)
+	if err != nil {
+		return nil, tenantdir.Allowlist{}, nil, errors.New("invalid settings")
+	}
+	return directory, config.mcpEndpoints, source, nil
 }
 
 func newModel(config config) (runtime.Model, error) {
@@ -223,7 +254,24 @@ func loadConfig(lookup func(string) string) (config, error) {
 	if err != nil {
 		return config{}, errors.New("invalid credential header configuration")
 	}
+	tenantDirectoryPath, err := require(envTenantDirectory)
+	if err != nil {
+		return config{}, err
+	}
+	endpointSpec, err := require(envMCPEndpoints)
+	if err != nil {
+		return config{}, err
+	}
+	mcpEndpoints, err := tenantdir.ParseAllowlist(endpointSpec)
+	if err != nil || len(mcpEndpoints.IDs()) == 0 {
+		return config{}, errors.New("invalid MCP endpoint configuration")
+	}
+	settingsPath, err := require(envSettings)
+	if err != nil {
+		return config{}, err
+	}
 	return config{
+		tenantDirectoryPath: tenantDirectoryPath, mcpEndpoints: mcpEndpoints, settingsPath: settingsPath,
 		databaseURL: databaseURL, definitionPath: definitionPath,
 		retainedConfigs: splitValues(lookup(envRetained)), port: port, grace: grace, keycloak: keycloak,
 		foundryEndpoint: foundryEndpoint, foundryDeployment: foundryDeployment,

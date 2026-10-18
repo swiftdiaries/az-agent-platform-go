@@ -22,21 +22,81 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/service"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/settings"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/tenantdir"
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
+
+const (
+	testTenant     = "tenant-a"
+	testPrincipal  = "tenant-a/alice" // StaticBearerTokens tenant form; this is the chat principal
+	testEndpointID = "test-mcp"
+)
+
+// acceptanceTokens maps the acceptance bearer tokens to tenant-form principals.
+var acceptanceTokens = chat.StaticBearerTokens{"token": testPrincipal, "token-b": "tenant-b/bob", "token-c": "tenant-c/carol"}
+
+// testTenancy routes testTenant to one allowlisted endpoint at url with default settings.
+func testTenancy(t *testing.T, url string) agentruntime.Tenancy {
+	t.Helper()
+	allow, err := tenantdir.NewAllowlist(map[string]string{testEndpointID: url})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := settings.NewMutable(settings.Document{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return agentruntime.Tenancy{
+		Directory: tenantdir.NewMutable(map[string]tenantdir.Entry{testTenant: {ProductVersion: "vN", EndpointID: testEndpointID}}),
+		Endpoints: allow,
+		Settings:  source,
+	}
+}
+
+// testEndpoint is the allowlisted endpoint (id testEndpointID) for url, the only
+// way a test can obtain a valid tenantdir.Endpoint for a direct Bind.
+func testEndpoint(t *testing.T, url string) tenantdir.Endpoint {
+	t.Helper()
+	allow, err := tenantdir.NewAllowlist(map[string]string{testEndpointID: url})
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint, err := allow.Endpoint(testEndpointID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return endpoint
+}
+
+// scoped resolves in's tenancy through runner.Scope (recording it on the run)
+// and returns the input ready for Run. Tenant defaults to testTenant.
+func scoped(t *testing.T, runner *agentruntime.Runner, in agentruntime.RunInput) agentruntime.RunInput {
+	t.Helper()
+	if in.Tenant == "" {
+		in.Tenant = testTenant
+	}
+	scope, err := runner.Scope(t.Context(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.Endpoint, in.Settings = scope.Endpoint, scope.Settings
+	return in
+}
 
 type acceptanceReplica struct {
 	app *service.Service
 	url string
 }
 
-func startAcceptanceReplica(t *testing.T, pool *pgxpool.Pool, registry *definitions.Registry, model agentruntime.Model) acceptanceReplica {
+func startAcceptanceReplica(t *testing.T, pool *pgxpool.Pool, registry *definitions.Registry, model agentruntime.Model, tenancy agentruntime.Tenancy) acceptanceReplica {
 	t.Helper()
 	app, err := service.New(service.Dependencies{
-		Pool: pool, Registry: registry, Authenticator: chat.StaticBearerTokens{"token": "alice"}, Model: model,
+		Pool: pool, Registry: registry, Authenticator: acceptanceTokens, Model: model,
 		CredentialHeaders: acceptanceCredentialHeaders,
+		Directory:         tenancy.Directory, Endpoints: tenancy.Endpoints, Settings: tenancy.Settings,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -107,8 +167,14 @@ func acceptanceReconnect(t *testing.T, endpoint, thread, run string) *http.Respo
 
 func acceptanceThread(t *testing.T, pool *pgxpool.Pool, external string) string {
 	t.Helper()
+	return acceptanceThreadFor(t, pool, testPrincipal, external)
+}
+
+// acceptanceThreadFor is acceptanceThread for an arbitrary chat principal.
+func acceptanceThreadFor(t *testing.T, pool *pgxpool.Pool, principal, external string) string {
+	t.Helper()
 	var thread string
-	if err := pool.QueryRow(t.Context(), "SELECT id FROM chat_threads WHERE principal='alice' AND external_id=$1", external).Scan(&thread); err != nil {
+	if err := pool.QueryRow(t.Context(), "SELECT id FROM chat_threads WHERE principal=$2 AND external_id=$1", external, principal).Scan(&thread); err != nil {
 		t.Fatal(err)
 	}
 	return thread
@@ -116,11 +182,11 @@ func acceptanceThread(t *testing.T, pool *pgxpool.Pool, external string) string 
 
 // threeReplicas starts replicas A, B and C as separate in-process Service
 // instances sharing one database, registry and model.
-func threeReplicas(t *testing.T, pool *pgxpool.Pool, registry *definitions.Registry, model agentruntime.Model) (a, b, c acceptanceReplica) {
+func threeReplicas(t *testing.T, pool *pgxpool.Pool, registry *definitions.Registry, model agentruntime.Model, tenancy agentruntime.Tenancy) (a, b, c acceptanceReplica) {
 	t.Helper()
-	a = startAcceptanceReplica(t, pool, registry, model)
-	b = startAcceptanceReplica(t, pool, registry, model)
-	c = startAcceptanceReplica(t, pool, registry, model)
+	a = startAcceptanceReplica(t, pool, registry, model, tenancy)
+	b = startAcceptanceReplica(t, pool, registry, model, tenancy)
+	c = startAcceptanceReplica(t, pool, registry, model, tenancy)
 	return a, b, c
 }
 

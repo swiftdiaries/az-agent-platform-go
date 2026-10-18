@@ -15,6 +15,8 @@ import (
 	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/settings"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/tenantdir"
 )
 
 type Dependencies struct {
@@ -26,6 +28,16 @@ type Dependencies struct {
 	// AGENT_PLATFORM_CREDENTIAL_HEADERS) that Chat copies into a run's
 	// Credential. Empty means no credential is forwarded.
 	CredentialHeaders []string
+	// Directory maps a tenant to a product version and MCP endpoint ID
+	// (AGENT_PLATFORM_TENANT_DIRECTORY). Required.
+	Directory tenantdir.Directory
+	// Endpoints is the deploy-time allowlist from endpoint ID to MCP URL
+	// (AGENT_PLATFORM_MCP_ENDPOINTS); it is the only source of MCP URLs. An
+	// empty allowlist makes every run dependency_unavailable.
+	Endpoints tenantdir.Allowlist
+	// Settings resolves per-tenant and per-user settings
+	// (AGENT_PLATFORM_SETTINGS). Required.
+	Settings settings.Source
 }
 
 type Service struct {
@@ -37,10 +49,10 @@ type Service struct {
 }
 
 func New(deps Dependencies) (*Service, error) {
-	if deps.Pool == nil || deps.Registry == nil || deps.Authenticator == nil || deps.Model == nil {
+	if deps.Pool == nil || deps.Registry == nil || deps.Authenticator == nil || deps.Model == nil || deps.Directory == nil || deps.Settings == nil {
 		return nil, errors.New("service dependencies are required")
 	}
-	runner := agentruntime.NewRunner(deps.Registry, platformmcp.NewClient(), deps.Model)
+	runner := agentruntime.NewRunner(deps.Registry, platformmcp.NewClient(), deps.Model, agentruntime.Tenancy{Directory: deps.Directory, Endpoints: deps.Endpoints, Settings: deps.Settings})
 	service := &Service{platform: platform.New(runner, journal.New(deps.Pool))}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })

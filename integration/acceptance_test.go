@@ -22,14 +22,13 @@ import (
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
-func acceptanceRegistry(t *testing.T, endpoint, policy string) *definitions.Registry {
+func acceptanceRegistry(t *testing.T, policy string) *definitions.Registry {
 	t.Helper()
 	path := writeDefinitionBundle(t, t.TempDir(), "prompt\n")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	data = bytes.Replace(data, []byte("http://example"), []byte(endpoint), 1)
 	data = bytes.Replace(data, []byte(`"class":"read_only"`), []byte(`"class":"`+policy+`"`), 1)
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
@@ -79,8 +78,8 @@ func TestAcceptanceThreeServiceHTTPSteeringReconnectAndForcedDrain(t *testing.T)
 		}
 		return agentruntime.ModelResponse{Text: "corrected Osaka"}, nil
 	})
-	registry := acceptanceRegistry(t, mcpAPI.URL, "read_only")
-	a, b, c := threeReplicas(t, pool, registry, model)
+	registry := acceptanceRegistry(t, "read_only")
+	a, b, c := threeReplicas(t, pool, registry, model, testTenancy(t, mcpAPI.URL))
 
 	first := acceptancePost(t, a.url, aguitypes.RunAgentInput{ThreadID: "steer-thread", RunID: "run-a", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan"}}})
 	defer first.Body.Close()
@@ -103,7 +102,7 @@ func TestAcceptanceThreeServiceHTTPSteeringReconnectAndForcedDrain(t *testing.T)
 		t.Fatalf("reconnect = %d", reconnect.StatusCode)
 	}
 	thread := acceptanceThread(t, pool, "steer-thread")
-	snapshot, err := journal.New(pool).Snapshot(t.Context(), thread, "alice")
+	snapshot, err := journal.New(pool).Snapshot(t.Context(), thread, testPrincipal)
 	if err != nil || len(snapshot.Runs) != 1 || snapshot.Runs[0].PendingCommands != 1 {
 		t.Fatalf("durable steering receipt = %#v, %v", snapshot, err)
 	}
@@ -187,8 +186,8 @@ func TestAcceptanceThreeServiceHTTPApprovalAndReconnect(t *testing.T) {
 		}
 		return agentruntime.ModelResponse{Text: "approved and complete"}, nil
 	})
-	registry := acceptanceRegistry(t, mcpAPI.URL, "effectful")
-	a, b, c := threeReplicas(t, pool, registry, model)
+	registry := acceptanceRegistry(t, "effectful")
+	a, b, c := threeReplicas(t, pool, registry, model, testTenancy(t, mcpAPI.URL))
 
 	wait := acceptancePost(t, a.url, aguitypes.RunAgentInput{ThreadID: "approval-thread", RunID: "approval-run", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "change"}}})
 	defer wait.Body.Close()
@@ -203,7 +202,7 @@ func TestAcceptanceThreeServiceHTTPApprovalAndReconnect(t *testing.T) {
 		t.Fatalf("missing approval request: %s", waitBody)
 	}
 	thread := acceptanceThread(t, pool, "approval-thread")
-	snapshot, err := journal.New(pool).Snapshot(t.Context(), thread, "alice")
+	snapshot, err := journal.New(pool).Snapshot(t.Context(), thread, testPrincipal)
 	if err != nil || len(snapshot.Runs) != 1 || snapshot.Runs[0].Interaction == nil {
 		t.Fatalf("durable approval wait = %#v, %v", snapshot, err)
 	}

@@ -65,7 +65,7 @@ func (s *Store) Start(ctx context.Context, o Owner, journey, digest string) (jso
 // calls never occur in this transaction. Admission shares this conversation lock.
 func (s *Store) Finish(ctx context.Context, o Owner, state RunState, history json.RawMessage, answer, callID, tool string) error {
 	c := o.Command
-	if state != RunCompleted && state != RunFailed && state != RunAuthRequired {
+	if state != RunCompleted && state != RunFailed && state != RunAuthRequired && state != RunDependencyUnavailable {
 		return ErrState
 	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {

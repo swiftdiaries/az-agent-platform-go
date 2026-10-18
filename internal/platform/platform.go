@@ -34,14 +34,16 @@ const (
 	RunCompleted     = journal.RunCompleted
 	RunFailed        = journal.RunFailed
 	RunAuthRequired  = journal.RunAuthRequired
+
+	RunDependencyUnavailable = journal.RunDependencyUnavailable
 )
 
 type Command struct {
-	ThreadID, RunID, CommunicationID, Principal, Text, TargetJourney, InteractionID, ReplyKind, ReplyJSON string
+	ThreadID, RunID, CommunicationID, Principal, Tenant, Text, TargetJourney, InteractionID, ReplyKind, ReplyJSON string
 }
 
 func (c Command) durable() journal.Command {
-	return journal.Command{ThreadID: c.ThreadID, RunID: c.RunID, CommunicationID: c.CommunicationID, Principal: c.Principal, Text: c.Text, TargetJourney: c.TargetJourney, InteractionID: c.InteractionID, ReplyKind: c.ReplyKind, ReplyJSON: c.ReplyJSON}
+	return journal.Command{ThreadID: c.ThreadID, RunID: c.RunID, CommunicationID: c.CommunicationID, Principal: c.Principal, Tenant: c.Tenant, Text: c.Text, TargetJourney: c.TargetJourney, InteractionID: c.InteractionID, ReplyKind: c.ReplyKind, ReplyJSON: c.ReplyJSON}
 }
 
 type Receipt = journal.Receipt
@@ -194,7 +196,7 @@ func (p *Platform) Submit(ctx context.Context, c Command, cred credential.Creden
 			defer cancel()
 			stop := context.AfterFunc(p.ctx, cancel)
 			defer stop()
-			p.execute(runCtx, owner, c, agentruntime.RunInput{ThreadID: c.ThreadID, RunID: c.RunID, Principal: c.Principal, Text: c.Text, TargetJourney: target, Credential: cred})
+			p.execute(runCtx, owner, c, agentruntime.RunInput{ThreadID: c.ThreadID, RunID: c.RunID, Principal: c.Principal, Tenant: c.Tenant, Text: c.Text, TargetJourney: target, Credential: cred})
 		}()
 	}
 	return receipt, nil
@@ -226,7 +228,14 @@ func (p *Platform) execute(ctx context.Context, owner journal.Owner, c Command, 
 	}()
 	in.Store = p.store
 	in.Owner = owner
-	journey, digest, err := p.runner.Binding(ctx, in)
+	var scope agentruntime.RunScope
+	scope, err = p.runner.Scope(ctx, in)
+	var journey, digest string
+	if err == nil {
+		// Resolved once per run; the ErrPending follow-up loop reuses it.
+		in.Endpoint, in.Settings = scope.Endpoint, scope.Settings
+		journey, digest, err = p.runner.Binding(ctx, in)
+	}
 	if err == nil {
 		in.History, err = p.store.Start(ctx, owner, journey, digest)
 		in.TargetJourney = journey
@@ -246,7 +255,10 @@ func (p *Platform) execute(ctx context.Context, owner journal.Owner, c Command, 
 		state := RunCompleted
 		if err != nil {
 			state = RunFailed
-			if errors.Is(err, platformmcp.ErrAuthRequired) {
+			switch {
+			case errors.Is(err, agentruntime.ErrDependencyUnavailable):
+				state = RunDependencyUnavailable
+			case errors.Is(err, platformmcp.ErrAuthRequired):
 				state = RunAuthRequired
 			}
 		}

@@ -59,7 +59,7 @@ func writeToolNameConfig(t *testing.T, catalog, allowlist []string) string {
 	if err := os.WriteFile(filepath.Join(root, "prompt.md"), []byte("prompt\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	data := fmt.Sprintf(`{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":[%s]}],"journeys":[{"id":"j","description":"test","system_prompt":"prompt.md","mcp":{"server":"s","tools":[%s]}}]}`, quoteTools(catalog), quoteTools(allowlist))
+	data := fmt.Sprintf(`{"mcp_servers":[{"id":"s","tools":[%s]}],"journeys":[{"id":"j","description":"test","system_prompt":"prompt.md","mcp":{"server":"s","tools":[%s]}}]}`, quoteTools(catalog), quoteTools(allowlist))
 	path := filepath.Join(root, "journeys.json")
 	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 		t.Fatal(err)

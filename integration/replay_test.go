@@ -32,12 +32,11 @@ func fixtureRunner(t *testing.T, model agentruntime.Model) *agentruntime.Runner 
 	})
 	endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
 	t.Cleanup(endpoint.Close)
-	t.Setenv("TEST_JAVA_MCP_ENDPOINT", endpoint.URL)
 	registry, err := definitions.Load(filepath.Join("..", "configs", "journeys.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return agentruntime.NewRunner(registry, platformmcp.NewClient(), model)
+	return agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, endpoint.URL))
 }
 
 // A request-scoped run context would cancel the model here. A process-local ID map
@@ -65,7 +64,7 @@ func TestPersistenceDisconnectAndReplacement(t *testing.T) {
 	runner := fixtureRunner(t, model)
 	service := platform.New(runner, journal.New(pool))
 	t.Cleanup(service.Close)
-	auth := chat.StaticBearerTokens{"token": "alice", "other": "bob"}
+	auth := chat.StaticBearerTokens{"token": testPrincipal, "other": "tenant-a/bob"}
 	api := httptest.NewServer(chat.NewHandler(auth, service, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	body := aguitypes.RunAgentInput{ThreadID: "external-email@example.test", RunID: "external-1", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "remember Kyoto"}}}
@@ -86,10 +85,10 @@ func TestPersistenceDisconnectAndReplacement(t *testing.T) {
 	response.Body.Close()
 	close(release)
 	var thread string
-	if err := pool.QueryRow(context.Background(), "SELECT id FROM chat_threads WHERE principal='alice'").Scan(&thread); err != nil {
+	if err := pool.QueryRow(context.Background(), "SELECT id FROM chat_threads WHERE principal='tenant-a/alice'").Scan(&thread); err != nil {
 		t.Fatal(err)
 	}
-	waitCompleted(t, service, thread, "alice")
+	waitCompleted(t, service, thread, testPrincipal)
 	service.Close()
 	api.Close()
 	replacement := platform.New(fixtureRunner(t, model), journal.New(pool))
@@ -311,7 +310,7 @@ func TestReplayHTTPReconnectCursor(t *testing.T) {
 	}))
 	p := platform.New(runner, journal.New(pool))
 	defer p.Close()
-	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, p, pool, []string{"Authorization", "Cookie"}))
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": testPrincipal}, p, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	input := aguitypes.RunAgentInput{ThreadID: "external", RunID: "run", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "hi"}}}
 	first := postAGUI(t, api.URL, input, "token", "", "")
@@ -322,7 +321,7 @@ func TestReplayHTTPReconnectCursor(t *testing.T) {
 	if err := pool.QueryRow(context.Background(), "SELECT id FROM chat_threads").Scan(&thread); err != nil {
 		t.Fatal(err)
 	}
-	snapshot := waitCompleted(t, p, thread, "alice")
+	snapshot := waitCompleted(t, p, thread, testPrincipal)
 	for _, cursor := range []int64{0, snapshot.Watermark, snapshot.Watermark + 20} {
 		request, _ := http.NewRequest(http.MethodGet, api.URL+"?threadId=external&runId=run", nil)
 		request.Header.Set("Authorization", "Bearer token")

@@ -169,10 +169,10 @@ func validHeaderName(header string) bool {
 	return true
 }
 
-func (a *KeycloakAuthenticator) Authenticate(request *http.Request) (string, error) {
+func (a *KeycloakAuthenticator) Authenticate(request *http.Request) (Identity, error) {
 	tokenString, err := a.token(request)
 	if err != nil || len(tokenString) > maxJWTBytes || rejectDuplicateJWTJSON(tokenString) != nil {
-		return "", errUnauthorized
+		return Identity{}, errUnauthorized
 	}
 	claims := jwt.MapClaims{}
 	_, err = a.parser.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (any, error) {
@@ -187,17 +187,17 @@ func (a *KeycloakAuthenticator) Authenticate(request *http.Request) (string, err
 		return key, nil
 	})
 	if err != nil {
-		return "", errUnauthorized
+		return Identity{}, errUnauthorized
 	}
 	user, ok := stringClaim(claims, a.userPath)
 	if !ok {
-		return "", errUnauthorized
+		return Identity{}, errUnauthorized
 	}
 	tenant, ok := stringClaim(claims, a.tenantPath)
 	if !ok {
-		return "", errUnauthorized
+		return Identity{}, errUnauthorized
 	}
-	return canonicalPrincipal(tenant, user), nil
+	return Identity{Tenant: tenant, Principal: canonicalPrincipal(tenant, user)}, nil
 }
 
 func (a *KeycloakAuthenticator) token(request *http.Request) (string, error) {

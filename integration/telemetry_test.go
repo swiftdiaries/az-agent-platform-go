@@ -89,10 +89,9 @@ func TestTelemetryMCPTraceAndCallIDAreCorrelatedWithoutContent(t *testing.T) {
 	callID := "call_opaque_01"
 	bound, err := platformmcp.NewClient().Bind(ctx, definitions.MCPServer{
 		ID:           "java-fixture",
-		Endpoint:     backend.URL,
 		Tools:        []string{"lookup_destination"},
 		CallIDHeader: "X-Platform-Call-ID",
-	}, []string{"lookup_destination"}, credential.Credential{})
+	}, testEndpoint(t, backend.URL), []string{"lookup_destination"}, credential.Credential{})
 	if err != nil {
 		t.Fatal(err)
 	}

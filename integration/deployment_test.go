@@ -8,14 +8,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"strings"
 	"testing"
 	"time"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
@@ -32,15 +29,7 @@ func TestServiceDrainRejectsNewAdmissionAndInterruptsExpiredOwner(t *testing.T) 
 	defer mcpHandler.Close()
 
 	root := t.TempDir()
-	path := writeDefinitionBundle(t, root, "prompt\n")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(strings.Replace(string(data), "http://example", mcpHandler.URL, 1)), 0600); err != nil {
-		t.Fatal(err)
-	}
-	registry, err := definitions.Load(path)
+	registry, err := definitions.Load(writeDefinitionBundle(t, root, "prompt\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,12 +42,14 @@ func TestServiceDrainRejectsNewAdmissionAndInterruptsExpiredOwner(t *testing.T) 
 		close(cancelled)
 		return agentruntime.ModelResponse{}, ctx.Err()
 	})
+	tenancy := testTenancy(t, mcpHandler.URL)
 	app, err := service.New(service.Dependencies{
 		Pool:              pool,
 		Registry:          registry,
-		Authenticator:     chat.StaticBearerTokens{"token": "alice"},
+		Authenticator:     acceptanceTokens,
 		Model:             model,
 		CredentialHeaders: []string{"Authorization"},
+		Directory:         tenancy.Directory, Endpoints: tenancy.Endpoints, Settings: tenancy.Settings,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -167,8 +158,10 @@ func TestServiceShutdownBoundsBlockedAdmissionAndClaim(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			tenancy := testTenancy(t, "http://127.0.0.1:1")
 			app, err := service.New(service.Dependencies{
-				Pool: pool, Registry: registry, Authenticator: chat.StaticBearerTokens{"token": "alice"},
+				Pool: pool, Registry: registry, Authenticator: acceptanceTokens,
+				Directory: tenancy.Directory, Endpoints: tenancy.Endpoints, Settings: tenancy.Settings,
 				Model: modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 					return agentruntime.ModelResponse{}, nil
 				}),

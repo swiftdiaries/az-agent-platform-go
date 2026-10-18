@@ -18,6 +18,7 @@ import (
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/tenantdir"
 )
 
 type Client struct{}
@@ -25,6 +26,10 @@ type Client struct{}
 var ErrBusinessRejected = errors.New("MCP business rejection")
 
 var ErrAuthRequired = errors.New("MCP authentication required")
+
+// ErrEndpointUnavailable marks an endpoint that is not allowlist-resolved or
+// that could not be reached or initialized. Messages never contain the URL.
+var ErrEndpointUnavailable = errors.New("MCP endpoint unavailable")
 
 func NewClient() *Client { return &Client{} }
 
@@ -34,7 +39,13 @@ type Bound struct {
 	byName  map[string]tool.FuncTool
 }
 
-func (c *Client) Bind(ctx context.Context, server definitions.MCPServer, allowed []string, cred credential.Credential) (*Bound, error) {
+// Bind connects to endpoint, which can only be produced by a tenantdir
+// Allowlist. Credentials are forwarded to every bound server, so the transport
+// is never built from anything else, and redirects are never followed.
+func (c *Client) Bind(ctx context.Context, server definitions.MCPServer, endpoint tenantdir.Endpoint, allowed []string, cred credential.Credential) (*Bound, error) {
+	if !endpoint.Valid() {
+		return nil, fmt.Errorf("%w: endpoint is not allowlisted", ErrEndpointUnavailable)
+	}
 	if len(allowed) == 0 {
 		return nil, fmt.Errorf("empty tool allowlist")
 	}
@@ -47,16 +58,16 @@ func (c *Client) Bind(ctx context.Context, server definitions.MCPServer, allowed
 		},
 	}
 	ctx, span := otel.Tracer("az-agent-platform/mcp").Start(ctx, "mcp.discover")
-	span.SetAttributes(attribute.String("mcp.server.id", server.ID))
+	span.SetAttributes(attribute.String("mcp.server.id", server.ID), attribute.String("mcp.endpoint.id", endpoint.ID()))
 	defer span.End()
-	session, err := mcptool.Connect(ctx, &protocol.StreamableClientTransport{Endpoint: server.Endpoint, HTTPClient: httpClient})
+	session, err := mcptool.Connect(ctx, &protocol.StreamableClientTransport{Endpoint: endpoint.URL(), HTTPClient: httpClient})
 	if err != nil {
-		return nil, fmt.Errorf("connect MCP server: %w", err)
+		return nil, unavailable("connect MCP server", err)
 	}
 	all, err := mcptool.ListTools(ctx, session)
 	if err != nil {
 		session.Close()
-		return nil, err
+		return nil, unavailable("list MCP tools", err)
 	}
 	wanted := make(map[string]bool, len(allowed))
 	for _, name := range allowed {
@@ -82,6 +93,27 @@ func (c *Client) Bind(ctx context.Context, server definitions.MCPServer, allowed
 		}
 	}
 	return bound, nil
+}
+
+// unavailable classifies a transport or protocol failure as a dependency
+// failure, keeping ErrAuthRequired's identity. The cause text can embed the URL
+// (net/http errors do), so it is deliberately not included.
+func unavailable(op string, err error) error {
+	if errors.Is(err, ErrAuthRequired) {
+		return fmt.Errorf("%s: %w", op, ErrAuthRequired)
+	}
+	return fmt.Errorf("%w: %s failed", ErrEndpointUnavailable, op)
+}
+
+// ServerInfo returns the name and version the server reported at initialize.
+func (b *Bound) ServerInfo() (name, version string) {
+	if b.session == nil {
+		return "", ""
+	}
+	if result := b.session.InitializeResult(); result != nil && result.ServerInfo != nil {
+		return result.ServerInfo.Name, result.ServerInfo.Version
+	}
+	return "", ""
 }
 
 func (b *Bound) Tools() []tool.FuncTool { return slices.Clone(b.tools) }

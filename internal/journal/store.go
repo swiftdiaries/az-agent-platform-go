@@ -2,6 +2,7 @@ package journal
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/jackc/pgx/v5"
@@ -28,9 +29,12 @@ const (
 	RunCompleted     RunState = "completed"
 	RunFailed        RunState = "failed"
 	RunAuthRequired  RunState = "auth_required"
+	// RunDependencyUnavailable is terminal: a required dependency (tenant
+	// directory, settings source or MCP endpoint) could not be used.
+	RunDependencyUnavailable RunState = "dependency_unavailable"
 )
 
-type Command struct{ ThreadID, RunID, CommunicationID, Principal, Text, TargetJourney, InteractionID, ReplyKind, ReplyJSON string }
+type Command struct{ ThreadID, RunID, CommunicationID, Principal, Tenant, Text, TargetJourney, InteractionID, ReplyKind, ReplyJSON string }
 type Receipt struct {
 	ThreadID, RunID, CommunicationID string
 	ExecutionRunID                   string
@@ -59,6 +63,9 @@ type Run struct {
 	RunID             string
 	State             RunState
 	JourneyID, Answer string
+	// Scope and server info recorded by the owner; empty/nil when unrecorded.
+	ProductVersion, EndpointID string
+	Settings, ServerInfo       json.RawMessage
 }
 
 type Snapshot struct {

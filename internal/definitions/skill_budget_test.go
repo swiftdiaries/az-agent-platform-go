@@ -27,7 +27,7 @@ func writeSkillBudgetFiles(t *testing.T, root string) {
 func writeSkillBudgetConfig(t *testing.T, root string, index int) string {
 	t.Helper()
 	path := filepath.Join(root, fmt.Sprintf("journeys-%03d.json", index))
-	config := fmt.Sprintf(`{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["lookup"]}],"skill_packages":[{"name":"planner","root":"skills/planner","supporting_files":["guide.md"],"allow_supporting_files":true}],"journeys":[{"id":"journey-%03d","description":"Plan","system_prompt":"prompt.md","mcp":{"server":"s","tools":["lookup"]},"skills":["planner"]}]}`, index)
+	config := fmt.Sprintf(`{"mcp_servers":[{"id":"s","tools":["lookup"]}],"skill_packages":[{"name":"planner","root":"skills/planner","supporting_files":["guide.md"],"allow_supporting_files":true}],"journeys":[{"id":"journey-%03d","description":"Plan","system_prompt":"prompt.md","mcp":{"server":"s","tools":["lookup"]},"skills":["planner"]}]}`, index)
 	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func writeSkillBudgetConfigWithJourneys(t *testing.T, root string, count int) st
 	t.Helper()
 	path := filepath.Join(root, "journeys.json")
 	var config strings.Builder
-	config.WriteString(`{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["lookup"]}],"skill_packages":[{"name":"planner","root":"skills/planner","supporting_files":["guide.md"],"allow_supporting_files":true}],"journeys":[`)
+	config.WriteString(`{"mcp_servers":[{"id":"s","tools":["lookup"]}],"skill_packages":[{"name":"planner","root":"skills/planner","supporting_files":["guide.md"],"allow_supporting_files":true}],"journeys":[`)
 	for i := 0; i < count; i++ {
 		if i > 0 {
 			config.WriteByte(',')

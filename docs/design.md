@@ -519,6 +519,7 @@ Settings decouple per-tenant and per-user behaviour from code and deployment. Th
 - **Fields:**
   - `max_active_journeys`: default 2, allowed 1 to 4 (see [Active set](#active-set-and-the-per-tenant-limit));
   - `cost.profile`: an opaque reference that the cost adapter interprets.
+- **User-level cost settings are deferred.** `cost.profile` is set only at the deploy-default and tenant layers for now; a user layer may only narrow `max_active_journeys`. A user cost layer needs its own narrowing rule before it is accepted.
 
 ## Cost seam
 

@@ -54,11 +54,12 @@ func NewHandler(auth Authenticator, service *platform.Platform, pool *pgxpool.Po
 	return &handler{auth: auth, platform: service, ids: IdentityMap{pool: pool}, credentialHeaders: slices.Clone(credentialHeaders)}
 }
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	principal, err := h.auth.Authenticate(r)
+	identity, err := h.auth.Authenticate(r)
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	principal := identity.Principal
 	cursor := int64(0)
 	if raw := r.Header.Get("Last-Event-ID"); raw != "" {
 		cursor, err = strconv.ParseInt(raw, 10, 64)
@@ -136,7 +137,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if create {
 		// Chat copies only the configured credential header names into the
 		// Credential; no inbound header map is retained or persisted.
-		_, err = h.platform.Submit(ctx, platform.Command{ThreadID: thread, RunID: run, CommunicationID: communication, Principal: principal, Text: text, TargetJourney: target, InteractionID: reply.InteractionID, ReplyKind: reply.Kind, ReplyJSON: replyJSON}, credential.FromRequest(r, h.credentialHeaders))
+		_, err = h.platform.Submit(ctx, platform.Command{ThreadID: thread, RunID: run, CommunicationID: communication, Principal: principal, Tenant: identity.Tenant, Text: text, TargetJourney: target, InteractionID: reply.InteractionID, ReplyKind: reply.Kind, ReplyJSON: replyJSON}, credential.FromRequest(r, h.credentialHeaders))
 		if err != nil {
 			commandError(w, err)
 			return
@@ -222,13 +223,16 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case "run.completed":
 			emit(events.NewRunFinishedEvent(input.ThreadID, input.RunID), sequence)
 			return true
-		case "run.failed", "auth_required", "run.interrupted":
+		case "run.failed", "auth_required", "run.interrupted", "run.dependency_unavailable":
 			code := "internal_error"
 			if e.Type == "run.interrupted" {
 				code = "interrupted"
 			}
 			if e.Type == "auth_required" {
 				code = "auth_required"
+			}
+			if e.Type == "run.dependency_unavailable" {
+				code = "dependency_unavailable"
 			}
 			emit(events.NewRunErrorEvent("run could not complete", events.WithErrorCode(code), events.WithRunID(input.RunID)), sequence)
 			return true
@@ -276,6 +280,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case platform.RunAuthRequired:
 		terminal(platform.Event{Type: "auth_required"}, 0)
+		return
+	case platform.RunDependencyUnavailable:
+		terminal(platform.Event{Type: "run.dependency_unavailable"}, 0)
 		return
 	}
 

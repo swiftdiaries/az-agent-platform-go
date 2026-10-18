@@ -215,7 +215,6 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 		mcpHandler.ServeHTTP(w, r)
 	}))
 	defer endpoint.Close()
-	t.Setenv("TEST_JAVA_MCP_ENDPOINT", endpoint.URL)
 	registry, err := definitions.Load(filepath.Join("..", "configs", "journeys.yaml"))
 	if err != nil {
 		t.Fatal(err)
@@ -230,8 +229,8 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 		}
 		return agentruntime.ModelResponse{Text: "corrected Kyoto"}, nil
 	})
-	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model)
-	auth := chat.StaticBearerTokens{"token": "alice"}
+	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, endpoint.URL))
+	auth := chat.StaticBearerTokens{"token": testPrincipal}
 	var apis []*httptest.Server
 	for range 3 {
 		service := platform.New(runner, journal.New(pool))
@@ -277,7 +276,7 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT id FROM agent_conversations").Scan(&thread); err != nil {
 		t.Fatal(err)
 	}
-	before, err := journal.New(pool).Snapshot(ctx, thread, "alice")
+	before, err := journal.New(pool).Snapshot(ctx, thread, testPrincipal)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +325,7 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 	if modelCalls.Load() != 2 || toolCalls.Load() != 1 || wrongCredentials.Load() {
 		t.Fatalf("replay or credential transfer: models %d tools %d credentials %v", modelCalls.Load(), toolCalls.Load(), wrongCredentials.Load())
 	}
-	after, err := journal.New(pool).Snapshot(ctx, thread, "alice")
+	after, err := journal.New(pool).Snapshot(ctx, thread, testPrincipal)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +380,7 @@ func TestSteeringInclusionFailureStopsDispatch(t *testing.T) {
 	}))
 	service := platform.New(runner, journal.New(pool))
 	defer service.Close()
-	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, service, pool, []string{"Authorization", "Cookie"}))
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": testPrincipal}, service, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	body := aguitypes.RunAgentInput{ThreadID: "external", RunID: "run", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "hello"}}}
 	response := postAGUI(t, api.URL, body, "token", "", "")
@@ -392,7 +391,7 @@ func TestSteeringInclusionFailureStopsDispatch(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT id FROM agent_conversations").Scan(&thread); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := service.Snapshot(ctx, thread, "alice")
+	snapshot, err := service.Snapshot(ctx, thread, testPrincipal)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +447,7 @@ func TestSteeringFinalDrainUsesLiveOwner(t *testing.T) {
 	defer a.Close()
 	b := platform.New(runner, journal.New(pool))
 	defer b.Close()
-	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "initial", Principal: "alice", Text: "initial"}
+	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "initial", Principal: "alice", Tenant: testTenant, Text: "initial"}
 	if _, err := a.Submit(ctx, c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +488,6 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 	})
 	endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
 	defer endpoint.Close()
-	t.Setenv("TEST_JAVA_MCP_ENDPOINT", endpoint.URL)
 	registry, err := definitions.Load(filepath.Join("..", "configs", "journeys.yaml"))
 	if err != nil {
 		t.Fatal(err)
@@ -500,7 +498,7 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 		contexts <- ctx
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
 	})
-	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model)
+	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, endpoint.URL))
 	a := platform.New(runner, journal.New(pool))
 	defer a.Close()
 	b := platform.New(runner, journal.New(pool))
@@ -512,7 +510,7 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 			close(release)
 		}
 	}()
-	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "initial", Principal: "alice", Text: "initial"}
+	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "initial", Principal: "alice", Tenant: testTenant, Text: "initial"}
 	if _, err := a.Submit(ctx, c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -741,7 +739,7 @@ func TestSteeringTerminalCommandCorrelationAcrossReplicas(t *testing.T) {
 				<-release
 				return agentruntime.ModelResponse{}, errors.New("model failed")
 			}))
-			auth := chat.StaticBearerTokens{"token": "alice", "other": "bob"}
+			auth := chat.StaticBearerTokens{"token": testPrincipal, "other": "tenant-a/bob"}
 			owner := platform.New(runner, journal.New(pool))
 			defer owner.Close()
 			peer := platform.New(runner, journal.New(pool))
@@ -785,7 +783,7 @@ func TestSteeringTerminalCommandCorrelationAcrossReplicas(t *testing.T) {
 			if err := pool.QueryRow(ctx, "SELECT id FROM agent_conversations").Scan(&thread); err != nil {
 				t.Fatal(err)
 			}
-			snapshot, err := journal.New(pool).Snapshot(ctx, thread, "alice")
+			snapshot, err := journal.New(pool).Snapshot(ctx, thread, testPrincipal)
 			if err != nil {
 				t.Fatal(err)
 			}
