@@ -10,7 +10,8 @@
 //     ([Server.Count], [Server.Calls], [Server.Applied]);
 //   - fault injection keyed by remote tool name: [Server.Block],
 //     [Server.FailTransient], [Server.DropResponseAfterApply],
-//     [Server.IsError] and [Server.Unauthorized].
+//     [Server.IsError], [Server.Unauthorized] and [Server.Forbid] (HTTP 403
+//     for tools/call of one tool).
 //
 // Remote tool names are served verbatim, including names the SDK considers
 // invalid ("billing/refund", "lookup destination", "ns:op"); the SDK only logs

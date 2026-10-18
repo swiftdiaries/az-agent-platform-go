@@ -228,10 +228,13 @@ func TestConversationDefinitionBySetDigest(t *testing.T) {
 		if err := s.ActivateDefinition(ctx, b1, b2, servedAll); err != nil {
 			t.Fatal(err)
 		}
-		// pinned conversations keep their pin after current advanced
+		// an idle pinned conversation re-pins to the advanced current (M6)
 		got, err = s.ResolveDefinition(ctx, o1, b2, servedAll)
-		if err != nil || got != b1 {
-			t.Fatalf("pinned conversation: %q %v", got, err)
+		if err != nil || got != b2 {
+			t.Fatalf("idle pinned conversation: %q %v", got, err)
+		}
+		if pin, _ := conversationPin(t, s, "t1"); pin != b2 {
+			t.Fatalf("t1 pin = %q", pin)
 		}
 		// a new conversation pins to the advanced current
 		o3 := admitClaim(t, s, threadCommand("t3", "r3", "c3", "three"))
@@ -250,8 +253,16 @@ func TestConversationDefinitionBySetDigest(t *testing.T) {
 		if _, pinned := conversationPin(t, s, "t4"); pinned {
 			t.Fatal("unserved current pinned the conversation")
 		}
-		// t1 is pinned to b1
-		if got, err := s.ResolveDefinition(ctx, o1, b2, servedOnly(b2)); !errors.Is(err, ErrDefinition) || got != "" {
+		// t2 is idle and pinned to b1; current b2 is unserved
+		if got, err := s.ResolveDefinition(ctx, o2, b2, servedOnly(b1)); !errors.Is(err, ErrDefinition) || got != "" {
+			t.Fatalf("unserved current for idle pin: %q %v", got, err)
+		}
+		if pin, _ := conversationPin(t, s, "t2"); pin != b1 {
+			t.Fatalf("t2 pin = %q", pin)
+		}
+		// a non-idle conversation keeps its unserved pin, which fails
+		insertOperation(t, s, "u1", "t2", "r2", "outcome_unknown")
+		if got, err := s.ResolveDefinition(ctx, o2, b2, servedOnly(b2)); !errors.Is(err, ErrDefinition) || got != "" {
 			t.Fatalf("unserved pin: %q %v", got, err)
 		}
 		if cur, _ := s.CurrentDefinition(ctx); cur != b2 {
@@ -316,14 +327,19 @@ func TestConversationActivateDefinition(t *testing.T) {
 	if err := s.ActivateDefinition(ctx, c1, c2, servedOnly(c2)); !errors.Is(err, ErrDefinition) || current() != c1 {
 		t.Fatalf("unserved present current: %v %q", err, current())
 	}
-	// a conversation pin that this replica cannot serve blocks activation
+	// an idle conversation pinned to an unserved digest does not block activation
 	old := strings.Repeat("5", 64)
 	mustExec(t, s.pool, "INSERT INTO agent_conversations(id,principal,definition_digest) VALUES('pinned','p',$1)", old)
 	mustExec(t, s.pool, "INSERT INTO agent_conversations(id,principal) VALUES('unpinned','p')")
+	// a pending approval pinned to it does
+	o := admitClaim(t, s, threadCommand("waiting", "rw", "cw", "hi"))
+	mustExec(t, s.pool, "UPDATE agent_conversations SET definition_digest=$1 WHERE id='waiting'", old)
+	rawInteraction(t, s, o, approvalArtifact("iw", "callw", "j"), "j", "pending", "", "")
 	if err := s.ActivateDefinition(ctx, c1, c2, servedOnly(c1, c2)); !errors.Is(err, ErrDefinition) || current() != c1 {
-		t.Fatalf("unserved conversation pin: %v %q", err, current())
+		t.Fatalf("unserved pending-approval pin: %v %q", err, current())
 	}
-	if err := s.ActivateDefinition(ctx, c1, c2, servedAll); err != nil {
+	mustExec(t, s.pool, "UPDATE agent_interactions SET state='expired' WHERE id='iw'")
+	if err := s.ActivateDefinition(ctx, c1, c2, servedOnly(c1, c2)); err != nil {
 		t.Fatal(err)
 	}
 	if current() != c2 {
@@ -335,30 +351,174 @@ func TestConversationDefinitionsReady(t *testing.T) {
 	ctx := context.Background()
 	s := scopedStore(t)
 	c1, p1 := strings.Repeat("6", 64), strings.Repeat("7", 64)
+	ready := func(name string, want bool, served func(string) bool) {
+		t.Helper()
+		if got, err := s.DefinitionsReady(ctx, served); err != nil || got != want {
+			t.Fatalf("%s: ready=%v err=%v, want %v", name, got, err, want)
+		}
+	}
 
-	if ready, err := s.DefinitionsReady(ctx, nil); ready || !errors.Is(err, ErrDefinition) {
-		t.Fatalf("nil served: %v %v", ready, err)
+	if got, err := s.DefinitionsReady(ctx, nil); got || !errors.Is(err, ErrDefinition) {
+		t.Fatalf("nil served: %v %v", got, err)
 	}
-	if ready, err := s.DefinitionsReady(ctx, servedOnly()); err != nil || !ready {
-		t.Fatalf("empty database: %v %v", ready, err)
-	}
+	ready("empty database", true, servedOnly())
 	mustExec(t, s.pool, "INSERT INTO agent_conversations(id,principal) VALUES('null-pin','p')")
-	if ready, err := s.DefinitionsReady(ctx, servedOnly()); err != nil || !ready {
-		t.Fatalf("NULL pin must be ignored: %v %v", ready, err)
-	}
+	ready("NULL pin ignored", true, servedOnly())
 	mustExec(t, s.pool, "INSERT INTO agent_definition_current(definition_digest) VALUES($1)", c1)
-	if ready, err := s.DefinitionsReady(ctx, servedOnly(c1)); err != nil || !ready {
-		t.Fatalf("served current: %v %v", ready, err)
+	ready("served current", true, servedOnly(c1))
+	ready("unserved current", false, servedOnly())
+
+	// an idle conversation pinned to an unserved digest does not block readiness
+	o := admitClaim(t, s, threadCommand("w", "rw", "cw", "hi"))
+	mustExec(t, s.pool, "UPDATE agent_conversations SET definition_digest=$1 WHERE id='w'", p1)
+	ready("idle unserved pin", true, servedOnly(c1))
+
+	// a pending interaction pins it
+	rawInteraction(t, s, o, approvalArtifact("i1", "call1", "j"), "j", "pending", "", "")
+	ready("pending interaction, unserved pin", false, servedOnly(c1))
+	ready("pending interaction, served pin", true, servedOnly(c1, p1))
+
+	// a consumed interaction counts while its continuation run is live
+	mustExec(t, s.pool, "UPDATE agent_interactions SET state='consumed', continuation_run_id='rw' WHERE id='i1'")
+	ready("consumed, continuation pending", false, servedOnly(c1))
+	mustExec(t, s.pool, "UPDATE agent_runs SET state='running' WHERE id='rw'")
+	ready("consumed, continuation running", false, servedOnly(c1))
+	mustExec(t, s.pool, "UPDATE agent_runs SET state='completed' WHERE id='rw'")
+	ready("consumed, continuation completed", true, servedOnly(c1))
+
+	// an unresolved operation counts
+	for _, outcome := range []string{"dispatching", "outcome_unknown"} {
+		insertOperation(t, s, "op-"+outcome, "w", "rw", outcome)
+		ready("operation "+outcome, false, servedOnly(c1))
+		mustExec(t, s.pool, "UPDATE agent_operations SET outcome='completed' WHERE call_id='op-'||$1::text", outcome)
+		ready("operation completed after "+outcome, true, servedOnly(c1))
 	}
-	if ready, err := s.DefinitionsReady(ctx, servedOnly()); err != nil || ready {
-		t.Fatalf("unserved current: %v %v", ready, err)
+}
+
+func insertOperation(t *testing.T, s *Store, call, thread, run, outcome string) {
+	t.Helper()
+	mustExec(t, s.pool, "INSERT INTO agent_operations(call_id,thread_id,run_id,alias,arguments,binding,policy,outcome,requires_approval) VALUES($1,$2,$3,'x','{}','b','effectful',$4,true)", call, thread, run, outcome)
+}
+
+// repinFixture claims thread "t" pinned to d1 with current d2.
+func repinFixture(t *testing.T) (*Store, Owner, string, string) {
+	t.Helper()
+	s := scopedStore(t)
+	d1, d2 := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	o := admitClaim(t, s, threadCommand("t", "r1", "c1", "hi"))
+	mustExec(t, s.pool, "UPDATE agent_conversations SET definition_digest=$1 WHERE id='t'", d1)
+	mustExec(t, s.pool, "INSERT INTO agent_definition_current(definition_digest) VALUES($1)", d2)
+	return s, o, d1, d2
+}
+
+func definitionChanged(t *testing.T, s *Store) (runs, details []string) {
+	t.Helper()
+	rows, err := s.pool.Query(context.Background(), "SELECT run_id, detail::text FROM agent_events WHERE kind='definition_changed' ORDER BY sequence")
+	if err != nil {
+		t.Fatal(err)
 	}
-	mustExec(t, s.pool, "INSERT INTO agent_conversations(id,principal,definition_digest) VALUES('pinned','p',$1)", p1)
-	if ready, err := s.DefinitionsReady(ctx, servedOnly(c1)); err != nil || ready {
-		t.Fatalf("unserved pin: %v %v", ready, err)
+	defer rows.Close()
+	for rows.Next() {
+		var run, detail string
+		if err := rows.Scan(&run, &detail); err != nil {
+			t.Fatal(err)
+		}
+		runs, details = append(runs, run), append(details, detail)
 	}
-	if ready, err := s.DefinitionsReady(ctx, servedOnly(c1, p1)); err != nil || !ready {
-		t.Fatalf("all served: %v %v", ready, err)
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return runs, details
+}
+
+func expectKept(t *testing.T, s *Store, o Owner, d1 string) {
+	t.Helper()
+	got, err := s.ResolveDefinition(context.Background(), o, d1, servedAll)
+	if err != nil || got != d1 {
+		t.Fatalf("ResolveDefinition = %q %v, want kept %q", got, err, d1)
+	}
+	if pin, _ := conversationPin(t, s, "t"); pin != d1 {
+		t.Fatalf("pin = %q, want %q", pin, d1)
+	}
+	if runs, _ := definitionChanged(t, s); len(runs) != 0 {
+		t.Fatalf("unexpected definition_changed events: %v", runs)
+	}
+}
+
+func TestRepinIdle(t *testing.T) {
+	ctx := context.Background()
+	s, o, d1, d2 := repinFixture(t)
+	got, err := s.ResolveDefinition(ctx, o, d1, servedAll)
+	if err != nil || got != d2 {
+		t.Fatalf("ResolveDefinition = %q %v, want %q", got, err, d2)
+	}
+	if pin, _ := conversationPin(t, s, "t"); pin != d2 {
+		t.Fatalf("pin = %q", pin)
+	}
+	runs, details := definitionChanged(t, s)
+	if len(runs) != 1 || runs[0] != "r1" {
+		t.Fatalf("events = %v", runs)
+	}
+	sameJSON(t, details[0], `{"old_digest":"`+d1+`","new_digest":"`+d2+`"}`)
+	// pin == current: no further event
+	if got, err := s.ResolveDefinition(ctx, o, d1, servedAll); err != nil || got != d2 {
+		t.Fatalf("second resolve = %q %v", got, err)
+	}
+	if runs, _ := definitionChanged(t, s); len(runs) != 1 {
+		t.Fatalf("events after no-op = %v", runs)
+	}
+}
+
+func TestRepinKeepsPendingApproval(t *testing.T) {
+	s, o, d1, _ := repinFixture(t)
+	rawInteraction(t, s, o, approvalArtifact("i1", "call1", "j"), "j", "pending", "", "")
+	expectKept(t, s, o, d1)
+}
+
+func TestRepinKeepsReplyContinuation(t *testing.T) {
+	s, o, d1, _ := repinFixture(t)
+	rawInteraction(t, s, o, approvalArtifact("i1", "call1", "j"), "j", "consumed", "r1", `{"decision":"approve"}`)
+	o.Command.InteractionID = "i1"
+	expectKept(t, s, o, d1)
+}
+
+func TestRepinKeepsUnresolvedOperation(t *testing.T) {
+	for _, outcome := range []string{"dispatching", "outcome_unknown"} {
+		t.Run(outcome, func(t *testing.T) {
+			s, o, d1, _ := repinFixture(t)
+			insertOperation(t, s, "op", "t", "r1", outcome)
+			expectKept(t, s, o, d1)
+		})
+	}
+}
+
+func TestRepinUnservedCurrent(t *testing.T) {
+	ctx := context.Background()
+	s, o, d1, _ := repinFixture(t)
+	if got, err := s.ResolveDefinition(ctx, o, d1, servedOnly(d1)); !errors.Is(err, ErrDefinition) || got != "" {
+		t.Fatalf("idle, unserved current: %q %v", got, err)
+	}
+	if pin, _ := conversationPin(t, s, "t"); pin != d1 {
+		t.Fatalf("pin = %q", pin)
+	}
+	if runs, _ := definitionChanged(t, s); len(runs) != 0 {
+		t.Fatalf("events = %v", runs)
+	}
+	// non-idle with an unserved pin
+	rawInteraction(t, s, o, approvalArtifact("i1", "call1", "j"), "j", "pending", "", "")
+	if got, err := s.ResolveDefinition(ctx, o, d1, servedExcept(d1)); !errors.Is(err, ErrDefinition) || got != "" {
+		t.Fatalf("non-idle, unserved pin: %q %v", got, err)
+	}
+}
+
+func TestRepinFencedByOwnerLease(t *testing.T) {
+	s, o, d1, _ := repinFixture(t)
+	mustExec(t, s.pool, "UPDATE agent_runs SET lease_until=clock_timestamp()-interval '1 second' WHERE id='r1'")
+	if _, err := s.ResolveDefinition(context.Background(), o, d1, servedAll); !errors.Is(err, ErrOwnership) {
+		t.Fatalf("expired owner: %v", err)
+	}
+	if pin, _ := conversationPin(t, s, "t"); pin != d1 {
+		t.Fatalf("pin = %q", pin)
 	}
 }
 

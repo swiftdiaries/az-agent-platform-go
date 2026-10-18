@@ -28,7 +28,15 @@ func desc(name, key string, tags ...string) Descriptor {
 
 func hinted(d Descriptor) Descriptor { d.ReadOnlyHint = true; return d }
 
-func ops(keys ...string) definitions.Selector { return definitions.Selector{Ops: keys} }
+// ops mirrors compile: a single-alternative selector defaults its alias.
+func ops(keys ...string) definitions.Selector {
+	alias, _ := definitions.AliasFor(keys[0])
+	return definitions.Selector{Ops: keys, Alias: alias}
+}
+
+func opsAs(alias string, keys ...string) definitions.Selector {
+	return definitions.Selector{Ops: keys, Alias: alias}
+}
 
 func tagSel(tags ...string) definitions.Selector { return definitions.Selector{Tags: tags} }
 
@@ -62,21 +70,57 @@ func TestResolve(t *testing.T) {
 		},
 		{
 			name:    "alternatives prefer first present v2",
-			journey: definitions.Journey{ID: "j", Tools: []definitions.Selector{ops("lookup.v2", "lookup.v1")}},
+			journey: definitions.Journey{ID: "j", Tools: []definitions.Selector{opsAs("lookup", "lookup.v2", "lookup.v1")}},
 			tools:   []Descriptor{desc("old", "lookup.v1"), desc("new", "lookup.v2")},
-			want:    []wantTool{{"lookup_v2", "lookup.v2", "new", definitions.ClassEffectful, true}},
+			want:    []wantTool{{"lookup", "lookup.v2", "new", definitions.ClassEffectful, true}},
 		},
 		{
 			name:    "alternatives fall back to v1",
-			journey: definitions.Journey{ID: "j", Tools: []definitions.Selector{ops("lookup.v2", "lookup.v1")}},
+			journey: definitions.Journey{ID: "j", Tools: []definitions.Selector{opsAs("lookup", "lookup.v2", "lookup.v1")}},
 			tools:   []Descriptor{desc("old", "lookup.v1")},
-			want:    []wantTool{{"lookup_v1", "lookup.v1", "old", definitions.ClassEffectful, true}},
+			want:    []wantTool{{"lookup", "lookup.v1", "old", definitions.ClassEffectful, true}},
 		},
 		{
 			name:    "missing across all alternatives reports first",
-			journey: definitions.Journey{ID: "j", Tools: []definitions.Selector{ops("lookup.v2", "lookup.v1")}},
+			journey: definitions.Journey{ID: "j", Tools: []definitions.Selector{opsAs("lookup", "lookup.v2", "lookup.v1")}},
 			tools:   []Descriptor{desc("x", "other")},
 			unavail: []Unavailable{{ReasonMissing, "lookup.v2"}},
+		},
+		{
+			name:    "alias is the selector alias for either alternative present",
+			journey: definitions.Journey{ID: "j", Tools: []definitions.Selector{opsAs("k_alias", "k.v2", "k")}},
+			tools:   []Descriptor{desc("only-v1", "k")},
+			want:    []wantTool{{"k_alias", "k", "only-v1", definitions.ClassEffectful, true}},
+		},
+		{
+			name:    "alias is the selector alias when only v2 is present",
+			journey: definitions.Journey{ID: "j", Tools: []definitions.Selector{opsAs("k_alias", "k.v2", "k")}},
+			tools:   []Descriptor{desc("only-v2", "k.v2")},
+			want:    []wantTool{{"k_alias", "k.v2", "only-v2", definitions.ClassEffectful, true}},
+		},
+		{
+			name:    "op alias wins for a tool also matched by tags",
+			journey: definitions.Journey{ID: "j", Tools: []definitions.Selector{opsAs("renamed", "leave.get"), tagSel("leave")}},
+			tools:   []Descriptor{desc("get", "leave.get", "leave")},
+			want:    []wantTool{{"renamed", "leave.get", "get", definitions.ClassEffectful, true}},
+		},
+		{
+			name:    "op alias colliding with a tag-only derived alias",
+			journey: definitions.Journey{ID: "j", Tools: []definitions.Selector{opsAs("leave_get", "x.v2", "x"), tagSel("leave")}},
+			tools:   []Descriptor{desc("x", "x"), desc("get", "leave.get", "leave")},
+			unavail: []Unavailable{{ReasonCollision, "leave_get"}},
+		},
+		{
+			name:    "reserved op alias",
+			journey: definitions.Journey{ID: "j", Tools: []definitions.Selector{opsAs("activate_journey", "x")}},
+			tools:   []Descriptor{desc("x", "x")},
+			unavail: []Unavailable{{ReasonCollision, "activate_journey"}},
+		},
+		{
+			name:    "invalid op alias reports the key",
+			journey: definitions.Journey{ID: "j", Tools: []definitions.Selector{opsAs("bad-alias", "x")}},
+			tools:   []Descriptor{desc("x", "x")},
+			unavail: []Unavailable{{ReasonInvalidAlias, "x"}},
 		},
 		{
 			name:    "ambiguous when two tools share a key",
@@ -123,18 +167,18 @@ func TestResolve(t *testing.T) {
 			name: "same tool via op and tags merges overlays",
 			journey: definitions.Journey{ID: "j", Tools: []definitions.Selector{
 				{Ops: []string{"leave.get"}, Class: definitions.ClassReadOnly},
-				{Tags: []string{"leave"}, Class: definitions.ClassIdempotent, ApprovalRequired: true},
+				{Tags: []string{"leave"}, ApprovalRequired: true},
 			}},
 			tools: []Descriptor{desc("get", "leave.get", "leave")},
-			want:  []wantTool{{"leave_get", "leave.get", "get", definitions.ClassIdempotent, true}},
+			want:  []wantTool{{"leave_get", "leave.get", "get", definitions.ClassReadOnly, true}},
 		},
 		{
-			name: "merge with unclassified selection is effectful",
+			name: "op class wins over a tag match",
 			journey: definitions.Journey{ID: "j", Tools: []definitions.Selector{
 				roClass(ops("leave.get")), tagSel("leave"),
 			}},
 			tools: []Descriptor{desc("get", "leave.get", "leave")},
-			want:  []wantTool{{"leave_get", "leave.get", "get", definitions.ClassEffectful, true}},
+			want:  []wantTool{{"leave_get", "leave.get", "get", definitions.ClassReadOnly, false}},
 		},
 		{
 			name: "tags selecting a different tool for a chosen key is ambiguous",
@@ -435,5 +479,36 @@ func TestCheckPoliciesIgnoresUnavailable(t *testing.T) {
 	out := CheckPolicies(in)
 	if !reflect.DeepEqual(out, in) {
 		t.Fatalf("out = %+v", out)
+	}
+}
+
+func resolveOne(journey definitions.Journey, tools ...Descriptor) Resolution {
+	journey.ID = "j"
+	return Resolve(journey, Snapshot{Digest: "d", ProductVersion: "2026.5", Tools: tools}, testMetaKey)
+}
+
+func TestResolveTagOnlyIsEffectful(t *testing.T) {
+	res := resolveOne(definitions.Journey{Tools: []definitions.Selector{tagSel("leave")}}, desc("get", "leave.get", "leave"))
+	if len(res.Tools) != 1 || res.Tools[0].Class != definitions.ClassEffectful || !res.Tools[0].RequiresApproval {
+		t.Fatalf("Tools = %+v", res.Tools)
+	}
+}
+
+func TestResolveOpClassWinsOverTag(t *testing.T) {
+	res := resolveOne(definitions.Journey{Tools: []definitions.Selector{
+		{Ops: []string{"leave.get"}, Class: definitions.ClassReadOnly}, tagSel("leave"),
+	}}, desc("get", "leave.get", "leave"))
+	if len(res.Tools) != 1 || res.Tools[0].Class != definitions.ClassReadOnly || res.Tools[0].RequiresApproval {
+		t.Fatalf("Tools = %+v", res.Tools)
+	}
+}
+
+func TestResolveTagApprovalOrsIn(t *testing.T) {
+	res := resolveOne(definitions.Journey{Tools: []definitions.Selector{
+		{Ops: []string{"leave.get"}, Class: definitions.ClassReadOnly},
+		{Tags: []string{"leave"}, ApprovalRequired: true},
+	}}, desc("get", "leave.get", "leave"))
+	if len(res.Tools) != 1 || res.Tools[0].Class != definitions.ClassReadOnly || !res.Tools[0].RequiresApproval {
+		t.Fatalf("Tools = %+v", res.Tools)
 	}
 }

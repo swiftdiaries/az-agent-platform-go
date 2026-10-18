@@ -104,7 +104,6 @@ func TestStaticStrict(t *testing.T) {
 		{"duplicate key", "default:\n  max_active_journeys: 2\n  max_active_journeys: 3\n"},
 		{"duplicate tenant", "default: {}\ntenants:\n  a: {}\n  a: {}\n"},
 		{"out-of-bounds value", "default:\n  max_active_journeys: 5\n"},
-		{"user widening", "default:\n  max_active_journeys: 2\nusers:\n  t:\n    p:\n      max_active_journeys: 3\n"},
 		{"user setting cost", "default: {}\nusers:\n  t:\n    p:\n      cost: {profile: gold}\n"},
 		{"string where int expected", "default:\n  max_active_journeys: two\n"},
 	}

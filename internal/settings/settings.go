@@ -148,10 +148,6 @@ func Compile(doc Document) (*Compiled, error) {
 		if t == "" {
 			return nil, invalidf("user: empty tenant key")
 		}
-		var limit Settings
-		limit.MaxActiveJourneys = DefaultMaxActiveJourneys
-		apply(&limit, c.def)
-		apply(&limit, c.tenants[t])
 		byPrincipal := make(map[string]Layer, len(doc.Users[t]))
 		for _, p := range sortedKeys(doc.Users[t]) {
 			if p == "" {
@@ -168,9 +164,6 @@ func Compile(doc Document) (*Compiled, error) {
 			// a cost profile) before it is accepted here and applied in Resolve.
 			if l.Cost != nil {
 				return nil, invalidf("%s: cost cannot be set at user level", name)
-			}
-			if n := l.MaxActiveJourneys; n != nil && *n > limit.MaxActiveJourneys {
-				return nil, invalidf("%s: max_active_journeys %d exceeds %d", name, *n, limit.MaxActiveJourneys)
 			}
 			byPrincipal[p] = l
 		}
@@ -196,19 +189,20 @@ func (c *Compiled) Resolve(ctx context.Context, scope Scope) (Settings, error) {
 	if scope.Tenant == "" {
 		return Settings{}, fmt.Errorf("%w: empty tenant", ErrUnavailable)
 	}
+	return Merge(c.def, c.tenants[scope.Tenant], c.users[scope.Tenant][scope.Principal]), nil
+}
+
+// Merge layers built-in defaults, def, tenant, then user: the user's max_active_journeys is clamped to the
+// tenant-effective value (min). User cost is ignored (Compile still rejects it). Digest is set. Pure.
+func Merge(def, tenant, user Layer) Settings {
 	s := Settings{MaxActiveJourneys: DefaultMaxActiveJourneys}
-	apply(&s, c.def)
-	if l, ok := c.tenants[scope.Tenant]; ok {
-		apply(&s, l)
-	}
-	// TODO(settings): user-level cost settings are deferred (see Compile); the
-	// user layer can only narrow max_active_journeys until a user cost layer
-	// defines its own narrowing rule.
-	if l, ok := c.users[scope.Tenant][scope.Principal]; ok {
-		apply(&s, l)
+	apply(&s, def)
+	apply(&s, tenant)
+	if n := user.MaxActiveJourneys; n != nil && *n < s.MaxActiveJourneys {
+		s.MaxActiveJourneys = *n
 	}
 	s.Digest = digestOf(s.MaxActiveJourneys, s.Cost.Profile)
-	return s, nil
+	return s
 }
 
 // digestOf is the lowercase hex SHA-256 of the canonical JSON of the applied values.

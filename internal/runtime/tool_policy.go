@@ -24,7 +24,7 @@ func guardedCall(ctx context.Context, in RunInput, binding toolCatalog, op journ
 		switch {
 		case errors.Is(err, catalog.ErrAuthRequired):
 			outcome = "auth_required"
-		case errors.Is(err, catalog.ErrBusinessRejected):
+		case errors.Is(err, catalog.ErrBusinessRejected), errors.Is(err, catalog.ErrNotPermitted):
 			outcome = "rejected"
 		case err != nil:
 			outcome = "outcome_unknown"
@@ -37,6 +37,10 @@ func guardedCall(ctx context.Context, in RunInput, binding toolCatalog, op journ
 		}
 		if outcome == "auth_required" {
 			return nil, err
+		}
+		// A 403 is definite and permanent for this call: repeating or repairing cannot help.
+		if errors.Is(err, catalog.ErrNotPermitted) {
+			return map[string]any{"error": "not_permitted"}, nil
 		}
 		// A business rejection is definite; repeat unchanged once before offering one
 		// argument repair. Transport uncertainty requires reviewed replay safety.

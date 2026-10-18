@@ -41,6 +41,25 @@ type conversation struct {
 	available []definitions.Journey
 	active    *journeys.ActiveSet
 	limit     int
+	// persisted is the active order last written to the journal.
+	persisted []string
+}
+
+// touch marks a journey recently used. The new order is persisted by flush.
+func (c *conversation) touch(journeyID string) { c.active.Touch(journeyID) }
+
+// flush persists the active order when touches changed it since the last write. A
+// round calls it once after its dispatches and before any wait or final answer.
+func (c *conversation) flush(ctx context.Context, in RunInput) error {
+	order := c.active.IDs()
+	if slices.Equal(order, c.persisted) {
+		return nil
+	}
+	if err := in.Store.SetActiveJourneys(ctx, in.Owner, order); err != nil {
+		return err
+	}
+	c.persisted = order
+	return nil
 }
 
 func (c *conversation) journey(id string) (definitions.Journey, bool) {
@@ -162,6 +181,7 @@ func (c *conversation) activate(ctx context.Context, in RunInput, arguments stri
 		}
 	}
 	c.active = next
+	c.persisted = next.IDs()
 	result := map[string]any{"activated": args.Journey}
 	if len(evicted) > 0 {
 		result["evicted"] = evicted
@@ -170,7 +190,7 @@ func (c *conversation) activate(ctx context.Context, in RunInput, arguments stri
 }
 
 // readResource processes one read_skill_resource call. It returns the file body and
-// its provenance. skills.ErrChanged (and any read failure other than an undeclared
+// its provenance, and marks the journey recently used. skills.ErrChanged (and any read failure other than an undeclared
 // file) ends the run.
 func (c *conversation) readResource(arguments string) (any, *MaterialProvenance, error) {
 	var args struct {
@@ -196,6 +216,7 @@ func (c *conversation) readResource(arguments string) (any, *MaterialProvenance,
 	if err != nil {
 		return nil, nil, err
 	}
+	c.touch(args.Journey)
 	return string(material.Body), &MaterialProvenance{ID: args.Journey + "/" + material.Resource, Digest: material.FileDigest}, nil
 }
 
@@ -236,6 +257,7 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation
 	// pending and requestHistory are shared by every round's agent. invoke drains the
 	// inbox into pending before it builds the agent; the agent's before hook copies it
 	// onto the request and its observed callback records its inclusion.
+	conv.persisted = conv.active.IDs()
 	var pending []journal.Input
 	var requestHistory json.RawMessage
 	var skills []MaterialProvenance
@@ -315,16 +337,16 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation
 			history = append(history, m)
 		}
 	}
+	protected := map[string]bool{}
+	if continuation != nil {
+		protected[continuation.Interaction.Call.ProviderCallID] = true
+	}
 	invoke := func() (*agent.Response, error) {
 		inbox, err := in.Store.Pending(ctx, in.Owner)
 		if err != nil {
 			return nil, err
 		}
 		pending = inbox.Commands
-		requestHistory, err = json.Marshal(history)
-		if err != nil {
-			return nil, err
-		}
 		beforeInput := len(history)
 		for _, c := range pending {
 			if c.Text != "" {
@@ -332,8 +354,24 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation
 				history = append(history, m)
 			}
 		}
+		// Only the request is trimmed; the persisted history keeps every turn.
+		kept, truncation := trimHistory(history, r.tenancy.HistoryBudget, protected)
+		// The digest input is what the model saw, without the newly admitted messages.
+		admitted := history[beforeInput:]
+		seen := slices.DeleteFunc(slices.Clone(kept), func(m *message.Message) bool { return slices.Contains(admitted, m) })
+		requestHistory, err = json.Marshal(seen)
+		if err != nil {
+			history = history[:beforeInput]
+			return nil, err
+		}
+		if truncation.TurnsDropped > 0 {
+			if err = in.Store.HistoryTruncated(ctx, in.Owner, journal.HistoryTruncation{TurnsDropped: truncation.TurnsDropped, MessagesDropped: truncation.MessagesDropped, EstimateBefore: truncation.EstimateBefore, EstimateAfter: truncation.EstimateAfter, Budget: truncation.Budget}); err != nil {
+				history = history[:beforeInput]
+				return nil, err
+			}
+		}
 		// Function results precede newly admitted user messages in materialized history.
-		response, err := buildAgent().Run(ctx, history).Collect()
+		response, err := buildAgent().Run(ctx, kept).Collect()
 		if err == nil {
 			history = append(history, response.Messages...)
 		} else {
@@ -420,6 +458,7 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation
 				break
 			}
 			callNumber++
+			conv.touch(approved.JourneyID)
 			op := b.operation(approved.Call.CallID, call.Name, call.Arguments, tool)
 			// The approval is consumed (and marked dispatched) even if the policy no longer requires one.
 			op.RequiresApproval = true
@@ -438,6 +477,9 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation
 			}
 		}
 		approved = nil
+		if err := conv.flush(ctx, in); err != nil {
+			return RunOutput{}, err
+		}
 	}
 	var calls []*message.FunctionCallContent
 	for round := 0; round < 16; round++ {
@@ -454,6 +496,9 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation
 			if len(calls) == 0 {
 				if response.String() == "" {
 					return RunOutput{}, fmt.Errorf("model returned no answer")
+				}
+				if err := conv.flush(ctx, in); err != nil {
+					return RunOutput{}, err
 				}
 				serialized, err := json.Marshal(history)
 				return RunOutput{JourneyID: in.TargetJourney, Answer: response.String(), History: serialized}, err
@@ -527,6 +572,9 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation
 					}
 					i.Questions = args.Questions
 				}
+				if err := conv.flush(ctx, in); err != nil {
+					return RunOutput{}, err
+				}
 				out, err := wait(i)
 				if errors.Is(err, journal.ErrPending) {
 					m := resultMessage(call.CallID, map[string]string{"error": "superseded_by_steering"})
@@ -535,6 +583,9 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation
 				}
 				return out, err
 			}
+			if step.Kind == callAlias {
+				conv.touch(step.Journey)
+			}
 			result, err := guardedCall(ctx, in, conv.cat, b.operation(callID, call.Name, call.Arguments, resolved), "")
 			if err != nil {
 				return RunOutput{}, err
@@ -542,6 +593,9 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation
 			if err := settle(call.CallID, result); err != nil {
 				return RunOutput{}, err
 			}
+		}
+		if err := conv.flush(ctx, in); err != nil {
+			return RunOutput{}, err
 		}
 		calls = nil
 	}

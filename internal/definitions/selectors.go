@@ -23,8 +23,11 @@ type CatalogConfig struct {
 // Selector picks operations from a catalog snapshot. Exactly one of Ops
 // (alternatives in preference order) and Tags is set.
 type Selector struct {
-	Ops              []string
-	Tags             []string
+	Ops  []string
+	Tags []string
+	// Alias is the model-facing tool name: for op selectors the explicit alias
+	// or AliasFor(Ops[0]); empty for tag selectors.
+	Alias            string
 	ReadOnlyHint     bool
 	Class            Class
 	ApprovalRequired bool
@@ -114,8 +117,24 @@ func AliasFor(op string) (string, bool) {
 			alias[i] = '_'
 		}
 	}
-	valid := len(alias) >= 1 && len(alias) <= 64 && !(alias[0] >= '0' && alias[0] <= '9')
-	return string(alias), valid
+	return string(alias), ValidAlias(string(alias))
+}
+
+// ValidAlias reports whether s matches ^[A-Za-z_][A-Za-z0-9_]{0,63}$.
+func ValidAlias(s string) bool {
+	if len(s) < 1 || len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_':
+		case c >= '0' && c <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // IsReservedToolName reports whether name belongs to the product runtime.

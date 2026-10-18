@@ -70,14 +70,14 @@ func TestCompileValidConfig(t *testing.T) {
 		t.Fatalf("product versions = %+v", j.ProductVersions)
 	}
 	want := []Selector{
-		{Ops: []string{"leave.balance"}},
-		{Ops: []string{"leave.request.v2", "leave.request"}, Class: ClassIdempotent, ApprovalRequired: true},
+		{Ops: []string{"leave.balance"}, Alias: "leave_balance"},
+		{Ops: []string{"leave.request.v2", "leave.request"}, Alias: "leave_request", Class: ClassIdempotent, ApprovalRequired: true},
 		{Tags: []string{"leave", "self-service"}, ReadOnlyHint: true},
 	}
 	if !reflect.DeepEqual(j.Tools, want) {
 		t.Fatalf("tools = %+v\nwant   %+v", j.Tools, want)
 	}
-	if got := journeys[1].Tools; !reflect.DeepEqual(got, []Selector{{Ops: []string{"expense.submit"}, Class: ClassEffectful}}) {
+	if got := journeys[1].Tools; !reflect.DeepEqual(got, []Selector{{Ops: []string{"expense.submit"}, Alias: "expense_submit", Class: ClassEffectful}}) {
 		t.Fatalf("expense tools = %+v", got)
 	}
 	if j.Catalog != set.Catalog() || len(j.Skills) != 1 || j.Skills[0].Name != "planner" || !j.Skills[0].AllowSupportingFiles {
@@ -107,7 +107,7 @@ func TestCompileValidConfig(t *testing.T) {
 }
 
 func TestCompileSkipsDotfilesAndReadsOpScalarVsList(t *testing.T) {
-	yaml := "catalog:\n  operation_meta_key: op\njourneys:\n  - id: j\n    skill: skills/planner\n    tools:\n      - op: a\n      - op: [b, c]\n"
+	yaml := "catalog:\n  operation_meta_key: op\njourneys:\n  - id: j\n    skill: skills/planner\n    tools:\n      - op: a\n      - op: [b, c]\n        alias: bc\n"
 	path := writeCompileTree(t, yaml, map[string]string{
 		"skills/planner/.DS_Store":      "junk",
 		"skills/planner/.hidden/x.md":   "hidden",
@@ -163,29 +163,39 @@ func TestCompileRejects(t *testing.T) {
 		{name: "no tools", yaml: journey("")},
 		{name: "op and tags", yaml: tools("      - op: a\n        tags: [x]\n")},
 		{name: "neither op nor tags", yaml: tools("      - class: read_only\n")},
+		{name: "class on tag selector", yaml: tools("      - tags: [x]\n        class: read_only\n")},
 		{name: "empty tags", yaml: tools("      - tags: []\n")},
 		{name: "duplicate tags", yaml: tools("      - tags: [x, x]\n")},
 		{name: "empty op list", yaml: tools("      - op: []\n")},
 		{name: "empty op alternative", yaml: tools("      - op: [a, \"\"]\n")},
 		{name: "empty op scalar", yaml: tools("      - op: \"\"\n")},
 		{name: "op mapping", yaml: tools("      - op: {a: b}\n")},
-		{name: "duplicate alternative", yaml: tools("      - op: [a, a]\n")},
+		{name: "duplicate alternative", yaml: tools("      - op: [a, a]\n        alias: x\n")},
 		{name: "invalid class", yaml: tools("      - op: a\n        class: deduplicated\n")},
 		{name: "invalid approval", yaml: tools("      - op: a\n        approval: always\n")},
 		{name: "idempotent without header", yaml: "catalog:\n  operation_meta_key: op\njourneys:\n  - id: j\n    skill: skills/planner\n    tools:\n      - op: a\n        class: idempotent\n"},
 		{name: "min >= max", yaml: journey("    product_versions: {min: \"2027.1\", max_exclusive: \"2026.2\"}\n    tools:\n      - op: a\n")},
 		{name: "min == max", yaml: journey("    product_versions: {min: \"1\", max_exclusive: \"1\"}\n    tools:\n      - op: a\n")},
-		{name: "op key in two selectors", yaml: tools("      - op: a\n      - op: [b, a]\n")},
-		{name: "denied key in op selector", yaml: journey("    deny: [a]\n    tools:\n      - op: [b, a]\n")},
+		{name: "op key in two selectors", yaml: tools("      - op: a\n      - op: [b, a]\n        alias: x\n")},
+		{name: "denied key in op selector", yaml: journey("    deny: [a]\n    tools:\n      - op: [b, a]\n        alias: x\n")},
 		{name: "empty deny", yaml: journey("    deny: [\"\"]\n    tools:\n      - op: a\n")},
 		{name: "max_tools 0", yaml: journey("    max_tools: 0\n    tools:\n      - op: a\n")},
 		{name: "max_tools 65", yaml: journey("    max_tools: 65\n    tools:\n      - op: a\n")},
 		{name: "reserved request_user_input", yaml: tools("      - op: request_user_input\n")},
-		{name: "reserved activate_journey", yaml: tools("      - op: [x, activate_journey]\n")},
+		{name: "reserved activate_journey", yaml: tools("      - op: [x, y]\n        alias: activate_journey\n")},
 		{name: "alias reserved via punctuation", yaml: tools("      - op: activate.journey\n")},
 		{name: "invalid alias digit", yaml: tools("      - op: 9lives\n")},
 		{name: "invalid alias length", yaml: tools("      - op: " + strings.Repeat("a", 70) + "\n")},
 		{name: "alias collision", yaml: tools("      - op: a.b\n      - op: a_b\n")},
+		{name: "multi-alternative without alias", yaml: tools("      - op: [a, b]\n")},
+		{name: "alias on tag selector", yaml: tools("      - tags: [x]\n        alias: x\n")},
+		{name: "invalid explicit alias", yaml: tools("      - op: a\n        alias: \"bad-alias\"\n")},
+		{name: "alias starting with digit", yaml: tools("      - op: a\n        alias: 9x\n")},
+		{name: "alias too long", yaml: tools("      - op: a\n        alias: " + strings.Repeat("a", 65) + "\n")},
+		{name: "reserved explicit alias", yaml: tools("      - op: a\n        alias: read_skill_resource\n")},
+		{name: "duplicate explicit alias", yaml: tools("      - op: a\n        alias: x\n      - op: [b, c]\n        alias: x\n")},
+		{name: "explicit alias equals derived alias", yaml: tools("      - op: a.b\n      - op: c\n        alias: a_b\n")},
+		{name: "alias with different alternatives across journeys", yaml: compileMinimal + "  - id: k\n    skill: skills/planner\n    tools:\n      - op: b\n        alias: lookup\n"},
 		{name: "invalid call id header", yaml: "catalog:\n  operation_meta_key: op\n  call_id_header: \"bad header\"\njourneys:\n  - id: j\n    skill: skills/planner\n    tools:\n      - op: a\n"},
 		{name: "removed key system_prompt", yaml: strings.Replace(compileMinimal, "    skill: skills/planner\n", "    skill: skills/planner\n    system_prompt: prompts/p.md\n", 1), extra: map[string]string{"prompts/p.md": "SECRET-PROMPT-BODY\n"}},
 		{name: "removed key routing", yaml: strings.Replace(compileMinimal, "    skill: skills/planner\n", "    skill: skills/planner\n    routing: {default: true}\n", 1)},
@@ -495,7 +505,7 @@ func TestCompileRepositoryConfig(t *testing.T) {
 	if len(journeys[0].Skills) != 1 || journeys[0].Skills[0].Name != "planner" {
 		t.Fatalf("vacation-planner = %+v", journeys[0])
 	}
-	if got, want := journeys[0].Tools, []Selector{{Ops: []string{"lookup_destination"}, Class: ClassReadOnly}}; !reflect.DeepEqual(got, want) {
+	if got, want := journeys[0].Tools, []Selector{{Ops: []string{"lookup_destination"}, Alias: "lookup_destination", Class: ClassReadOnly}}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("vacation-planner tools = %+v", got)
 	}
 	swap := journeys[1]
@@ -503,8 +513,8 @@ func TestCompileRepositoryConfig(t *testing.T) {
 		t.Fatalf("shift-swap = %+v", swap)
 	}
 	want := []Selector{
-		{Ops: []string{"lookup_shift"}, Class: ClassReadOnly},
-		{Ops: []string{"request_shift_swap"}}, // unclassified: effectful, approval required
+		{Ops: []string{"lookup_shift"}, Alias: "lookup_shift", Class: ClassReadOnly},
+		{Ops: []string{"request_shift_swap"}, Alias: "request_shift_swap"}, // unclassified: effectful, approval required
 	}
 	if !reflect.DeepEqual(swap.Tools, want) {
 		t.Fatalf("shift-swap tools = %+v, want %+v", swap.Tools, want)
@@ -705,15 +715,33 @@ func TestCompilePolicyConflict(t *testing.T) {
 		},
 		{
 			name:   "key conflict through op alternatives",
-			first:  "      - op: [other, lookup]\n        class: read_only\n",
+			first:  "      - op: [other, lookup]\n        alias: pick\n        class: read_only\n",
 			second: "      - op: lookup\n",
 			want:   `definitions: operation "lookup" has conflicting policies in journeys alpha, zeta`,
 		},
 		{
 			name:   "alias conflict between two keys",
-			first:  "      - op: a.b\n        class: read_only\n",
-			second: "      - op: a_b\n",
-			want:   `definitions: alias "a_b" has conflicting policies in journeys alpha, zeta`,
+			first:  "      - op: [a, b]\n        alias: pick\n        class: read_only\n",
+			second: "      - op: [a, b]\n        alias: pick\n",
+			want:   `definitions: operation "a" has conflicting policies in journeys alpha, zeta`,
+		},
+		{
+			name:   "same alias and ops, different class",
+			first:  "      - op: [a, b]\n        alias: pick\n        class: read_only\n",
+			second: "      - op: [a, b]\n        alias: pick\n",
+			want:   `definitions: operation "a" has conflicting policies in journeys alpha, zeta`,
+		},
+		{
+			name:   "same alias and ops, different approval",
+			first:  "      - op: [a, b]\n        alias: pick\n        class: read_only\n",
+			second: "      - op: [a, b]\n        alias: pick\n        class: read_only\n        approval: required\n",
+			want:   `definitions: operation "a" has conflicting policies in journeys alpha, zeta`,
+		},
+		{
+			name:   "one alias, different alternative lists",
+			first:  "      - op: a.b\n        alias: pick\n",
+			second: "      - op: a_b\n        alias: pick\n",
+			want:   `definitions: alias "pick" names different operations in journeys alpha, zeta`,
 		},
 	}
 	for _, tc := range cases {
@@ -731,8 +759,8 @@ func TestCompilePolicyConflictAcceptsEqualPolicies(t *testing.T) {
 	cases := []struct{ name, first, second string }{
 		{"same policy", "      - op: lookup\n        class: read_only\n", "      - op: lookup\n        class: read_only\n"},
 		{"unset class equals effectful", "      - op: lookup\n", "      - op: lookup\n        class: effectful\n"},
-		{"alias with equal policies", "      - op: a.b\n", "      - op: a_b\n        class: effectful\n"},
-		{"tag selectors are not checked", "      - tags: [x]\n        class: read_only\n", "      - tags: [x]\n"},
+		{"alias with equal ops and policies", "      - op: [a, b]\n        alias: pick\n", "      - op: [a, b]\n        alias: pick\n        class: effectful\n"},
+		{"tag selectors are not checked", "      - tags: [x]\n", "      - tags: [x]\n        approval: required\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -741,5 +769,30 @@ func TestCompilePolicyConflictAcceptsEqualPolicies(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestCompileSelectorAlias(t *testing.T) {
+	yaml := "catalog:\n  operation_meta_key: op\njourneys:\n  - id: j\n    skill: skills/planner\n    tools:\n" +
+		"      - op: a.b\n      - op: c\n        alias: renamed\n      - op: [d, e]\n        alias: pick\n      - tags: [t]\n"
+	set, err := Compile(writeCompileTree(t, yaml, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, _ := set.Journey("j")
+	var got []string
+	for _, s := range j.Tools {
+		got = append(got, s.Alias)
+	}
+	if want := []string{"a_b", "renamed", "pick", ""}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("aliases = %q, want %q", got, want)
+	}
+}
+
+func TestValidAlias(t *testing.T) {
+	for s, want := range map[string]bool{"a": true, "_x1": true, "A_b": true, "": false, "1a": false, "a-b": false, "a.b": false, strings.Repeat("a", 64): true, strings.Repeat("a", 65): false} {
+		if ValidAlias(s) != want {
+			t.Errorf("ValidAlias(%q) = %v", s, !want)
+		}
 	}
 }

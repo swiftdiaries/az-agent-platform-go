@@ -54,6 +54,8 @@ data:
   AGENT_PLATFORM_COST_GATE: open
   # key=Header-Name pairs; blank uses the X-Agent-* defaults.
   AGENT_PLATFORM_COST_HEADERS: ""
+  # Required: model=tokens pairs; the key must equal AZ_AGENT_FOUNDRY_DEPLOYMENT.
+  AGENT_PLATFORM_HISTORY_BUDGET: <required-foundry-deployment>=64000
   OTEL_SERVICE_NAME: az-agent-platform
   OTEL_SERVICE_VERSION: <required-release-version>
   OTEL_EXPORTER_OTLP_ENDPOINT: ""

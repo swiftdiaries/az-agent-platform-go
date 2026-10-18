@@ -1,11 +1,15 @@
 package catalog
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,8 +35,8 @@ type journeySpec struct {
 	ops []string
 }
 
-// compileSet writes a config with one read_only op selector per op key and
-// compiles it.
+// compileSet writes a config with one read_only op selector per op entry and
+// compiles it. An entry "k.v2,k@alias" is a multi-alternative selector.
 func compileSet(t *testing.T, journeys ...journeySpec) *definitions.Set {
 	t.Helper()
 	dir := t.TempDir()
@@ -49,6 +53,10 @@ func compileSet(t *testing.T, journeys ...journeySpec) *definitions.Set {
 		}
 		fmt.Fprintf(&b, "  - id: %s\n    skill: skills/%s\n    tools:\n", j.id, j.id)
 		for _, op := range j.ops {
+			if list, alias, ok := strings.Cut(op, "@"); ok {
+				fmt.Fprintf(&b, "      - op: [%s]\n        alias: %s\n        class: read_only\n", list, alias)
+				continue
+			}
 			fmt.Fprintf(&b, "      - op: %s\n        class: read_only\n", op)
 		}
 	}
@@ -408,6 +416,28 @@ func TestOpenResolvesAliasesAcrossTenants(t *testing.T) {
 	}
 }
 
+// A multi-alternative selector exposes one alias whichever alternative the
+// tenant's snapshot carries, and Call sends that tenant's own remote name.
+func TestOpenResolvesAliasesAcrossTenantsAlternatives(t *testing.T) {
+	for _, tc := range []struct{ remote, key string }{{"lookup_v2", "travel.lookup.v2"}, {"lookup_v1", "travel.lookup"}} {
+		t.Run(tc.key, func(t *testing.T) {
+			e := newEnv(t, mcptest.Options{}, mcptest.Tool{Name: tc.remote, OperationKey: tc.key, Description: "d"})
+			e.set = compileSet(t, journeySpec{"j", []string{"travel.lookup.v2,travel.lookup@lookup"}})
+			b := e.open(t, e.claim(t, "r1"), Options{})
+			tools := b.Tools("j")
+			if len(tools) != 1 || tools[0].Name() != "lookup" {
+				t.Fatalf("Tools = %+v", tools)
+			}
+			if _, err := b.Call(t.Context(), "call-1", "lookup", []byte(`{}`)); err != nil {
+				t.Fatal(err)
+			}
+			if e.server.Calls(tc.remote) != 1 {
+				t.Fatalf("Calls(%q) = %d", tc.remote, e.server.Calls(tc.remote))
+			}
+		})
+	}
+}
+
 func TestBindingCallSendsRemoteName(t *testing.T) {
 	for _, remote := range []string{"travel/lookup", "travel lookup"} {
 		t.Run(remote, func(t *testing.T) {
@@ -516,8 +546,8 @@ func TestOpenUnavailableJourney(t *testing.T) {
 }
 
 // compileTagSet writes one journey per spec, each with a single tag selector
-// of the given class, so policies are known only after resolution.
-func compileTagSet(t *testing.T, specs map[string][2]string) *definitions.Set {
+// or op selector given as YAML, so policies are known only after resolution.
+func compileTagSet(t *testing.T, specs map[string]string) *definitions.Set {
 	t.Helper()
 	dir := t.TempDir()
 	var b strings.Builder
@@ -535,7 +565,7 @@ func compileTagSet(t *testing.T, specs map[string][2]string) *definitions.Set {
 		if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skill), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		fmt.Fprintf(&b, "  - id: %s\n    skill: skills/%s\n    tools:\n      - tags: [%s]\n        class: %s\n", id, id, spec[0], spec[1])
+		fmt.Fprintf(&b, "  - id: %s\n    skill: skills/%s\n    tools:\n%s", id, id, spec)
 	}
 	path := filepath.Join(dir, "journeys.yaml")
 	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
@@ -553,10 +583,10 @@ func TestOpenPolicyConflict(t *testing.T) {
 		mcptest.Tool{Name: "travel/book", OperationKey: "travel.book", Tags: []string{"shared"}},
 		mcptest.Tool{Name: "travel/lookup", OperationKey: "travel.lookup", Tags: []string{"solo"}},
 	)
-	e.set = compileTagSet(t, map[string][2]string{
-		"tagA":  {"shared", "effectful"},
-		"tagB":  {"shared", "idempotent"},
-		"plain": {"solo", "read_only"},
+	e.set = compileTagSet(t, map[string]string{
+		"tagA":  "      - tags: [shared]\n",
+		"tagB":  "      - op: travel.book\n        class: read_only\n",
+		"plain": "      - tags: [solo]\n",
 	})
 	b := e.open(t, e.claim(t, "r1"), Options{})
 	for _, id := range []string{"tagA", "tagB"} {
@@ -574,5 +604,75 @@ func TestOpenPolicyConflict(t *testing.T) {
 	}
 	if _, ok := b.Tool("plain", "travel_lookup"); !ok {
 		t.Fatal("plain journey lost its tool")
+	}
+}
+
+func TestBindingCallNotPermitted(t *testing.T) {
+	other := mcptest.Tool{Name: "travel/other", Description: "Other", OperationKey: "travel.other"}
+	e := newEnv(t, mcptest.Options{}, lookupTool(), other)
+	e.set = compileSet(t, journeySpec{"j", []string{"travel.lookup", "travel.other"}})
+	e.server.Forbid("travel/lookup")
+	b := e.open(t, e.claim(t, "r1"), Options{})
+	_, err := b.Call(t.Context(), "call-1", "travel_lookup", []byte(`{}`))
+	if !errors.Is(err, ErrNotPermitted) || errors.Is(err, ErrAuthRequired) {
+		t.Fatalf("Call error = %v, want ErrNotPermitted only", err)
+	}
+	if strings.Contains(err.Error(), e.server.URL()) {
+		t.Fatalf("error leaks the URL: %v", err)
+	}
+	if got := e.server.Count("tools/call"); got != 1 {
+		t.Fatalf("tools/call count = %d, want 1", got)
+	}
+	if _, err := b.Call(t.Context(), "call-2", "travel_other", []byte(`{}`)); err != nil {
+		t.Fatalf("second Call: %v", err)
+	}
+	if got := e.server.Count("tools/call"); got != 2 {
+		t.Fatalf("tools/call count = %d, want 2", got)
+	}
+	if _, err := b.Call(t.Context(), "call-3", "travel_lookup", []byte(`{}`)); !errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("third Call error = %v, want ErrNotPermitted", err)
+	}
+	if got := e.server.Calls("travel/lookup"); got != 2 {
+		t.Fatalf("lookup reached the server %d times, want 2", got)
+	}
+}
+
+// forbidding wraps a real MCP server, answering 403 to the named JSON-RPC
+// method and proxying everything else.
+func forbidding(t *testing.T, e *env, method string) tenantdir.Endpoint {
+	t.Helper()
+	target, err := url.Parse(e.server.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		if strings.Contains(string(body), `"method":"`+method+`"`) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(front.Close)
+	return endpointFor(t, "ep-1", front.URL)
+}
+
+func TestOpenForbiddenInitialize(t *testing.T) {
+	e := newEnv(t, mcptest.Options{})
+	e.scope.Endpoint = forbidding(t, e, "initialize")
+	_, err := Open(t.Context(), e.scope, cookieCredential(), e.store, e.claim(t, "r1"), e.set, Options{})
+	if !errors.Is(err, ErrAuthRequired) || errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("Open error = %v, want ErrAuthRequired", err)
+	}
+}
+
+func TestOpenForbiddenToolsList(t *testing.T) {
+	e := newEnv(t, mcptest.Options{})
+	e.scope.Endpoint = forbidding(t, e, "tools/list")
+	_, err := Open(t.Context(), e.scope, cookieCredential(), e.store, e.claim(t, "r1"), e.set, Options{})
+	if !errors.Is(err, ErrAuthRequired) || errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("Open error = %v, want ErrAuthRequired", err)
 	}
 }

@@ -194,3 +194,70 @@ func TestActivateRemove(t *testing.T) {
 		})
 	}
 }
+
+func TestTouchTable(t *testing.T) {
+	tests := []struct {
+		name        string
+		start       []string
+		id          string
+		wantChanged bool
+		wantIDs     []string
+	}{
+		{"LRU moves to MRU", []string{"J1", "J2", "J3"}, "J1", true, []string{"J2", "J3", "J1"}},
+		{"middle moves to MRU", []string{"J1", "J2", "J3"}, "J2", true, []string{"J1", "J3", "J2"}},
+		{"already MRU", []string{"J1", "J2"}, "J2", false, []string{"J1", "J2"}},
+		{"absent", []string{"J1", "J2"}, "J9", false, []string{"J1", "J2"}},
+		{"empty id", []string{"J1", "J2"}, "", false, []string{"J1", "J2"}},
+		{"single member is MRU", []string{"J1"}, "J1", false, []string{"J1"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := NewActiveSet(tc.start)
+			if got := a.Touch(tc.id); got != tc.wantChanged {
+				t.Fatalf("Touch(%q) = %v, want %v", tc.id, got, tc.wantChanged)
+			}
+			if got := ids(t, a); !reflect.DeepEqual(got, tc.wantIDs) {
+				t.Fatalf("ids = %v, want %v", got, tc.wantIDs)
+			}
+		})
+	}
+}
+
+func TestTouchZeroValue(t *testing.T) {
+	var a ActiveSet
+	if a.Touch("J1") {
+		t.Fatal("Touch on zero value reported a change")
+	}
+	if a.Len() != 0 {
+		t.Fatalf("Len = %d, want 0", a.Len())
+	}
+}
+
+func TestTouchNeverEvicts(t *testing.T) {
+	a := NewActiveSet([]string{"J1", "J2", "J3"})
+	const limit = 2
+	if !a.Touch("J1") {
+		t.Fatal("Touch(J1) reported no change")
+	}
+	if a.Len() <= limit {
+		t.Fatalf("Len = %d, want above limit %d", a.Len(), limit)
+	}
+	if want := []string{"J2", "J3", "J1"}; !reflect.DeepEqual(ids(t, a), want) {
+		t.Fatalf("ids = %v, want %v", ids(t, a), want)
+	}
+}
+
+func TestTouchThenActivateEvictsRightLRU(t *testing.T) {
+	a := NewActiveSet([]string{"J1", "J2"})
+	a.Touch("J1")
+	evicted, err := a.Activate("J3", 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"J2"}; !reflect.DeepEqual(evicted, want) {
+		t.Fatalf("evicted = %v, want %v", evicted, want)
+	}
+	if want := []string{"J1", "J3"}; !reflect.DeepEqual(ids(t, a), want) {
+		t.Fatalf("ids = %v, want %v", ids(t, a), want)
+	}
+}

@@ -3,8 +3,10 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,6 +18,7 @@ import (
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/microsoft/agent-framework-go/message"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
@@ -820,7 +823,7 @@ func TestE2EConversationAgent(t *testing.T) {
 				}
 				return agentruntime.ModelResponse{ToolCalls: []agentruntime.ToolCall{{CallID: "s4-lookup", Name: "travel_lookup", Arguments: json.RawMessage(`{}`)}}}, nil
 			}),
-			activate("visas"),         // 3: third journey evicts the LRU one
+			activate("visas"),         // 3: third journey evicts the LRU one (hotels; the dispatched travel_lookup bumped planner)
 			modeltest.Text("A1 done"), // 4
 			// Run A2: alice's user layer narrows the limit to 1.
 			activate("planner"),       // 5
@@ -908,23 +911,23 @@ func TestE2EConversationAgent(t *testing.T) {
 		expect(2, []string{"hotel_search", "travel_lookup"}, "planner", "hotels")
 		result(2, "s4-act-hotels", `{"activated":"hotels"}`)
 		result(2, "s4-sibling", notExecuted)
-		expect(3, []string{"hotel_search", "travel_lookup"}, "planner", "hotels")
+		expect(3, []string{"hotel_search", "travel_lookup"}, "hotels", "planner") // dispatching travel_lookup bumped planner
 		if got := e2eResult(t, model.Requests()[3], "s4-lookup"); strings.Contains(got, `"error"`) {
 			t.Errorf("executed travel_lookup result = %s, want a tool result", got)
 		}
-		expect(4, []string{"hotel_search", "visa_check"}, "hotels", "visas")
-		result(4, "modeltest-call-3", `{"activated":"visas","evicted":["planner"]}`)
+		expect(4, []string{"travel_lookup", "visa_check"}, "planner", "visas")
+		result(4, "modeltest-call-3", `{"activated":"visas","evicted":["hotels"]}`)
 		if got := vN.Calls("travel/lookup"); got != 1 {
 			t.Errorf("MCP travel/lookup calls = %d, want 1 (the sibling must not run)", got)
 		}
-		requireActive("after A1", testPrincipal, threadA, "hotels", "visas")
+		requireActive("after A1", testPrincipal, threadA, "planner", "visas")
 
 		// Run A2: a user-level setting narrows A's limit to 1; the next run start evicts down.
 		if err := source.Set(settingsDoc(&one)); err != nil {
 			t.Fatal(err)
 		}
 		chat(b, tokenA, threadA, "e2e-s4-a2", "narrow")
-		expect(5, []string{"visa_check"}, "visas") // hotels (LRU) was evicted at run start
+		expect(5, []string{"visa_check"}, "visas") // planner (LRU) was evicted at run start
 		expect(6, []string{"travel_lookup"}, "planner")
 		result(6, "modeltest-call-5", `{"activated":"planner","evicted":["visas"]}`)
 		requireActive("after A2", testPrincipal, threadA, "planner")
@@ -1539,7 +1542,16 @@ func TestE2EConversationAgent(t *testing.T) {
 		}
 	})
 	t.Run("S8", func(t *testing.T) {
-		stage(t, 8, "H7")
+		stage(t, 8, "H6b")
+		// Design corrections: one alias across tenants and a version flip (M4), history truncation (M5), idle definition re-pin (M6), dispatch keeps a journey active (M9) and 403 as a tool result (M15). Each block has its own database, definition set and replicas.
+		t.Run("M4 alias", e2eS8Alias)
+		t.Run("M5 history budget", e2eS8HistoryBudget)
+		t.Run("M6 definition re-pin", e2eS8Repin)
+		t.Run("M9 dispatch touches", e2eS8Touch)
+		t.Run("M15 not permitted", e2eS8NotPermitted)
+	})
+	t.Run("S9", func(t *testing.T) {
+		stage(t, 9, "H7")
 		// An apply-then-drop-response effect yields outcome_unknown with no retry and a pinned journey, and the trace carries no content, tool descriptions or remote names.
 	})
 }
@@ -1748,4 +1760,515 @@ func e2eInternalRun(t *testing.T, pool *pgxpool.Pool, thread, external string) s
 		t.Fatalf("internal id of run %s: %v", external, err)
 	}
 	return id
+}
+
+// e2eS8Journey is one S8 journey: its id and its YAML tool entries (already
+// indented six spaces).
+type e2eS8Journey struct{ id, tools string }
+
+// e2eS8Path writes an S8 bundle whose skill bodies are "BODY <id> <prompt>" and
+// returns the journeys.yaml path.
+func e2eS8Path(t *testing.T, prompt string, journeys ...e2eS8Journey) string {
+	t.Helper()
+	root := t.TempDir()
+	config := "catalog:\n  operation_meta_key: " + testMetaKey + "\n  call_id_header: X-Platform-Call-ID\njourneys:\n"
+	for _, j := range journeys {
+		dir := filepath.Join(root, "skills", j.id)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		skill := "---\nname: " + j.id + "\ndescription: The " + j.id + " journey\n---\nBODY " + j.id + " " + prompt + "\n"
+		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skill), 0600); err != nil {
+			t.Fatal(err)
+		}
+		config += "  - id: " + j.id + "\n    skill: skills/" + j.id + "\n    tools:\n" + j.tools
+	}
+	path := filepath.Join(root, "journeys.yaml")
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// e2eS8Set compiles an S8 bundle.
+func e2eS8Set(t *testing.T, prompt string, journeys ...e2eS8Journey) *definitions.Set {
+	t.Helper()
+	return compileSet(t, e2eS8Path(t, prompt, journeys...))
+}
+
+// e2eS8ReadOnly is the YAML tool entry selecting one read_only operation.
+func e2eS8ReadOnly(op string) string { return "      - op: " + op + "\n        class: read_only\n" }
+
+// e2eS8Chat posts one chat run as the bearer token and requires RUN_FINISHED unless
+// the caller passes allowError.
+func e2eS8Chat(t *testing.T, replica acceptanceReplica, token, thread, run string, input aguitypes.RunAgentInput) string {
+	t.Helper()
+	input.ThreadID, input.RunID = thread, run
+	return e2eReadBody(t, run, acceptancePostWithHeaders(t, replica.url, input, http.Header{"Authorization": {"Bearer " + token}}))
+}
+
+// e2eS8Say is a user message, optionally targeting a journey.
+func e2eS8Say(text, journey string) aguitypes.RunAgentInput {
+	input := aguitypes.RunAgentInput{Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: text}}}
+	if journey != "" {
+		input.ForwardedProps = map[string]any{"journeyId": journey}
+	}
+	return input
+}
+
+// e2eS8Finished requires a finished run whose body contains want.
+func e2eS8Finished(t *testing.T, name, body, want string) {
+	t.Helper()
+	if !strings.Contains(body, "RUN_FINISHED") || !strings.Contains(body, want) || strings.Contains(body, "RUN_ERROR") {
+		t.Fatalf("%s did not finish with %q: %s", name, want, body)
+	}
+}
+
+// e2eS8Tenancy builds a tenancy from endpoint id -> URL and tenant -> directory entry with default settings.
+func e2eS8Tenancy(t *testing.T, urls map[string]string, entries map[string]tenantdir.Entry) (agentruntime.Tenancy, *tenantdir.Mutable) {
+	t.Helper()
+	allow, err := tenantdir.NewAllowlist(urls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := settings.NewMutable(settings.Document{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := tenantdir.NewMutable(entries)
+	return agentruntime.Tenancy{Directory: directory, Endpoints: allow, Settings: source}, directory
+}
+
+// e2eS8Active is agent_conversations.active_journeys (least recently used first).
+func e2eS8Active(t *testing.T, pool *pgxpool.Pool, principal, external string) []string {
+	t.Helper()
+	var raw []byte
+	if err := pool.QueryRow(t.Context(), `SELECT active_journeys FROM agent_conversations WHERE id=$1`, acceptanceThreadFor(t, pool, principal, external)).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	if err := json.Unmarshal(raw, &ids); err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+// e2eS8Alias is M4: one alias for a [k.v2, k] selector across two tenants on different alternatives and across a version flip.
+func e2eS8Alias(t *testing.T) {
+	const (
+		alias   = "leave_request"
+		remoteA = "leave/request"      // tenant A, vN: only leave.request
+		remoteB = "leave request v2"   // tenant B: only leave.request.v2
+		remoteN = "leave:request v2 A" // tenant A after the flip: leave.request.v2
+	)
+	pool := database(t)
+	set := e2eS8Set(t, "alias", e2eS8Journey{"leave", "      - op: [leave.request.v2, leave.request]\n        alias: " + alias + "\n        class: read_only\n"})
+	epA := mcptest.New(t, mcptest.Options{Name: "e2e-s8-a", Version: "vN"}, mcptest.Catalog{Tools: []mcptest.Tool{{Name: remoteA, OperationKey: "leave.request", Result: "granted"}}})
+	epB := mcptest.New(t, mcptest.Options{Name: "e2e-s8-b", Version: "vN+1"}, mcptest.Catalog{Tools: []mcptest.Tool{{Name: remoteB, OperationKey: "leave.request.v2", Result: "granted"}}})
+	epN := mcptest.New(t, mcptest.Options{Name: "e2e-s8-n", Version: "vN+2"}, mcptest.Catalog{Tools: []mcptest.Tool{{Name: remoteN, OperationKey: "leave.request.v2", Result: "granted"}}})
+	tenancy, directory := e2eS8Tenancy(t,
+		map[string]string{"java-a": epA.URL(), "java-b": epB.URL(), "java-n": epN.URL()},
+		map[string]tenantdir.Entry{
+			"tenant-a": {ProductVersion: "vN", EndpointID: "java-a"},
+			"tenant-b": {ProductVersion: "vN+1", EndpointID: "java-b"},
+		})
+	model := modeltest.New(
+		modeltest.Call(alias, struct{}{}), modeltest.Text("A1 done"), // 0, 1: tenant A on leave.request
+		modeltest.Call(alias, struct{}{}), modeltest.Text("B1 done"), // 2, 3: tenant B on leave.request.v2
+		modeltest.Call(alias, struct{}{}), modeltest.Text("A2 done"), // 4, 5: tenant A after the flip
+	)
+	a, b, c := threeReplicas(t, pool, set, model, tenancy)
+
+	e2eS8Finished(t, "A1", e2eS8Chat(t, a, "token", "e2e-s8-alias-a", "e2e-s8-alias-a1", e2eS8Say("leave please", "leave")), "A1 done")
+	e2eS8Finished(t, "B1", e2eS8Chat(t, b, "token-b", "e2e-s8-alias-b", "e2e-s8-alias-b1", e2eS8Say("leave please", "leave")), "B1 done")
+	if epA.Calls(remoteA) != 1 || epB.Calls(remoteB) != 1 || epA.Count("tools/call") != 1 || epB.Count("tools/call") != 1 {
+		t.Fatalf("MCP calls: A %q=%d (tools/call %d), B %q=%d (tools/call %d); want one each", remoteA, epA.Calls(remoteA), epA.Count("tools/call"), remoteB, epB.Calls(remoteB), epB.Count("tools/call"))
+	}
+
+	// The tenant moves to the version whose catalog has leave.request.v2 under another remote name.
+	directory.Set("tenant-a", tenantdir.Entry{ProductVersion: "vN+2", EndpointID: "java-n"})
+	e2eS8Finished(t, "A2", e2eS8Chat(t, c, "token", "e2e-s8-alias-a", "e2e-s8-alias-a2", e2eS8Say("again", "")), "A2 done")
+	if epN.Calls(remoteN) != 1 || epN.Count("tools/call") != 1 {
+		t.Errorf("flipped endpoint %q calls = %d (tools/call %d), want 1", remoteN, epN.Calls(remoteN), epN.Count("tools/call"))
+	}
+	if epA.Calls(remoteA) != 1 || epA.Count("tools/call") != 1 {
+		t.Errorf("old endpoint calls after the flip = %d (tools/call %d), want unchanged 1", epA.Calls(remoteA), epA.Count("tools/call"))
+	}
+
+	requests := model.Requests()
+	if len(requests) != 6 {
+		t.Fatalf("model requests = %d, want 6", len(requests))
+	}
+	for _, i := range []int{0, 2, 4} {
+		if got := e2eJourneyAliases(requests[i]); !slices.Equal(got, []string{alias}) {
+			t.Errorf("request %d journey aliases = %v, want [%s]", i, got, alias)
+		}
+	}
+	for i, request := range requests {
+		dump := fmt.Sprintf("%+v", request)
+		for _, remote := range []string{remoteA, remoteB, remoteN} {
+			if strings.Contains(dump, remote) {
+				t.Errorf("model request %d mentions remote name %q", i, remote)
+			}
+		}
+	}
+	for _, i := range []int{1, 3, 5} {
+		if got := e2eResult(t, requests[i], fmt.Sprintf("modeltest-call-%d", i-1)); strings.Contains(got, `"error"`) {
+			t.Errorf("request %d result = %s, want a tool result", i, got)
+		}
+	}
+}
+
+// e2eS8HistoryBudget is M5: with a budget that fits about two turns, the fourth provider request omits the oldest turns, keeps every call paired with its result, and leaves one counts-only history_truncated event; the persisted history keeps all four turns.
+func e2eS8HistoryBudget(t *testing.T) {
+	const (
+		sentinel = "azap-s8-history-sentinel-7f3a91"
+		// A turn is ~2.5KB of user text (~625 estimated tokens at 4 bytes per token) plus
+		// a short answer, so 1700 tokens (6.8KB) fits two turns and not three.
+		budget = 1700
+	)
+	turnText := func(n int) string {
+		head := fmt.Sprintf("TURN-%d-MARKER ", n)
+		if n == 1 {
+			head += sentinel + " "
+		}
+		return head + strings.Repeat("lorem ipsum dolor ", 140)
+	}
+	pool := database(t)
+	set := e2eS8Set(t, "history", e2eS8Journey{"planner", e2eS8ReadOnly("travel.lookup")})
+	endpoint := mcptest.New(t, mcptest.Options{Name: "e2e-s8-history", Version: "vN"}, mcptest.Catalog{Tools: []mcptest.Tool{{Name: "travel/lookup", OperationKey: "travel.lookup", Result: "Kyoto is available"}}})
+	tenancy := testTenancy(t, endpoint.URL())
+	tenancy.HistoryBudget = budget
+	model := modeltest.New(
+		modeltest.Text("answer 1"), // 0
+		modeltest.Text("answer 2"), // 1
+		modeltest.Call("travel_lookup", map[string]any{"destination": "Kyoto"}), // 2: turn 3 holds a call
+		modeltest.Text("answer 3"), // 3
+		modeltest.Text("answer 4"), // 4
+	)
+	a, b, c := threeReplicas(t, pool, set, model, tenancy)
+	const thread = "e2e-s8-history"
+	replicas := []acceptanceReplica{a, b, c, a}
+	for i := 1; i <= 4; i++ {
+		journey := ""
+		if i == 1 {
+			journey = "planner"
+		}
+		e2eS8Finished(t, fmt.Sprintf("turn %d", i), e2eS8Chat(t, replicas[i-1], "token", thread, fmt.Sprintf("e2e-s8-history-%d", i), e2eS8Say(turnText(i), journey)), fmt.Sprintf("answer %d", i))
+	}
+	requests := model.Requests()
+	if len(requests) != 5 {
+		t.Fatalf("model requests = %d, want 5", len(requests))
+	}
+
+	// The fourth turn's provider request.
+	last := requests[4]
+	var firstUser, texts string
+	calls, results := map[string]bool{}, map[string]bool{}
+	for _, m := range last.ProviderMessages {
+		if m.Role == message.RoleUser && firstUser == "" {
+			firstUser = m.String()
+		}
+		texts += m.String() + "\n"
+		for _, content := range m.Contents {
+			switch content := content.(type) {
+			case *message.FunctionCallContent:
+				calls[content.CallID] = true
+			case *message.FunctionResultContent:
+				results[content.CallID] = true
+			}
+		}
+	}
+	if firstUser == "" || strings.Contains(firstUser, "TURN-1-MARKER") || strings.Contains(firstUser, "TURN-2-MARKER") {
+		t.Errorf("request 4 first user message = %.60q, want a turn after the oldest", firstUser)
+	}
+	if strings.Contains(texts, "TURN-1-MARKER") || strings.Contains(texts, sentinel) || !strings.Contains(texts, "TURN-4-MARKER") {
+		t.Errorf("request 4 messages: want turn 1 omitted and turn 4 present")
+	}
+	if len(calls) == 0 || !maps.Equal(calls, results) {
+		t.Errorf("request 4 function calls %v and results %v, want a non-empty call set with a result for each", calls, results)
+	}
+	// The untrimmed requests keep turn 1.
+	if !strings.Contains(strings.Join(requests[1].Messages, "\n"), "TURN-1-MARKER") {
+		t.Error("request 1 (two turns) lost turn 1 although it fits the budget")
+	}
+
+	// Exactly one counts-only event for the run that trimmed.
+	threadID := acceptanceThread(t, pool, thread)
+	runID := e2eInternalRun(t, pool, threadID, "e2e-s8-history-4")
+	var raw []byte
+	var n int
+	if err := pool.QueryRow(t.Context(), `SELECT count(*), min(detail::text)::text FROM agent_events WHERE thread_id=$1 AND run_id=$2 AND kind='history_truncated'`, threadID, runID).Scan(&n, &raw); err != nil || n != 1 {
+		t.Fatalf("history_truncated events for the fourth run = %d (%v), want 1", n, err)
+	}
+	var detail struct {
+		TurnsDropped, MessagesDropped, EstimateBefore, EstimateAfter, Budget int
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for key := range fields {
+		if !slices.Contains([]string{"turns_dropped", "messages_dropped", "estimate_before", "estimate_after", "budget"}, key) {
+			t.Errorf("history_truncated detail has unexpected field %q", key)
+		}
+	}
+	number := func(key string) int { v, _ := fields[key].(float64); return int(v) }
+	detail.TurnsDropped, detail.MessagesDropped, detail.EstimateBefore, detail.EstimateAfter, detail.Budget =
+		number("turns_dropped"), number("messages_dropped"), number("estimate_before"), number("estimate_after"), number("budget")
+	if detail.TurnsDropped < 1 || detail.MessagesDropped < 1 || detail.Budget != budget || detail.EstimateBefore <= budget || detail.EstimateAfter > budget || detail.EstimateAfter >= detail.EstimateBefore {
+		t.Errorf("history_truncated detail = %s, want turns/messages dropped >= 1, budget %d, before > budget >= after", raw, budget)
+	}
+	if strings.Contains(string(raw), sentinel) || strings.Contains(string(raw), "TURN-") {
+		t.Errorf("history_truncated detail carries turn content: %s", raw)
+	}
+
+	// The persisted history is never trimmed.
+	var persisted string
+	if err := pool.QueryRow(t.Context(), `SELECT history::text FROM agent_conversations WHERE id=$1`, threadID).Scan(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 4; i++ {
+		if !strings.Contains(persisted, fmt.Sprintf("TURN-%d-MARKER", i)) {
+			t.Errorf("persisted history lacks turn %d", i)
+		}
+	}
+	if !strings.Contains(persisted, sentinel) {
+		t.Error("persisted history lacks the turn 1 sentinel")
+	}
+}
+
+// e2eS8Ready reports whether the replica's /readyz answers 200.
+func e2eS8Ready(t *testing.T, replica acceptanceReplica) bool {
+	t.Helper()
+	response, err := http.Get(replica.url + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	return response.StatusCode == http.StatusOK
+}
+
+// e2eS8Repin is M6: an idle conversation re-pins to the current definition set with one definition_changed event; a conversation with a pending approval keeps its pin and keeps the old set required until it settles.
+func e2eS8Repin(t *testing.T) {
+	ctx := t.Context()
+	journeys := []e2eS8Journey{
+		{"planner", e2eS8ReadOnly("travel.lookup")},
+		{"booking", "      - op: book.reserve\n"}, // effectful: needs approval
+	}
+	d1Path, d2Path := e2eS8Path(t, "PROMPT-D1", journeys...), e2eS8Path(t, "PROMPT-D2", journeys...)
+	d1Only, d2Only, both := compileSet(t, d1Path), compileSet(t, d2Path), compileSet(t, d2Path, d1Path)
+	d1, d2 := d1Only.Digest(), d2Only.Digest()
+	if d1 == d2 || both.Digest() != d2 || !both.Serves(d1) || d2Only.Serves(d1) {
+		t.Fatalf("definition sets: d1 %s d2 %s both %s", d1, d2, both.Digest())
+	}
+
+	pool := database(t)
+	store := journal.New(pool)
+	endpoint := mcptest.New(t, mcptest.Options{Name: "e2e-s8-repin", Version: "vN"}, e2eCatalog(func(o e2eOp) string { return o.remoteA }))
+	tenancy := testTenancy(t, endpoint.URL())
+	model := modeltest.New(
+		modeltest.Text("x1 done"),                  // 0: idle conversation on D1
+		modeltest.Call("book_reserve", struct{}{}), // 1: effectful, waits for approval
+		modeltest.Text("booked"),                   // 2: the approved continuation (D1)
+		modeltest.Text("x2 done"),                  // 3: the idle conversation after the flip (D2)
+	)
+	const threadX, threadY = "e2e-s8-repin-x", "e2e-s8-repin-y"
+	a, b, _ := threeReplicas(t, pool, d1Only, model, tenancy)
+
+	e2eS8Finished(t, "X1", e2eS8Chat(t, a, "token", threadX, "e2e-s8-repin-x1", e2eS8Say("plan", "planner")), "x1 done")
+	body := e2eS8Chat(t, b, "token", threadY, "e2e-s8-repin-y1", e2eS8Say("book", "booking"))
+	if !strings.Contains(body, "interaction.requested") {
+		t.Fatalf("Y1 lacks the approval request: %s", body)
+	}
+	internalX, internalY := acceptanceThread(t, pool, threadX), acceptanceThread(t, pool, threadY)
+	pinOf := func(thread string) string {
+		t.Helper()
+		var pin string
+		if err := pool.QueryRow(ctx, `SELECT COALESCE(definition_digest,'') FROM agent_conversations WHERE id=$1`, thread).Scan(&pin); err != nil {
+			t.Fatal(err)
+		}
+		return pin
+	}
+	changes := func(thread string) (count int, from, to string) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `SELECT count(*), COALESCE(min(detail->>'old_digest'),''), COALESCE(min(detail->>'new_digest'),'') FROM agent_events WHERE thread_id=$1 AND kind='definition_changed'`, thread).Scan(&count, &from, &to); err != nil {
+			t.Fatal(err)
+		}
+		return count, from, to
+	}
+	if pinOf(internalX) != d1 || pinOf(internalY) != d1 {
+		t.Fatalf("pins before the activation: X %q Y %q, want both D1 %q", pinOf(internalX), pinOf(internalY), d1)
+	}
+	var interaction, binding string
+	if err := pool.QueryRow(ctx, `SELECT id, COALESCE(artifact->'call'->>'binding','') FROM agent_interactions WHERE thread_id=$1 AND state='pending'`, internalY).Scan(&interaction, &binding); err != nil {
+		t.Fatalf("no pending approval on Y: %v", err)
+	}
+	if endpoint.Calls("book/reserve") != 0 {
+		t.Fatalf("book/reserve called before approval")
+	}
+
+	// D2 cannot become current from a replica that does not serve D1: Y's pending approval references it.
+	if err := store.ActivateDefinition(ctx, d1, d2, d2Only.Serves); !errors.Is(err, journal.ErrDefinition) {
+		t.Fatalf("activation D1 -> D2 with a D2-only set = %v, want ErrDefinition", err)
+	}
+	if err := store.ActivateDefinition(ctx, d1, d2, both.Serves); err != nil {
+		t.Fatalf("activation D1 -> D2 with D1 and D2 served: %v", err)
+	}
+	if current, err := store.CurrentDefinition(ctx); err != nil || current != d2 {
+		t.Fatalf("current definition = %q, %v, want D2", current, err)
+	}
+
+	// Replicas that serve only D2 are not Ready while the D1 approval is pending.
+	for _, replica := range []acceptanceReplica{a, b} {
+		replica.stop()
+	}
+	a, b, _ = threeReplicas(t, pool, d2Only, model, tenancy)
+	if e2eS8Ready(t, a) || e2eS8Ready(t, b) {
+		t.Fatal("a D2-only replica is Ready while an approval pinned to D1 is pending")
+	}
+	if pinOf(internalY) != d1 {
+		t.Errorf("Y pin while pending = %q, want D1", pinOf(internalY))
+	}
+	if count, _, _ := changes(internalY); count != 0 {
+		t.Errorf("definition_changed events on Y while pending = %d, want 0", count)
+	}
+
+	// Settle the approval on replicas that serve D1 and D2: the continuation still runs on D1.
+	for _, replica := range []acceptanceReplica{a, b} {
+		replica.stop()
+	}
+	a, b, _ = threeReplicas(t, pool, both, model, tenancy)
+	reply := aguitypes.RunAgentInput{ForwardedProps: map[string]any{"interactionReply": map[string]any{
+		"interactionId": interaction, "kind": "approval",
+		"answer": map[string]any{"decision": "approve", "binding": binding},
+	}}}
+	e2eS8Finished(t, "Y2", e2eS8Chat(t, a, "token", threadY, "e2e-s8-repin-y2", reply), "booked")
+	if endpoint.Calls("book/reserve") != 1 {
+		t.Errorf("book/reserve calls after approval = %d, want 1", endpoint.Calls("book/reserve"))
+	}
+	if got := model.Requests()[2].DefinitionDigest; got != d1 {
+		t.Errorf("approved continuation ran on %q, want D1 %q", got, d1)
+	}
+	if count, _, _ := changes(internalY); count != 0 {
+		t.Errorf("definition_changed events on Y after its continuation = %d, want 0 (a continuation never re-pins)", count)
+	}
+
+	// Nothing is pending any more: D2-only replicas are Ready.
+	for _, replica := range []acceptanceReplica{a, b} {
+		replica.stop()
+	}
+	a, b, _ = threeReplicas(t, pool, d2Only, model, tenancy)
+	if !e2eS8Ready(t, a) || !e2eS8Ready(t, b) {
+		t.Fatal("a D2-only replica is not Ready after the approval settled")
+	}
+
+	// The idle conversation's next message re-pins to D2 with one definition_changed event.
+	e2eS8Finished(t, "X2", e2eS8Chat(t, b, "token", threadX, "e2e-s8-repin-x2", e2eS8Say("again", "")), "x2 done")
+	if count, from, to := changes(internalX); count != 1 || from != d1 || to != d2 {
+		t.Errorf("definition_changed on X = %d %q -> %q, want 1 %q -> %q", count, from, to, d1, d2)
+	}
+	request := model.Requests()[3]
+	if request.DefinitionDigest != d2 || request.Provenance.Definition.Digest != d2 || !strings.Contains(request.Instructions, "PROMPT-D2") || strings.Contains(request.Instructions, "PROMPT-D1") {
+		t.Errorf("X2 request definition %q, instructions lack PROMPT-D2 or carry PROMPT-D1: %.200q", request.DefinitionDigest, request.Instructions)
+	}
+	if pinOf(internalX) != d2 {
+		t.Errorf("X pin after re-pin = %q, want D2", pinOf(internalX))
+	}
+	var changedRun string
+	if err := pool.QueryRow(ctx, `SELECT run_id FROM agent_events WHERE thread_id=$1 AND kind='definition_changed'`, internalX).Scan(&changedRun); err != nil || changedRun != e2eInternalRun(t, pool, internalX, "e2e-s8-repin-x2") {
+		t.Errorf("definition_changed run = %q (%v), want the X2 run", changedRun, err)
+	}
+}
+
+// e2eS8Touch is M9: dispatching a journey's alias keeps it from being the least recently used.
+func e2eS8Touch(t *testing.T) {
+	pool := database(t)
+	set := e2eS8Set(t, "touch",
+		e2eS8Journey{"j1", e2eS8ReadOnly("travel.lookup")},
+		e2eS8Journey{"j2", e2eS8ReadOnly("hotel.search")},
+		e2eS8Journey{"j3", e2eS8ReadOnly("visa.check")},
+	)
+	endpoint := mcptest.New(t, mcptest.Options{Name: "e2e-s8-touch", Version: "vN"}, e2eCatalog(func(o e2eOp) string { return o.remoteA }))
+	tenancy := testTenancy(t, endpoint.URL()) // default limit: 2 active journeys
+	activate := func(id string) modeltest.Step {
+		return modeltest.Call("activate_journey", map[string]any{"journey": id})
+	}
+	model := modeltest.New(
+		activate("j1"), // 0
+		activate("j2"), // 1
+		modeltest.Call("travel_lookup", struct{}{}), // 2: dispatch a j1 alias
+		activate("j3"),            // 3: j2 is now the least recently used
+		modeltest.Text("touched"), // 4
+	)
+	a, _, _ := threeReplicas(t, pool, set, model, tenancy)
+	e2eS8Finished(t, "touch run", e2eS8Chat(t, a, "token", "e2e-s8-touch", "e2e-s8-touch-1", e2eS8Say("go", "")), "touched")
+	requests := model.Requests()
+	if len(requests) != 5 {
+		t.Fatalf("model requests = %d, want 5", len(requests))
+	}
+	if got := requests[3].ActiveJourneys; !slices.Equal(got, []string{"j2", "j1"}) {
+		t.Errorf("request 3 ActiveJourneys = %v, want [j2 j1] (the dispatch moved j1 to most recently used)", got)
+	}
+	if got := e2eResult(t, requests[4], "modeltest-call-3"); got != `{"activated":"j3","evicted":["j2"]}` {
+		t.Errorf("third activation result = %s, want j3 activated and [j2] evicted", got)
+	}
+	if got := e2eS8Active(t, pool, testPrincipal, "e2e-s8-touch"); !slices.Equal(got, []string{"j1", "j3"}) {
+		t.Errorf("active journeys = %v, want [j1 j3]", got)
+	}
+	if got := endpoint.Calls("travel/lookup"); got != 1 {
+		t.Errorf("MCP travel/lookup calls = %d, want 1", got)
+	}
+}
+
+// e2eS8NotPermitted is M15: a 403 is a tool result the model sees once and the run continues; a 401 still ends the run auth_required.
+func e2eS8NotPermitted(t *testing.T) {
+	pool := database(t)
+	set := e2eS8Set(t, "forbid", e2eS8Journey{"ops", e2eS8ReadOnly("travel.lookup") + e2eS8ReadOnly("hotel.search")})
+	endpoint := mcptest.New(t, mcptest.Options{Name: "e2e-s8-forbid", Version: "vN"}, e2eCatalog(func(o e2eOp) string { return o.remoteA }))
+	endpoint.Forbid("travel/lookup")
+	model := modeltest.New(
+		modeltest.Call("travel_lookup", struct{}{}), // 0: 403
+		modeltest.Call("hotel_search", struct{}{}),  // 1: a later call in the same run succeeds
+		modeltest.Text("ops done"),                  // 2
+		modeltest.Call("hotel_search", struct{}{}),  // 3: second thread, 401
+	)
+	a, b, _ := threeReplicas(t, pool, set, model, testTenancy(t, endpoint.URL()))
+
+	body := e2eS8Chat(t, a, "token", "e2e-s8-forbid-1", "e2e-s8-forbid-run1", e2eS8Say("go", "ops"))
+	e2eS8Finished(t, "forbid run", body, "ops done")
+	requests := model.Requests()
+	if len(requests) != 3 {
+		t.Fatalf("model requests after the 403 run = %d, want 3", len(requests))
+	}
+	if got := e2eResult(t, requests[1], "modeltest-call-0"); got != `{"error":"not_permitted"}` {
+		t.Errorf("result of the forbidden call = %s, want {\"error\":\"not_permitted\"}", got)
+	}
+	if got := e2eResult(t, requests[2], "modeltest-call-1"); strings.Contains(got, `"error"`) {
+		t.Errorf("result of the later call = %s, want a tool result", got)
+	}
+	if got := endpoint.Calls("travel/lookup"); got != 1 {
+		t.Errorf("MCP travel/lookup calls = %d, want exactly 1 (no retry)", got)
+	}
+	if got := endpoint.Calls("hotel/search"); got != 1 {
+		t.Errorf("MCP hotel/search calls = %d, want 1", got)
+	}
+	internal := acceptanceThread(t, pool, "e2e-s8-forbid-1")
+	if got := e2eRunState(t, pool, internal, e2eInternalRun(t, pool, internal, "e2e-s8-forbid-run1")); got != string(journal.RunCompleted) {
+		t.Errorf("403 run state = %q, want completed", got)
+	}
+
+	// A 401 on a separate thread still ends the run auth_required.
+	endpoint.Unauthorized("hotel/search", 1)
+	body = e2eS8Chat(t, b, "token", "e2e-s8-forbid-2", "e2e-s8-forbid-run2", e2eS8Say("go", "ops"))
+	if !strings.Contains(body, `"code":"auth_required"`) || strings.Contains(body, "RUN_FINISHED") {
+		t.Fatalf("401 run: expected RUN_ERROR auth_required and no RUN_FINISHED: %s", body)
+	}
+	internal = acceptanceThread(t, pool, "e2e-s8-forbid-2")
+	if got := e2eRunState(t, pool, internal, e2eInternalRun(t, pool, internal, "e2e-s8-forbid-run2")); got != string(journal.RunAuthRequired) {
+		t.Errorf("401 run state = %q, want auth_required", got)
+	}
+	if got := model.Count(); got != 4 {
+		t.Errorf("model requests = %d, want 4", got)
+	}
 }

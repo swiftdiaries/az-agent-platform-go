@@ -30,8 +30,11 @@ const DefaultSnapshotTTL = 10 * time.Minute
 var (
 	// ErrBusinessRejected marks a tool result the server flagged isError.
 	ErrBusinessRejected = errors.New("MCP business rejection")
-	// ErrAuthRequired marks a 401/403 from the integration endpoint.
+	// ErrAuthRequired marks a 401 on a call, or a 401/403 while connecting or
+	// listing tools, from the integration endpoint.
 	ErrAuthRequired = errors.New("MCP authentication required")
+	// ErrNotPermitted marks a 403 from the integration endpoint on tools/call.
+	ErrNotPermitted = errors.New("MCP operation not permitted")
 	// ErrEndpointUnavailable marks an endpoint that is not allowlist-resolved
 	// or that could not be reached or initialized. Messages never contain the
 	// URL.
@@ -274,6 +277,9 @@ func (b *Binding) Call(ctx context.Context, callID, alias string, arguments []by
 		if errors.Is(err, ErrAuthRequired) {
 			b.broken.Store(true)
 			return nil, fmt.Errorf("call MCP tool: %w", ErrAuthRequired)
+		}
+		if errors.Is(err, ErrNotPermitted) {
+			return nil, fmt.Errorf("call MCP tool: %w", ErrNotPermitted)
 		}
 		return nil, err
 	}

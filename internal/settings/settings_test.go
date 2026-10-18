@@ -135,38 +135,128 @@ func TestNarrowOnly(t *testing.T) {
 		d.Users = map[string]map[string]Layer{"a": {"p": u}}
 		return d
 	}
-	tests := []struct {
-		name    string
-		doc     Document
-		invalid bool
+	clamp := []struct {
+		name string
+		doc  Document
+		want int
 	}{
-		{"user above tenant", user(&Layer{MaxActiveJourneys: ip(2)}, nil, Layer{MaxActiveJourneys: ip(3)}), true},
-		{"user equal tenant", user(&Layer{MaxActiveJourneys: ip(2)}, nil, Layer{MaxActiveJourneys: ip(2)}), false},
-		{"user below tenant", user(&Layer{MaxActiveJourneys: ip(3)}, nil, Layer{MaxActiveJourneys: ip(1)}), false},
-		{"no tenant layer, above default", user(nil, ip(2), Layer{MaxActiveJourneys: ip(3)}), true},
-		{"no tenant layer, equal default", user(nil, ip(2), Layer{MaxActiveJourneys: ip(2)}), false},
-		{"no tenant layer, above built-in default", user(nil, nil, Layer{MaxActiveJourneys: ip(3)}), true},
-		{"tenant layer without max uses default", user(&Layer{}, ip(2), Layer{MaxActiveJourneys: ip(3)}), true},
-		{"user sets cost", user(nil, nil, Layer{Cost: &CostLayer{Profile: sp("x")}}), true},
-		{"user sets empty cost", user(nil, nil, Layer{Cost: &CostLayer{}}), true},
-		{"empty tenant key", Document{Users: map[string]map[string]Layer{"": {"p": {}}}}, true},
-		{"empty principal key", Document{Users: map[string]map[string]Layer{"a": {"": {}}}}, true},
-		{"empty tenant layer key", Document{Tenants: map[string]Layer{"": {}}}, true},
-		{"empty explicit profile on tenant", Document{Tenants: map[string]Layer{"a": {Cost: &CostLayer{Profile: sp("")}}}}, false},
+		{"user above tenant clamped", user(&Layer{MaxActiveJourneys: ip(2)}, nil, Layer{MaxActiveJourneys: ip(3)}), 2},
+		{"user equal tenant", user(&Layer{MaxActiveJourneys: ip(2)}, nil, Layer{MaxActiveJourneys: ip(2)}), 2},
+		{"user below tenant narrows", user(&Layer{MaxActiveJourneys: ip(3)}, nil, Layer{MaxActiveJourneys: ip(1)}), 1},
+		{"no tenant layer, above default clamped", user(nil, ip(2), Layer{MaxActiveJourneys: ip(3)}), 2},
+		{"no tenant layer, above built-in default clamped", user(nil, nil, Layer{MaxActiveJourneys: ip(3)}), DefaultMaxActiveJourneys},
+		{"tenant layer without max uses default", user(&Layer{}, ip(2), Layer{MaxActiveJourneys: ip(3)}), 2},
+		{"lowered tenant limit does not reject", user(&Layer{MaxActiveJourneys: ip(1)}, ip(4), Layer{MaxActiveJourneys: ip(4)}), 1},
 	}
-	for _, tc := range tests {
+	for _, tc := range clamp {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Compile(tc.doc)
-			if tc.invalid {
-				if !errors.Is(err, ErrInvalid) {
-					t.Fatalf("want ErrInvalid, got %v", err)
-				}
-				return
+			s := resolve(t, mustCompile(t, tc.doc), "a", "p")
+			if s.MaxActiveJourneys != tc.want {
+				t.Fatalf("MaxActiveJourneys = %d, want %d", s.MaxActiveJourneys, tc.want)
 			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
+			if s.Digest != digestOf(tc.want, s.Cost.Profile) {
+				t.Fatalf("digest does not carry clamped value")
+			}
+			var rec Settings
+			if err := json.Unmarshal(s.Record(), &rec); err != nil || rec.MaxActiveJourneys != tc.want || rec.Digest != s.Digest {
+				t.Fatalf("record = %s (%v), want clamped %d", s.Record(), err, tc.want)
 			}
 		})
+	}
+	invalid := []struct {
+		name string
+		doc  Document
+	}{
+		{"user sets cost", user(nil, nil, Layer{Cost: &CostLayer{Profile: sp("x")}})},
+		{"user sets empty cost", user(nil, nil, Layer{Cost: &CostLayer{}})},
+		{"user out of bounds", user(nil, nil, Layer{MaxActiveJourneys: ip(5)})},
+		{"empty tenant key", Document{Users: map[string]map[string]Layer{"": {"p": {}}}}},
+		{"empty principal key", Document{Users: map[string]map[string]Layer{"a": {"": {}}}}},
+		{"empty tenant layer key", Document{Tenants: map[string]Layer{"": {}}}},
+	}
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Compile(tc.doc); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("want ErrInvalid, got %v", err)
+			}
+		})
+	}
+	t.Run("empty explicit profile on tenant", func(t *testing.T) {
+		mustCompile(t, Document{Tenants: map[string]Layer{"a": {Cost: &CostLayer{Profile: sp("")}}}})
+	})
+}
+
+func TestMergeDefaultsOnly(t *testing.T) {
+	s := Merge(Layer{}, Layer{}, Layer{})
+	if s.MaxActiveJourneys != DefaultMaxActiveJourneys || s.Cost.Profile != "" {
+		t.Fatalf("got %+v", s)
+	}
+	if s.Digest != digestOf(DefaultMaxActiveJourneys, "") {
+		t.Fatalf("digest not set")
+	}
+}
+
+func TestMergeDefOnly(t *testing.T) {
+	s := Merge(Layer{MaxActiveJourneys: ip(4), Cost: &CostLayer{Profile: sp("d")}}, Layer{}, Layer{})
+	if s.MaxActiveJourneys != 4 || s.Cost.Profile != "d" {
+		t.Fatalf("got %+v", s)
+	}
+}
+
+func TestMergeTenantOverridesDef(t *testing.T) {
+	s := Merge(
+		Layer{MaxActiveJourneys: ip(4), Cost: &CostLayer{Profile: sp("d")}},
+		Layer{MaxActiveJourneys: ip(3), Cost: &CostLayer{Profile: sp("t")}},
+		Layer{})
+	if s.MaxActiveJourneys != 3 || s.Cost.Profile != "t" {
+		t.Fatalf("got %+v", s)
+	}
+}
+
+func TestMergeUserNarrows(t *testing.T) {
+	s := Merge(Layer{}, Layer{MaxActiveJourneys: ip(3)}, Layer{MaxActiveJourneys: ip(1)})
+	if s.MaxActiveJourneys != 1 {
+		t.Fatalf("got %d", s.MaxActiveJourneys)
+	}
+}
+
+func TestMergeUserAboveTenantClamped(t *testing.T) {
+	s := Merge(Layer{MaxActiveJourneys: ip(4)}, Layer{MaxActiveJourneys: ip(2)}, Layer{MaxActiveJourneys: ip(4)})
+	if s.MaxActiveJourneys != 2 {
+		t.Fatalf("got %d", s.MaxActiveJourneys)
+	}
+}
+
+func TestMergeUserAboveDeployDefaultClamped(t *testing.T) {
+	s := Merge(Layer{MaxActiveJourneys: ip(3)}, Layer{}, Layer{MaxActiveJourneys: ip(4)})
+	if s.MaxActiveJourneys != 3 {
+		t.Fatalf("got %d", s.MaxActiveJourneys)
+	}
+	s = Merge(Layer{}, Layer{}, Layer{MaxActiveJourneys: ip(4)})
+	if s.MaxActiveJourneys != DefaultMaxActiveJourneys {
+		t.Fatalf("built-in: got %d", s.MaxActiveJourneys)
+	}
+}
+
+func TestMergeUserCostIgnored(t *testing.T) {
+	s := Merge(Layer{}, Layer{Cost: &CostLayer{Profile: sp("t")}}, Layer{Cost: &CostLayer{Profile: sp("u")}})
+	if s.Cost.Profile != "t" {
+		t.Fatalf("got %q", s.Cost.Profile)
+	}
+}
+
+func TestMergeDigestMatchesResolve(t *testing.T) {
+	def := Layer{MaxActiveJourneys: ip(4), Cost: &CostLayer{Profile: sp("d")}}
+	ten := Layer{MaxActiveJourneys: ip(3)}
+	usr := Layer{MaxActiveJourneys: ip(2)}
+	c := mustCompile(t, Document{
+		Default: def,
+		Tenants: map[string]Layer{"a": ten},
+		Users:   map[string]map[string]Layer{"a": {"p": usr}},
+	})
+	got := resolve(t, c, "a", "p")
+	if want := Merge(def, ten, usr); got != want {
+		t.Fatalf("Resolve %+v != Merge %+v", got, want)
 	}
 }
 

@@ -51,6 +51,7 @@ type rawVersions struct {
 type rawTool struct {
 	Op       opList   `yaml:"op"`
 	Tags     []string `yaml:"tags"`
+	Alias    string   `yaml:"alias"`
 	ReadOnly bool     `yaml:"read_only"`
 	Class    string   `yaml:"class"`
 	Approval string   `yaml:"approval"`
@@ -201,6 +202,9 @@ func Compile(path string) (*Set, error) {
 		set.canonical[journey.Digest] = canonical
 		set.order = append(set.order, journey.ID)
 		digests = append(digests, journey.Digest)
+	}
+	if err := checkAliasOps(set); err != nil {
+		return nil, err
 	}
 	if err := checkPolicyConflicts(set); err != nil {
 		return nil, err
@@ -360,17 +364,30 @@ func compileTools(catalog CatalogConfig, rj rawJourney) ([]Selector, []string, e
 					return fail("operation key is also denied")
 				}
 				seenOps[key] = true
-				alias, ok := AliasFor(key)
-				if !ok {
-					return fail("operation key has no valid tool alias")
-				}
-				if IsReservedToolName(alias) || aliases[alias] {
-					return fail("operation key alias is reserved or collides with another operation")
-				}
-				aliases[alias] = true
 			}
+			alias := rt.Alias
+			if alias == "" {
+				if len(rt.Op.values) > 1 {
+					return fail("op with more than one alternative requires an alias")
+				}
+				alias, _ = AliasFor(rt.Op.values[0])
+			}
+			if !ValidAlias(alias) {
+				return fail("tool alias is invalid")
+			}
+			if IsReservedToolName(alias) || aliases[alias] {
+				return fail("tool alias is reserved or collides with another tool")
+			}
+			aliases[alias] = true
+			sel.Alias = alias
 			sel.Ops = append([]string(nil), rt.Op.values...)
 		} else {
+			if rt.Class != "" {
+				return fail("class is allowed only on op selectors")
+			}
+			if rt.Alias != "" {
+				return fail("alias is allowed only on op selectors")
+			}
 			if len(rt.Tags) == 0 {
 				return fail("tags must not be empty")
 			}
@@ -478,6 +495,15 @@ func policyClassRank(c Class) int {
 	return 2
 }
 
+func selectorPolicy(s Selector) effectivePolicy {
+	p := effectivePolicy{class: s.Class, approval: s.ApprovalRequired}
+	if p.class == "" {
+		p.class = ClassEffectful
+	}
+	p.approval = p.approval || p.class != ClassReadOnly
+	return p
+}
+
 // journeyPolicies merges the op selectors of a journey per key the way
 // catalog resolution does: strictest class, approval OR-ed.
 func journeyPolicies(j Journey) map[string]effectivePolicy {
@@ -504,6 +530,29 @@ func journeyPolicies(j Journey) map[string]effectivePolicy {
 	return out
 }
 
+// checkAliasOps rejects one alias naming different ordered operation lists in
+// different journeys.
+func checkAliasOps(set *Set) error {
+	ids := append([]string(nil), set.order...)
+	sort.Strings(ids)
+	first := map[string]string{} // alias -> first journey
+	ops := map[string]string{}   // alias -> encoded ops
+	for _, id := range ids {
+		for _, s := range set.journeys[id].Tools {
+			if s.Alias == "" {
+				continue
+			}
+			enc := strings.Join(s.Ops, "\x00")
+			if prev, ok := ops[s.Alias]; !ok {
+				ops[s.Alias], first[s.Alias] = enc, id
+			} else if prev != enc {
+				return fmt.Errorf("definitions: alias %q names different operations in journeys %s, %s", s.Alias, first[s.Alias], id)
+			}
+		}
+	}
+	return nil
+}
+
 // checkPolicyConflicts rejects one operation key, or one alias, carrying
 // different effective policies in different journeys. Tag selectors are
 // checked at bind time.
@@ -518,12 +567,15 @@ func checkPolicyConflicts(set *Set) error {
 				byKey[key] = map[string]effectivePolicy{}
 			}
 			byKey[key][id] = p
-			if alias, ok := AliasFor(key); ok {
-				if byAlias[alias] == nil {
-					byAlias[alias] = map[string]effectivePolicy{}
-				}
-				byAlias[alias][id] = p
+		}
+		for _, s := range set.journeys[id].Tools {
+			if s.Alias == "" {
+				continue
 			}
+			if byAlias[s.Alias] == nil {
+				byAlias[s.Alias] = map[string]effectivePolicy{}
+			}
+			byAlias[s.Alias][id] = selectorPolicy(s)
 		}
 	}
 	for _, group := range []struct {

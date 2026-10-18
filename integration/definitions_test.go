@@ -205,7 +205,7 @@ func compileSet(t *testing.T, path string, retained ...string) *definitions.Set 
 	return set
 }
 
-func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
+func TestVersionActivationRepinsIdleSessions(t *testing.T) {
 	ctx := context.Background()
 	oldRoot, newRoot := t.TempDir(), t.TempDir()
 	oldPath := writeDefinitionBundle(t, oldRoot, "old prompt\n")
@@ -221,26 +221,31 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 	if err := store.ActivateDefinition(ctx, "", oldDigest, oldRegistry.Serves); err != nil {
 		t.Fatal(err)
 	}
+	changes := func(thread string) (count int, oldSeen, newSeen string) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, "SELECT count(*), COALESCE(min(detail->>'old_digest'),''), COALESCE(min(detail->>'new_digest'),'') FROM agent_events WHERE thread_id=$1 AND kind='definition_changed'", thread).Scan(&count, &oldSeen, &newSeen); err != nil {
+			t.Fatal(err)
+		}
+		return count, oldSeen, newSeen
+	}
 
+	// The first run resolves before the activation and the activation lands while it
+	// runs: the run stays on the set it resolved.
+	model := &scriptedModel{}
+	runner := agentruntime.NewRunner(registry, model, testTenancy(t, keyedEndpoint(t, "lookup")))
+	model.script(func(r agentruntime.ModelRequest) agentruntime.ModelResponse {
+		if err := store.ActivateDefinition(ctx, oldDigest, newDigest, registry.Serves); err != nil {
+			t.Errorf("activation during the run: %v", err)
+		}
+		return textStep("done")(r)
+	})
 	command := journal.Command{ThreadID: "old-thread", RunID: "old-run", CommunicationID: "old-command", Principal: "alice", Tenant: testTenant, Text: "plan", TargetJourney: "planner"}
 	if _, _, err := store.Admit(ctx, command); err != nil {
 		t.Fatal(err)
 	}
 	owner := claimForTest(t, store, command, true)
-	resolved, err := store.ResolveDefinition(ctx, owner, newDigest, registry.Serves)
-	if err != nil || resolved != oldDigest {
-		t.Fatalf("old current resolution = %q, %v", resolved, err)
-	}
-	if err := store.ActivateDefinition(ctx, oldDigest, newDigest, registry.Serves); err != nil {
-		t.Fatal(err)
-	}
-	// The run targets the journey explicitly. Its binding must stay pinned to the
-	// set it resolved before the activation.
-	model := &scriptedModel{}
-	runner := agentruntime.NewRunner(registry, model, testTenancy(t, keyedEndpoint(t, "lookup")))
-	model.script(textStep("done"))
 	if output, err := runOwned(t, store, runner, owner, command, "planner"); err != nil || output.Answer != "done" {
-		t.Fatalf("binding winner did not stay pinned through activation: %#v, %v", output, err)
+		t.Fatalf("run through activation: %#v, %v", output, err)
 	}
 	requireSet := func(label, wantDigest, wantBody string) {
 		t.Helper()
@@ -251,33 +256,42 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 		}
 	}
 	requireSet("old session", oldDigest, "old prompt")
+	if count, _, _ := changes("old-thread"); count != 0 {
+		t.Fatalf("definition_changed events within the first run = %d", count)
+	}
 
+	// The next run of the same idle conversation re-pins to the current set.
 	continued := journal.Command{ThreadID: "old-thread", RunID: "old-next", CommunicationID: "old-next", Principal: "alice", Tenant: testTenant, Text: "again", TargetJourney: "planner"}
 	if _, _, err := store.Admit(ctx, continued); err != nil {
 		t.Fatal(err)
 	}
 	continuedOwner := claimForTest(t, store, continued, false)
-	if resolved, err = store.ResolveDefinition(ctx, continuedOwner, newDigest, registry.Serves); err != nil || resolved != oldDigest {
-		t.Fatalf("completed session fell forward = %q, %v", resolved, err)
-	}
 	model.script(textStep("again"))
 	if _, err := runOwned(t, store, runner, continuedOwner, continued, "planner"); err != nil {
 		t.Fatal(err)
 	}
-	requireSet("completed session", oldDigest, "old prompt")
+	requireSet("re-pinned session", newDigest, "new prompt")
+	if count, from, to := changes("old-thread"); count != 1 || from != oldDigest || to != newDigest {
+		t.Fatalf("definition_changed = %d %q -> %q, want 1 %q -> %q", count, from, to, oldDigest, newDigest)
+	}
+	var pin string
+	if err := pool.QueryRow(ctx, "SELECT definition_digest FROM agent_conversations WHERE id='old-thread'").Scan(&pin); err != nil || pin != newDigest {
+		t.Fatalf("conversation pin = %q, %v", pin, err)
+	}
+
 	newCommand := journal.Command{ThreadID: "new-thread", RunID: "new-run", CommunicationID: "new-command", Principal: "alice", Tenant: testTenant, Text: "plan", TargetJourney: "planner"}
 	if _, _, err := store.Admit(ctx, newCommand); err != nil {
 		t.Fatal(err)
 	}
 	newOwner := claimForTest(t, store, newCommand, false)
-	if resolved, err = store.ResolveDefinition(ctx, newOwner, oldDigest, registry.Serves); err != nil || resolved != newDigest {
-		t.Fatalf("new session ignored current = %q, %v", resolved, err)
-	}
 	model.script(textStep("fresh"))
 	if _, err := runOwned(t, store, runner, newOwner, newCommand, "planner"); err != nil {
 		t.Fatal(err)
 	}
 	requireSet("new session", newDigest, "new prompt")
+	if count, _, _ := changes("new-thread"); count != 0 {
+		t.Fatalf("a new conversation emitted %d definition_changed events", count)
+	}
 	// Each conversation keeps its own active set.
 	if got := activeSet(t, pool, "old-thread"); !slices.Equal(got, []string{"planner"}) {
 		t.Fatalf("old session active set = %v", got)
@@ -289,9 +303,59 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 		t.Fatalf("failed activation changed current = %q, %v", current, err)
 	}
 
+	// No conversation is non-idle, so the old bundle is no longer needed.
+	candidateOnly := compileSet(t, newPath)
+	if ready, err := store.DefinitionsReady(ctx, candidateOnly.Serves); err != nil || !ready {
+		t.Fatalf("readiness with only the new set and no non-idle conversation = %v, %v", ready, err)
+	}
+	if ready, err := store.DefinitionsReady(ctx, registry.Serves); err != nil || !ready {
+		t.Fatalf("complete retained bundle readiness = %v, %v", ready, err)
+	}
+	if ready, err := store.DefinitionsReady(ctx, func(string) bool { return false }); err != nil || ready {
+		t.Fatalf("readiness serving nothing = %v, %v", ready, err)
+	}
+}
+
+// A conversation with a pending interaction is non-idle: it stays pinned to the old
+// set, and the old set must stay served until it settles.
+func TestVersionActivationNonIdleSessionNeedsOldSet(t *testing.T) {
+	ctx := context.Background()
+	oldPath := writeDefinitionBundle(t, t.TempDir(), "old prompt\n")
+	newPath := writeDefinitionBundle(t, t.TempDir(), "new prompt\n")
+	oldRegistry := compileSet(t, oldPath)
+	registry := compileSet(t, newPath, oldPath)
+	oldDigest, newDigest := oldRegistry.Digest(), registry.Digest()
+	pool := database(t)
+	store := journal.New(pool)
+	if err := store.ActivateDefinition(ctx, "", oldDigest, oldRegistry.Serves); err != nil {
+		t.Fatal(err)
+	}
+	model := &scriptedModel{}
+	runner := agentruntime.NewRunner(registry, model, testTenancy(t, keyedEndpoint(t, "lookup")))
+	model.script(callStep("ask", "request_user_input", `{"questions":[{"id":"q","header":"Where","question":"Which city?","options":[{"label":"A","description":"a"},{"label":"B","description":"b"}]}]}`))
+	command := journal.Command{ThreadID: "waiting-thread", RunID: "waiting-run", CommunicationID: "waiting-command", Principal: "alice", Tenant: testTenant, Text: "plan", TargetJourney: "planner"}
+	if _, _, err := store.Admit(ctx, command); err != nil {
+		t.Fatal(err)
+	}
+	owner := claimForTest(t, store, command, true)
+	input := scoped(t, runner, agentruntime.RunInput{Store: store, Owner: owner, ThreadID: command.ThreadID, RunID: command.RunID, Principal: command.Principal, Text: command.Text, TargetJourney: "planner"})
+	journey, digest, err := runner.Binding(ctx, input)
+	if err != nil || digest != oldDigest {
+		t.Fatalf("binding = %q %q, %v", journey, digest, err)
+	}
+	input.DefinitionDigest, input.TargetJourney = digest, journey
+	if input.History, err = store.Start(ctx, owner, journey, digest); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := runner.Run(ctx, input); err != nil || !output.Waiting {
+		t.Fatalf("run = %#v, %v", output, err)
+	}
+	if err := store.ActivateDefinition(ctx, oldDigest, newDigest, registry.Serves); err != nil {
+		t.Fatal(err)
+	}
 	candidateOnly := compileSet(t, newPath)
 	if ready, err := store.DefinitionsReady(ctx, candidateOnly.Serves); err != nil || ready {
-		t.Fatalf("missing retained bundle readiness = %v, %v", ready, err)
+		t.Fatalf("readiness with only the new set while a conversation is non-idle on the old one = %v, %v", ready, err)
 	}
 	if ready, err := store.DefinitionsReady(ctx, registry.Serves); err != nil || !ready {
 		t.Fatalf("complete retained bundle readiness = %v, %v", ready, err)

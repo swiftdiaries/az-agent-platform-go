@@ -22,7 +22,7 @@ import (
 
 func TestLoadConfigRequiresEveryProductionBoundary(t *testing.T) {
 	values := validEnvironment()
-	for _, name := range []string{"DATABASE_URL", "AGENT_PLATFORM_CONFIG", "AGENT_PLATFORM_PORT", "AGENT_PLATFORM_SHUTDOWN_GRACE", "KEYCLOAK_JWT_ISSUER", "KEYCLOAK_JWKS_URL", "KEYCLOAK_JWT_AUDIENCE", "KEYCLOAK_JWT_SOURCE", "KEYCLOAK_JWT_HEADER", "KEYCLOAK_USER_CLAIM_PATH", "KEYCLOAK_TENANT_CLAIM_PATH", "KEYCLOAK_JWT_ALLOWED_ALGORITHMS", "AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT", "AZ_AGENT_FOUNDRY_DEPLOYMENT", "OTEL_SERVICE_NAME", "OTEL_SERVICE_VERSION", "AGENT_PLATFORM_TENANT_DIRECTORY", "AGENT_PLATFORM_MCP_ENDPOINTS", "AGENT_PLATFORM_SETTINGS"} {
+	for _, name := range []string{"DATABASE_URL", "AGENT_PLATFORM_CONFIG", "AGENT_PLATFORM_PORT", "AGENT_PLATFORM_SHUTDOWN_GRACE", "KEYCLOAK_JWT_ISSUER", "KEYCLOAK_JWKS_URL", "KEYCLOAK_JWT_AUDIENCE", "KEYCLOAK_JWT_SOURCE", "KEYCLOAK_JWT_HEADER", "KEYCLOAK_USER_CLAIM_PATH", "KEYCLOAK_TENANT_CLAIM_PATH", "KEYCLOAK_JWT_ALLOWED_ALGORITHMS", "AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT", "AZ_AGENT_FOUNDRY_DEPLOYMENT", "OTEL_SERVICE_NAME", "OTEL_SERVICE_VERSION", "AGENT_PLATFORM_TENANT_DIRECTORY", "AGENT_PLATFORM_MCP_ENDPOINTS", "AGENT_PLATFORM_SETTINGS", "AGENT_PLATFORM_HISTORY_BUDGET"} {
 		t.Run(name, func(t *testing.T) {
 			missing := mapsClone(values)
 			delete(missing, name)
@@ -41,6 +41,7 @@ func TestLoadConfigSelectsLiteLLMWithoutFoundryCredentialConfiguration(t *testin
 	values[litellm.EnvBaseURL] = "http://localhost:4000"
 	values[litellm.EnvAPIKey] = "proxy-secret"
 	values[litellm.EnvModel] = "azure-alias"
+	values[envHistoryBudget] = "gpt-deployment=100000,azure-alias=50000"
 	loaded, err := loadConfig(missingValue(values))
 	if err != nil || loaded.modelProvider != "litellm" || loaded.litellm.Model != "azure-alias" {
 		t.Fatalf("LiteLLM config/error = %+v/%v", loaded, err)
@@ -257,7 +258,8 @@ func validEnvironment() map[string]string {
 		"OTEL_SERVICE_NAME": "agent-platform", "OTEL_SERVICE_VERSION": "revision", "OTEL_EXPORTER_OTLP_ENDPOINT": "https://collector.example/v1/traces",
 		"OTEL_EXPORTER_OTLP_HEADERS":      "Authorization=Bearer secret,X-Tenant=tenant",
 		"AGENT_PLATFORM_TENANT_DIRECTORY": "/config/tenants.yaml", "AGENT_PLATFORM_SETTINGS": "/config/settings.yaml",
-		"AGENT_PLATFORM_MCP_ENDPOINTS": "java-2026-2=https://mcp-a.example/mcp,java-2026-3=https://mcp-b.example/mcp",
+		"AGENT_PLATFORM_HISTORY_BUDGET": "gpt-deployment=100000",
+		"AGENT_PLATFORM_MCP_ENDPOINTS":  "java-2026-2=https://mcp-a.example/mcp,java-2026-3=https://mcp-b.example/mcp",
 	}
 }
 
@@ -354,5 +356,58 @@ func TestCostGateRejectsInvalidWithoutEchoingTheValue(t *testing.T) {
 				t.Errorf("error %q echoes %q", err, v)
 			}
 		}
+	}
+}
+
+func TestHistoryBudgetSelectsConfiguredModelEntry(t *testing.T) {
+	values := validEnvironment()
+	values[envHistoryBudget] = " other=7 , gpt-deployment=100000 "
+	loaded, err := loadConfig(missingValue(values))
+	if err != nil || loaded.historyBudget != 100000 {
+		t.Fatalf("foundry budget = %d, %v", loaded.historyBudget, err)
+	}
+	values = validEnvironment()
+	delete(values, "AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT")
+	delete(values, "AZ_AGENT_FOUNDRY_DEPLOYMENT")
+	values[envModelProvider] = "litellm"
+	values[litellm.EnvBaseURL] = "http://localhost:4000"
+	values[litellm.EnvAPIKey] = "proxy-secret"
+	values[litellm.EnvModel] = "azure-alias"
+	values[envHistoryBudget] = "gpt-deployment=100000,azure-alias=50000"
+	loaded, err = loadConfig(missingValue(values))
+	if err != nil || loaded.historyBudget != 50000 {
+		t.Fatalf("litellm budget = %d, %v", loaded.historyBudget, err)
+	}
+}
+
+func TestHistoryBudgetRejectsInvalidValuesWithoutEchoing(t *testing.T) {
+	for name, value := range map[string]string{
+		"empty":         "  ",
+		"no equals":     "gpt-deployment",
+		"no model":      "=100",
+		"no tokens":     "gpt-deployment=",
+		"not a number":  "gpt-deployment=lots-secret",
+		"zero":          "gpt-deployment=0",
+		"negative":      "gpt-deployment=-5",
+		"float":         "gpt-deployment=1.5",
+		"duplicate":     "gpt-deployment=1,gpt-deployment=2",
+		"empty pair":    "gpt-deployment=1,,x=2",
+		"other only":    "other-secret=100",
+		"overflow":      "gpt-deployment=99999999999999999999",
+		"trailing junk": "gpt-deployment=100 tokens",
+	} {
+		t.Run(name, func(t *testing.T) {
+			values := validEnvironment()
+			values[envHistoryBudget] = value
+			_, err := loadConfig(missingValue(values))
+			if err == nil {
+				t.Fatalf("%q accepted", value)
+			}
+			for _, leak := range []string{"secret", "lots", "gpt-deployment", "99999", "tokens"} {
+				if strings.Contains(err.Error(), leak) {
+					t.Fatalf("error %q echoes %q", err, leak)
+				}
+			}
+		})
 	}
 }

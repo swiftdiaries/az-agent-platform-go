@@ -55,9 +55,30 @@ type Resolution struct {
 // Available reports whether the journey can be served.
 func (r Resolution) Available() bool { return len(r.Unavailable) == 0 }
 
+// selection accumulates what the matching selectors say about one tool. Only
+// an op selector contributes a class; a tag match adds approval alone.
 type selection struct {
-	class    definitions.Class
+	opClass  definitions.Class
+	opAlias  string
+	fromOp   bool
 	approval bool
+}
+
+// alias is the choosing op selector's alias; a tool matched only by tags
+// takes the alias derived from its operation key.
+func (s selection) alias(key string) string {
+	if s.fromOp && s.opAlias != "" {
+		return s.opAlias
+	}
+	alias, _ := definitions.AliasFor(key)
+	return alias
+}
+
+func (s selection) class() definitions.Class {
+	if s.fromOp && s.opClass != "" {
+		return s.opClass
+	}
+	return definitions.ClassEffectful
 }
 
 // Resolve matches the journey's reviewed selectors against the snapshot. It is
@@ -97,15 +118,12 @@ func Resolve(journey definitions.Journey, snapshot Snapshot, metaKey string) Res
 	selected := map[int]selection{}
 	keyTools := map[string]map[int]bool{}
 	choose := func(index int, s definitions.Selector) {
-		next := selection{class: s.Class, approval: s.ApprovalRequired}
-		if next.class == "" {
-			next.class = definitions.ClassEffectful
-		}
-		if prev, ok := selected[index]; ok {
-			next.approval = next.approval || prev.approval
-			if classRank(prev.class) > classRank(next.class) {
-				next.class = prev.class
-			}
+		next := selected[index]
+		next.approval = next.approval || s.ApprovalRequired
+		if len(s.Ops) > 0 {
+			next.opClass = s.Class
+			next.opAlias = s.Alias
+			next.fromOp = true
 		}
 		selected[index] = next
 		if keyTools[keys[index]] == nil {
@@ -171,17 +189,24 @@ func Resolve(journey definitions.Journey, snapshot Snapshot, metaKey string) Res
 	// Aliases must be valid, unreserved and unique within the journey.
 	aliasOwner := map[string]string{}
 	for _, key := range selectedKeys {
-		alias, valid := definitions.AliasFor(key)
-		switch {
-		case !valid:
-			add(ReasonInvalidAlias, key)
-		case definitions.IsReservedToolName(alias):
-			add(ReasonCollision, alias)
-		default:
-			if owner, ok := aliasOwner[alias]; ok && owner != key {
+		indexes := make([]int, 0, len(keyTools[key]))
+		for index := range keyTools[key] {
+			indexes = append(indexes, index)
+		}
+		sort.Ints(indexes)
+		for _, index := range indexes {
+			alias := selected[index].alias(key)
+			switch {
+			case !definitions.ValidAlias(alias):
+				add(ReasonInvalidAlias, key)
+			case definitions.IsReservedToolName(alias):
 				add(ReasonCollision, alias)
+			default:
+				if owner, ok := aliasOwner[alias]; ok && owner != key {
+					add(ReasonCollision, alias)
+				}
+				aliasOwner[alias] = key
 			}
-			aliasOwner[alias] = key
 		}
 	}
 
@@ -200,12 +225,11 @@ func Resolve(journey definitions.Journey, snapshot Snapshot, metaKey string) Res
 	tools := make([]Tool, 0, len(selected))
 	for index, sel := range selected {
 		d := snapshot.Tools[index]
-		alias, _ := definitions.AliasFor(keys[index])
 		tools = append(tools, Tool{
-			Alias: alias, OperationKey: keys[index], RemoteName: d.Name,
+			Alias: sel.alias(keys[index]), OperationKey: keys[index], RemoteName: d.Name,
 			Description: d.Description, InputSchema: d.InputSchema,
-			Class:            sel.class,
-			RequiresApproval: sel.class != definitions.ClassReadOnly || sel.approval,
+			Class:            sel.class(),
+			RequiresApproval: sel.class() != definitions.ClassReadOnly || sel.approval,
 		})
 	}
 	sort.Slice(tools, func(a, b int) bool { return tools[a].Alias < tools[b].Alias })
@@ -213,18 +237,6 @@ func Resolve(journey definitions.Journey, snapshot Snapshot, metaKey string) Res
 		res.Tools = tools
 	}
 	return res
-}
-
-// classRank orders classes from least to most restrictive; unknown values
-// rank as effectful.
-func classRank(c definitions.Class) int {
-	switch c {
-	case definitions.ClassReadOnly:
-		return 0
-	case definitions.ClassIdempotent:
-		return 1
-	}
-	return 2
 }
 
 func hasAllTags(meta map[string]any, want []string) bool {

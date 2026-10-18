@@ -1,6 +1,6 @@
 // Package journeys holds the pure logic behind per-conversation journey
 // activation: the least-recently-used active set with pinned journeys and a
-// per-tenant limit, and the composition of the per-request instructions from
+// per-tenant limit (recency is bumped by activation and by Touch on use), and the composition of the per-request instructions from
 // the base prompt, available journey metadata and active journey bodies.
 // It performs no I/O and imports only the standard library.
 package journeys
@@ -59,6 +59,16 @@ func (a *ActiveSet) Remove(ids ...string) []string {
 	}
 	a.ids = kept
 	return removed
+}
+
+// Touch moves id to most recently used. No eviction; no-op (false) when id is absent or already MRU.
+func (a *ActiveSet) Touch(id string) (changed bool) {
+	i := slices.Index(a.ids, id)
+	if i < 0 || i == len(a.ids)-1 {
+		return false
+	}
+	a.ids = append(slices.Delete(a.ids, i, i+1), id)
+	return true
 }
 
 // Activate makes id the most recently used journey.

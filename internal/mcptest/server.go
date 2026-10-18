@@ -130,6 +130,7 @@ type Server struct {
 type controls struct {
 	failN   int
 	unauthN int // <0: always
+	forbid  bool
 	dropN   int
 	isError *string
 	block   *blocker
@@ -443,6 +444,15 @@ func (s *Server) Unauthorized(tool string, n int) {
 	s.ctl(tool).unauthN = n
 }
 
+// Forbid makes every tools/call HTTP request for the remote tool name answer
+// HTTP 403 before reaching the SDK, until ClearControls. Other tools,
+// initialize and tools/list are served normally.
+func (s *Server) Forbid(tool string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ctl(tool).forbid = true
+}
+
 // ClearControls removes every control for tool, releasing any Block.
 func (s *Server) ClearControls(tool string) {
 	s.mu.Lock()
@@ -545,6 +555,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					c.unauthN--
 				}
 				status = http.StatusUnauthorized
+			case c.forbid:
+				status = http.StatusForbidden
 			case c.failN > 0:
 				c.failN--
 				status = http.StatusServiceUnavailable

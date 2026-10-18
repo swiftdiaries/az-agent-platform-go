@@ -49,6 +49,8 @@ const (
 	envCostGate = "AGENT_PLATFORM_COST_GATE"
 	// envCostHeaders names the attribution headers the headers gate sends.
 	envCostHeaders = "AGENT_PLATFORM_COST_HEADERS"
+	// envHistoryBudget is the per-model history budget, as model=tokens,model2=tokens.
+	envHistoryBudget = "AGENT_PLATFORM_HISTORY_BUDGET"
 )
 
 type config struct {
@@ -65,6 +67,7 @@ type config struct {
 	telemetry         telemetry.Config
 	credentialHeaders []string
 	costGate          cost.Gate
+	historyBudget     int
 
 	tenantDirectoryPath string
 	settingsPath        string
@@ -133,6 +136,7 @@ func run(ctx context.Context, lookup func(string) string) error {
 		Pool: pool, Definitions: defs, Authenticator: authenticator, Model: model,
 		CredentialHeaders: config.credentialHeaders, CostGate: config.costGate,
 		Directory: directory, Endpoints: endpoints, Settings: settingsSource,
+		HistoryBudget: config.historyBudget,
 	})
 	if err != nil {
 		return errors.New("service initialization failed")
@@ -280,6 +284,14 @@ func loadConfig(lookup func(string) string) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	configuredModel := foundryDeployment
+	if modelProvider == "litellm" {
+		configuredModel = litellmConfig.Model
+	}
+	historyBudget, err := parseHistoryBudget(lookup(envHistoryBudget), configuredModel)
+	if err != nil {
+		return config{}, err
+	}
 	return config{
 		tenantDirectoryPath: tenantDirectoryPath, mcpEndpoints: mcpEndpoints, settingsPath: settingsPath,
 		databaseURL: databaseURL, definitionPath: definitionPath,
@@ -287,7 +299,31 @@ func loadConfig(lookup func(string) string) (config, error) {
 		foundryEndpoint: foundryEndpoint, foundryDeployment: foundryDeployment,
 		modelProvider: modelProvider, litellm: litellmConfig,
 		telemetry: telemetryConfig, credentialHeaders: credentialHeaders, costGate: costGate,
+		historyBudget: historyBudget,
 	}, nil
+}
+
+// parseHistoryBudget parses model=tokens pairs and returns the entry for the
+// configured model. Errors are fixed messages and never echo the value.
+func parseHistoryBudget(value, model string) (int, error) {
+	budgets := map[string]int{}
+	if strings.TrimSpace(value) == "" {
+		return 0, errors.New("history budget is missing")
+	}
+	for _, pair := range strings.Split(value, ",") {
+		name, tokens, ok := strings.Cut(pair, "=")
+		name, tokens = strings.TrimSpace(name), strings.TrimSpace(tokens)
+		count, err := strconv.Atoi(tokens)
+		if _, duplicate := budgets[name]; !ok || name == "" || err != nil || count < 1 || duplicate {
+			return 0, errors.New("invalid history budget configuration")
+		}
+		budgets[name] = count
+	}
+	budget, ok := budgets[model]
+	if !ok {
+		return 0, errors.New("history budget is missing for the configured model")
+	}
+	return budget, nil
 }
 
 func keycloakConfig(require func(string) (string, error)) (chat.KeycloakConfig, error) {

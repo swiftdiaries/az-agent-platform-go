@@ -8,6 +8,7 @@ journeys:
     tools:
       - op: leave.balance
       - op: [leave.request.v2, leave.request]
+        alias: leave_request
         class: idempotent
         approval: required
       - tags: [leave, self-service]

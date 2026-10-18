@@ -593,3 +593,44 @@ func TestServerVerbatimNames(t *testing.T) {
 		}
 	}
 }
+
+func TestServerForbidden(t *testing.T) {
+	s := mcptest.New(t, mcptest.Options{}, simple("pay", "look"))
+	s.Forbid("pay")
+
+	// The session survives a 403 (RoundTrip errors do not end it), but a
+	// fresh one per attempt keeps this test independent of the client.
+	for i := 0; i < 2; i++ {
+		if res, err := call(connect(t, s, nil), "pay"); err == nil {
+			t.Fatalf("call %d succeeded: %+v", i, res)
+		}
+	}
+	if s.Applied("pay") != 0 {
+		t.Fatal("forbidden call applied the effect")
+	}
+	var n403 int
+	for _, r := range s.Requests() {
+		if r.Tool == "pay" && r.Status == http.StatusForbidden {
+			n403++
+		}
+	}
+	if n403 != 2 || s.Calls("pay") != 2 || s.Count("tools/call") != 2 {
+		t.Fatalf("403=%d calls=%d: %+v", n403, s.Calls("pay"), s.Requests())
+	}
+}
+
+func TestServerForbiddenOtherToolsServed(t *testing.T) {
+	s := mcptest.New(t, mcptest.Options{}, simple("pay", "look"))
+	s.Forbid("pay")
+	session := connect(t, s, nil)
+	if got := names(listAll(t, session)); !reflect.DeepEqual(got, []string{"look", "pay"}) {
+		t.Fatalf("listed = %v", got)
+	}
+	if _, err := call(session, "look"); err != nil || s.Applied("look") != 1 {
+		t.Fatalf("look: err=%v applied=%d", err, s.Applied("look"))
+	}
+	s.ClearControls("pay")
+	if _, err := call(session, "pay"); err != nil || s.Applied("pay") != 1 {
+		t.Fatalf("after clear: err=%v applied=%d", err, s.Applied("pay"))
+	}
+}

@@ -110,6 +110,10 @@ type Tenancy struct {
 	Settings  settings.Source
 	// Cost admits runs and decorates provider requests. Nil is cost.Open{}.
 	Cost cost.Gate
+	// HistoryBudget is the estimated tokens of history sent per provider request;
+	// older whole turns beyond it are left out of the request. 0 disables trimming
+	// and is for tests only.
+	HistoryBudget int
 }
 
 // ErrDependencyUnavailable marks a tenant directory, allowlist, settings or MCP

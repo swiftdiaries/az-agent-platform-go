@@ -548,7 +548,9 @@ func TestApprovalSupersededOnDefinitionSetChange(t *testing.T) {
 	runnerX := agentruntime.NewRunner(setX, lookupModel(), testTenancy(t, backend.URL))
 	runnerY := agentruntime.NewRunner(setY, lookupModel(), testTenancy(t, backend.URL))
 	i := waitForApproval(t, runnerX, pool, "rollout")
-	// The configuration rolls to Y, and the conversation is re-pinned to it.
+	// The configuration rolls to Y. A reply continuation never idle-re-pins (M6), so the
+	// re-pin is forced here by clearing the conversation pin: the continuation then pins
+	// to current Y, and the approval granted under X must be superseded, not dispatched.
 	store := journal.New(pool)
 	if err := store.ActivateDefinition(t.Context(), setX.Digest(), setY.Digest(), setY.Serves); err != nil {
 		t.Fatal(err)
@@ -572,6 +574,52 @@ func TestApprovalSupersededOnDefinitionSetChange(t *testing.T) {
 		t.Fatalf("superseded approval dispatched: %v", calls)
 	}
 	requireOperationRows(t, pool, 0)
+}
+
+func TestApprovalKeepsPinOnReplyContinuation(t *testing.T) {
+	pool := database(t)
+	mock := newMockMCP(t)
+	backend := httptest.NewServer(mock)
+	defer backend.Close()
+	xPath := writeBundleConfig(t, t.TempDir(), "prompt X\n", lookupAlias, "")
+	yPath := writeBundleConfig(t, t.TempDir(), "prompt Y\n", lookupAlias, "")
+	setX := compileSet(t, xPath)
+	setXY := compileSet(t, yPath, xPath)
+	setY := compileSet(t, yPath)
+	if setX.Digest() == setXY.Digest() {
+		t.Fatal("sets must differ")
+	}
+	runnerX := agentruntime.NewRunner(setX, lookupModel(), testTenancy(t, backend.URL))
+	i := waitForApproval(t, runnerX, pool, "rollout")
+	store := journal.New(pool)
+	// The pending approval pins the conversation to X: Y alone cannot be activated.
+	if err := store.ActivateDefinition(t.Context(), setX.Digest(), setXY.Digest(), setY.Serves); !errors.Is(err, journal.ErrDefinition) {
+		t.Fatalf("activation serving only Y = %v, want ErrDefinition", err)
+	}
+	if err := store.ActivateDefinition(t.Context(), setX.Digest(), setXY.Digest(), setXY.Serves); err != nil {
+		t.Fatal(err)
+	}
+	runnerXY := agentruntime.NewRunner(setXY, lookupModel(), testTenancy(t, backend.URL))
+	p := platform.New(runnerXY, store)
+	defer p.Close()
+	approve(t, p, "rollout", i, "reply")
+	awaitState(t, p, "rollout", "reply", journal.RunCompleted)
+	var changed int
+	if err := pool.QueryRow(t.Context(), "SELECT count(*) FROM agent_events WHERE thread_id='rollout' AND kind='definition_changed'").Scan(&changed); err != nil || changed != 0 {
+		t.Fatalf("definition_changed events = %d (%v), want 0", changed, err)
+	}
+	var pin string
+	if err := pool.QueryRow(t.Context(), "SELECT definition_digest FROM agent_conversations WHERE id='rollout'").Scan(&pin); err != nil || pin != setX.Digest() {
+		t.Fatalf("conversation pin = %q (%v), want X %q", pin, err, setX.Digest())
+	}
+	var marker string
+	if err := pool.QueryRow(t.Context(), "SELECT marker FROM agent_interactions WHERE id=$1", i.ID).Scan(&marker); err != nil || marker != "dispatched" {
+		t.Fatalf("marker = %q/%v, want dispatched", marker, err)
+	}
+	if calls := mock.calls(); len(calls) != 1 {
+		t.Fatalf("approved action dispatched %d times: %v", len(calls), calls)
+	}
+	requireOperationRows(t, pool, 1)
 }
 
 func TestApprovalSupersededWhenJourneyUnavailable(t *testing.T) {

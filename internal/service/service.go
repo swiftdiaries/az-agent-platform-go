@@ -41,6 +41,9 @@ type Dependencies struct {
 	// CostGate is the cost enforcement and attribution seam
 	// (AGENT_PLATFORM_COST_GATE). Nil admits everything and decorates nothing.
 	CostGate cost.Gate
+	// HistoryBudget is the estimated tokens of history per provider request for the
+	// configured model (AGENT_PLATFORM_HISTORY_BUDGET).
+	HistoryBudget int
 }
 
 type Service struct {
@@ -55,7 +58,7 @@ func New(deps Dependencies) (*Service, error) {
 	if deps.Pool == nil || deps.Definitions == nil || deps.Authenticator == nil || deps.Model == nil || deps.Directory == nil || deps.Settings == nil {
 		return nil, errors.New("service dependencies are required")
 	}
-	runner := agentruntime.NewRunner(deps.Definitions, deps.Model, agentruntime.Tenancy{Directory: deps.Directory, Endpoints: deps.Endpoints, Settings: deps.Settings, Cost: deps.CostGate})
+	runner := agentruntime.NewRunner(deps.Definitions, deps.Model, agentruntime.Tenancy{Directory: deps.Directory, Endpoints: deps.Endpoints, Settings: deps.Settings, Cost: deps.CostGate, HistoryBudget: deps.HistoryBudget})
 	service := &Service{platform: platform.New(runner, journal.New(deps.Pool))}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })

@@ -38,6 +38,8 @@ type fakeCatalog struct {
 	unavailable map[string]bool
 	calls       []string
 	onCall      func(alias string)
+	// failures makes Call return the error for an alias.
+	failures map[string]error
 }
 
 func (f *fakeCatalog) Resolution(id string) (catalog.Resolution, bool) {
@@ -89,6 +91,12 @@ func (f *fakeCatalog) Call(_ context.Context, _, alias string, _ []byte) (any, e
 	f.mu.Unlock()
 	if hook != nil {
 		hook(alias)
+	}
+	f.mu.Lock()
+	failure := f.failures[alias]
+	f.mu.Unlock()
+	if failure != nil {
+		return nil, failure
 	}
 	return map[string]string{"alias": alias, "status": "ok"}, nil
 }

@@ -16,10 +16,11 @@ import (
 type callIDKey struct{}
 
 // unavailable classifies a transport or protocol failure as a dependency
-// failure, keeping ErrAuthRequired's identity. The cause text can embed the URL
+// failure, keeping ErrAuthRequired's identity; a 403 before any call
+// (ErrNotPermitted) is auth_required too. The cause text can embed the URL
 // (net/http errors do), so it is deliberately not included.
 func unavailable(op string, err error) error {
-	if errors.Is(err, ErrAuthRequired) {
+	if errors.Is(err, ErrAuthRequired) || errors.Is(err, ErrNotPermitted) {
 		return fmt.Errorf("%s: %w", op, ErrAuthRequired)
 	}
 	return fmt.Errorf("%w: %s failed", ErrEndpointUnavailable, op)
@@ -27,7 +28,7 @@ func unavailable(op string, err error) error {
 
 // headerTransport applies the credential to every request, adds the call-ID
 // header to requests whose context carries a call ID, injects W3C trace
-// context only, and turns 401/403 into ErrAuthRequired.
+// context only, and turns 401 into ErrAuthRequired and 403 into ErrNotPermitted.
 type headerTransport struct {
 	lifetime     context.Context
 	base         http.RoundTripper
@@ -59,9 +60,13 @@ func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	} else {
 		response.Body = &sessionBody{ReadCloser: response.Body, release: release}
 	}
-	if err == nil && (response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) {
+	if err == nil && response.StatusCode == http.StatusUnauthorized {
 		response.Body.Close()
 		return nil, ErrAuthRequired
+	}
+	if err == nil && response.StatusCode == http.StatusForbidden {
+		response.Body.Close()
+		return nil, ErrNotPermitted
 	}
 	return response, err
 }
