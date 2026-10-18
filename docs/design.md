@@ -66,7 +66,7 @@ The steering requirement does **not** promise cancellation of a running model ca
 
 ### Tools, catalogs and versions
 
-- **Tools are selected by `_meta` operation key, never by name.** Java owns the keys, tags and annotations. The platform owns the selectors and a policy overlay that can only narrow. The model sees stable aliases, one per op selector (see [Aliases](#aliases)).
+- **Tools are selected by `_meta` operation key, never by name.** Java owns the keys, tags and annotations. The platform owns the selectors and a policy overlay that can only narrow. The model sees stable aliases, one per op selector; a selector with alternatives declares its alias (see [Aliases](#aliases)).
 - **Catalog snapshots** are raw paginated `tools/list` descriptors captured at the first message. They are immutable, addressed by digest, stored per principal, and each conversation pins one. They are revalidated at run start and are never authorization.
 - **Product versions.** A tenant directory maps tenant to product version to endpoint ID, and the endpoint is allowlisted before any credential is sent. A support window and per-version CI fixtures guard compatibility.
 - **Error encoding.** Business, entitlement and validation rejections become model-visible results. Only `outcome_unknown`, `auth_required` and internal failures are errors. On `tools/call`, HTTP 401 is `auth_required` and HTTP 403 is the entitlement result `{"error":"not_permitted"}` (see [Effects](#effects-retry-and-errors)).
@@ -342,10 +342,11 @@ At run start, Catalog resolves every journey's selector against the snapshot:
 
 The model sees a stable alias, never the dynamic name. **The alias belongs to the selector, not to the resolved key** (M4):
 
-- An op selector's alias is its explicit `alias:`, or else `AliasFor` of its first (canonical) alternative. `[leave.request.v2, leave.request]` exposes `leave_request_v2` on every tenant, whichever alternative resolves, and keeps it across a version flip. A tool matched only by a tag selector takes `AliasFor` of its own key. Prepending a newer alternative later changes a derived alias, so a selector whose list will grow sets `alias:`.
-- `alias:` is allowed only on op selectors. Compile rejects an invalid or reserved alias, two op selectors in one journey with one alias, and one alias given to different alternative lists in different journeys of a set, so an alias names one selector set-wide.
+- **An op selector with more than one alternative must declare `alias:`**; compile fails without it. `op: [leave.request.v2, leave.request]` with `alias: leave_request` exposes `leave_request` on every tenant, whichever alternative resolves, and keeps it across a version flip and when a newer alternative is prepended.
+- A single-alternative op selector defaults to `AliasFor(its key)`, and may still set `alias:`. A tool matched only by a tag selector takes `AliasFor(its own key)`.
+- `alias:` is allowed only on op selectors. Compile rejects a multi-alternative op selector without one, an invalid or reserved alias, two op selectors in one journey with one alias, and one alias given to different alternative lists in different journeys of a set, so an alias names one selector set-wide.
 - A key bump inside one selector keeps the alias, so history and skill text stay valid. The approval binding covers the operation key, so a decided approval for the old key is still superseded.
-- Alternative considered: keep deriving the alias from the resolved key. The same selector then shows different aliases per tenant and across a flip, and history names an alias that disappears.
+- Alternatives considered: (a) derive the alias from the resolved key: the same selector shows different aliases per tenant and across a flip, and history names an alias that disappears; (b) default to `AliasFor` of the first alternative: stable across tenants, but prepending a newer alternative silently renames the tool for every conversation.
 
 Binding maps each alias to the user's remote name at call time, using the **remote** name as the server knows it, so names with characters outside `[A-Za-z0-9_.-]` (such as `/`, a space or `:`) are called correctly. Descriptions and input schemas come from the server. This keeps skill text, evals and the provider prompt cache stable across tenants and avoids provider name-length and character limits.
 
@@ -438,7 +439,7 @@ journeys:
       - op: leave.balance
         class: read_only                        # class is allowed only on op selectors
       - op: [leave.request.v2, leave.request]   # alternatives in preference order
-        alias: leave_request                    # optional; default AliasFor(first alternative)
+        alias: leave_request                    # required: more than one alternative
         approval: required                      # overlay may only narrow
       - tags: [leave]                           # no class: tag-only matches are effectful
         read_only: true                         # hint filter, not a class: keeps readOnlyHint tools
@@ -449,7 +450,7 @@ The vacation label is illustrative. The platform schema has no vacation, shift, 
 
 Startup validation:
 
-- **Rejects** duplicate journey IDs, missing or escaping skill paths (no symlinks), malformed selectors, empty selector lists, unknown policy fields, invalid product-version ranges, `class:` or `alias:` on a tag selector, and alias conflicts (see [Aliases](#aliases)).
+- **Rejects** duplicate journey IDs, missing or escaping skill paths (no symlinks), malformed selectors, empty selector lists, unknown policy fields, invalid product-version ranges, `class:` or `alias:` on a tag selector, an op selector with more than one alternative and no `alias:`, and alias conflicts (see [Aliases](#aliases)).
 - **Never validates tool names.** No tenant-independent name exists. Selectors are checked against per-version fixtures in CI instead.
 
 Each journey's instructions are an immutable bundle rooted at a `SKILL.md`. Its frontmatter `name` and `description` are the metadata the model sees. Supporting files load on demand within the bundle only. Where prose must differ by product version, the bundle may contain a version-range overlay file; whole journeys are not forked per version.

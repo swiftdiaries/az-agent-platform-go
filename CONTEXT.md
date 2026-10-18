@@ -62,7 +62,7 @@ _Avoid_: tool list, server contract
 A user's tool catalog captured when a conversation's first message is handled, identified by digest and revalidated at each run start. It never grants permission; the MCP server still authorizes every call.
 
 **Tool alias**:
-The stable model-facing name for a tool selector's operation, the same on every tenant and product version whichever of the selector's operation keys resolves. It is mapped to the user's dynamic tool name at call time.
+The stable model-facing name for a tool selector's operation, the same on every tenant and product version whichever of the selector's operation keys resolves. A selector with alternative operation keys declares its alias; a single key defaults to a name derived from it. It is mapped to the user's dynamic tool name at call time.
 
 **Product version**:
 The release of the product a tenant runs. Each product version has its own MCP server version and endpoint.
