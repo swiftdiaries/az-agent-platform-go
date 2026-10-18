@@ -9,9 +9,9 @@ import (
 	"github.com/microsoft/agent-framework-go/agent"
 	"github.com/microsoft/agent-framework-go/message"
 	"github.com/microsoft/agent-framework-go/tool"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	platformskills "github.com/swiftdiaries/az-agent-platform-go/internal/skills"
 )
 
@@ -52,7 +52,7 @@ func (questionTool) Schema() any {
 	return schema
 }
 
-func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definitions.Journey, bound *platformmcp.Bound, server definitions.MCPServer) (output RunOutput, runErr error) {
+func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definitions.Journey, cat *catalog.Binding) (output RunOutput, runErr error) {
 	var history []*message.Message
 	if err := json.Unmarshal(in.History, &history); err != nil {
 		return RunOutput{}, err
@@ -99,7 +99,7 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 	var skillMaterial []platformskills.Material
 	// The pinned graph resumes each outstanding tool result separately. The product
 	// owns batching and durable waiting; a bare MAF agent handles one provider turn.
-	tools := append(funcsAsTools(bound.Tools()), tool.Tool(questionTool{}))
+	tools := append(cat.Tools(journey.ID), tool.Tool(questionTool{}))
 	if len(skillCatalog) > 0 {
 		tools = append(tools, loadSkillTool{}, readSkillResourceTool{})
 	}
@@ -240,15 +240,10 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 				return RunOutput{}, err
 			}
 			callID := stableCallID(in.ThreadID, fmt.Sprintf("%s/%d/%d", in.RunID, in.Iteration, callNumber))
-			policy := journey.Policies[call.Name].Class
-			if policy == "" {
-				policy = "effectful"
-			}
+			var resolved catalog.Tool
 			if call.Name != "request_user_input" {
-				allowed := false
-				for _, name := range journey.MCP.Tools {
-					allowed = allowed || name == call.Name
-				}
+				var allowed bool
+				resolved, allowed = cat.Tool(journey.ID, call.Name)
 				if !allowed {
 					return RunOutput{}, fmt.Errorf("tool is not allowed")
 				}
@@ -261,7 +256,7 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 				callID = approved.Call.CallID
 				approvalID = approved.ID
 			}
-			if call.Name == "request_user_input" || (policy != "read_only" && approvalID == "") {
+			if call.Name == "request_user_input" || (resolved.RequiresApproval && approvalID == "") {
 				// Close siblings explicitly before checkpointing one externally answerable
 				// request; they may be proposed again after this wait, never auto-dispatched.
 				for _, sibling := range calls[index+1:] {
@@ -302,7 +297,7 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 				}
 				return RunOutput{JourneyID: journey.ID, History: serialized, Waiting: true}, nil
 			}
-			result, err := guardedCall(ctx, in, bound, journal.Operation{CallID: callID, Name: call.Name, Arguments: call.Arguments, Binding: binding, Policy: policy}, approvalID)
+			result, err := guardedCall(ctx, in, cat, journal.Operation{CallID: callID, Name: call.Name, OperationKey: resolved.OperationKey, Arguments: call.Arguments, Binding: binding, Policy: string(resolved.Class), RequiresApproval: resolved.RequiresApproval}, approvalID)
 			if err != nil {
 				return RunOutput{}, err
 			}

@@ -12,7 +12,7 @@ import (
 	"testing"
 
 	"github.com/microsoft/agent-framework-go/message"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
@@ -161,7 +161,7 @@ func TestCompleteSanitizesAuthAndPreservesCancellation(t *testing.T) {
 	defer server.Close()
 	adapter := newAdapter(t, server)
 	_, err := adapter.Complete(t.Context(), runtime.ModelRequest{ProviderMessages: []*message.Message{message.NewText("secret")}})
-	if !errors.Is(err, platformmcp.ErrAuthRequired) || strings.Contains(err.Error(), "private-auth-detail") {
+	if !errors.Is(err, catalog.ErrAuthRequired) || strings.Contains(err.Error(), "private-auth-detail") {
 		t.Fatalf("auth error = %v", err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())

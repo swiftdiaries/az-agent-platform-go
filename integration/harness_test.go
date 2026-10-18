@@ -18,8 +18,12 @@ import (
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/service"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/settings"
@@ -82,8 +86,40 @@ func scoped(t *testing.T, runner *agentruntime.Runner, in agentruntime.RunInput)
 	if err != nil {
 		t.Fatal(err)
 	}
-	in.Endpoint, in.Settings = scope.Endpoint, scope.Settings
+	in.ProductVersion, in.Endpoint, in.Settings = scope.Entry.ProductVersion, scope.Endpoint, scope.Settings
 	return in
+}
+
+// testMetaKey is the _meta key under which the test servers publish operation keys
+// (the writers set catalog.operation_meta_key to the same value).
+const testMetaKey = "operation_key"
+
+// keyedTool is an inline go-sdk tool that publishes op under _meta[testMetaKey].
+// name is the remote name; the model sees definitions.AliasFor(op).
+func keyedTool(name, op string) *mcp.Tool {
+	return &mcp.Tool{Name: name, Meta: mcp.Meta{testMetaKey: op}, InputSchema: map[string]any{"type": "object"}}
+}
+
+// openTestCatalog opens a catalog Binding for set against endpoint as a freshly
+// admitted and claimed run (a journal owner is required to pin a snapshot).
+func openTestCatalog(ctx context.Context, t *testing.T, endpoint tenantdir.Endpoint, cred credential.Credential, set *definitions.Set) (*catalog.Binding, error) {
+	t.Helper()
+	store := journal.New(database(t))
+	command := journal.Command{ThreadID: "catalog", RunID: "catalog", CommunicationID: "catalog", Principal: testPrincipal, Tenant: testTenant, Text: "plan"}
+	if _, _, err := store.Admit(t.Context(), command); err != nil {
+		t.Fatal(err)
+	}
+	owner := claimForTest(t, store, command, false)
+	binding, err := catalog.Open(ctx, catalog.Scope{ProductVersion: "vN", Endpoint: endpoint}, cred, store, owner, set, catalog.Options{})
+	if binding != nil {
+		t.Cleanup(func() { binding.Close() })
+	}
+	return binding, err
+}
+
+func withDescription(tool *mcp.Tool, description string) *mcp.Tool {
+	tool.Description = description
+	return tool
 }
 
 type acceptanceReplica struct {
@@ -91,10 +127,10 @@ type acceptanceReplica struct {
 	url string
 }
 
-func startAcceptanceReplica(t *testing.T, pool *pgxpool.Pool, registry *definitions.Registry, model agentruntime.Model, tenancy agentruntime.Tenancy) acceptanceReplica {
+func startAcceptanceReplica(t *testing.T, pool *pgxpool.Pool, set *definitions.Set, model agentruntime.Model, tenancy agentruntime.Tenancy) acceptanceReplica {
 	t.Helper()
 	app, err := service.New(service.Dependencies{
-		Pool: pool, Registry: registry, Authenticator: acceptanceTokens, Model: model,
+		Pool: pool, Definitions: set, Authenticator: acceptanceTokens, Model: model,
 		CredentialHeaders: acceptanceCredentialHeaders,
 		Directory:         tenancy.Directory, Endpoints: tenancy.Endpoints, Settings: tenancy.Settings,
 	})
@@ -181,12 +217,12 @@ func acceptanceThreadFor(t *testing.T, pool *pgxpool.Pool, principal, external s
 }
 
 // threeReplicas starts replicas A, B and C as separate in-process Service
-// instances sharing one database, registry and model.
-func threeReplicas(t *testing.T, pool *pgxpool.Pool, registry *definitions.Registry, model agentruntime.Model, tenancy agentruntime.Tenancy) (a, b, c acceptanceReplica) {
+// instances sharing one database, definition set and model.
+func threeReplicas(t *testing.T, pool *pgxpool.Pool, set *definitions.Set, model agentruntime.Model, tenancy agentruntime.Tenancy) (a, b, c acceptanceReplica) {
 	t.Helper()
-	a = startAcceptanceReplica(t, pool, registry, model, tenancy)
-	b = startAcceptanceReplica(t, pool, registry, model, tenancy)
-	c = startAcceptanceReplica(t, pool, registry, model, tenancy)
+	a = startAcceptanceReplica(t, pool, set, model, tenancy)
+	b = startAcceptanceReplica(t, pool, set, model, tenancy)
+	c = startAcceptanceReplica(t, pool, set, model, tenancy)
 	return a, b, c
 }
 

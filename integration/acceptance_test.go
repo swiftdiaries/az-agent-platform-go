@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,22 +21,12 @@ import (
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
-func acceptanceRegistry(t *testing.T, policy string) *definitions.Registry {
+// acceptanceSet compiles the planner bundle whose one tool is operation key
+// travel.lookup (alias travel_lookup). policy is "read_only", "idempotent" or
+// "effectful" (the unclassified default).
+func acceptanceSet(t *testing.T, policy string) *definitions.Set {
 	t.Helper()
-	path := writeDefinitionBundle(t, t.TempDir(), "prompt\n")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data = bytes.Replace(data, []byte(`"class":"read_only"`), []byte(`"class":"`+policy+`"`), 1)
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		t.Fatal(err)
-	}
-	registry, err := definitions.Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return registry
+	return compileSet(t, writeBundleConfig(t, t.TempDir(), "prompt\n", "travel.lookup", policy))
 }
 
 // This is the missing process-level regression: all ingress and reconnects use
@@ -48,7 +37,7 @@ func TestAcceptanceThreeServiceHTTPSteeringReconnectAndForcedDrain(t *testing.T)
 	var releaseTool sync.Once
 	t.Cleanup(func() { releaseTool.Do(func() { close(toolRelease) }) })
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "acceptance", Version: "1"}, nil)
-	mcp.AddTool(mcpServer, &mcp.Tool{Name: "lookup"}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, struct{}, error) {
+	mcp.AddTool(mcpServer, keyedTool("lookup", "travel.lookup"), func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, struct{}, error) {
 		close(toolStarted)
 		select {
 		case <-toolRelease:
@@ -71,14 +60,14 @@ func TestAcceptanceThreeServiceHTTPSteeringReconnectAndForcedDrain(t *testing.T)
 			return agentruntime.ModelResponse{}, ctx.Err()
 		}
 		if len(request.ToolResults) == 0 {
-			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "lookup", Arguments: json.RawMessage(`{}`)}}, nil
+			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "travel_lookup", Arguments: json.RawMessage(`{}`)}}, nil
 		}
 		if len(request.PendingCommands) != 1 || request.PendingCommands[0].Text != "use Osaka instead" {
 			return agentruntime.ModelResponse{}, errors.New("steering was not delivered at the next provider boundary")
 		}
 		return agentruntime.ModelResponse{Text: "corrected Osaka"}, nil
 	})
-	registry := acceptanceRegistry(t, "read_only")
+	registry := acceptanceSet(t, "read_only")
 	a, b, c := threeReplicas(t, pool, registry, model, testTenancy(t, mcpAPI.URL))
 
 	first := acceptancePost(t, a.url, aguitypes.RunAgentInput{ThreadID: "steer-thread", RunID: "run-a", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan"}}})
@@ -170,7 +159,7 @@ func TestAcceptanceThreeServiceHTTPApprovalAndReconnect(t *testing.T) {
 	pool := database(t)
 	var calls atomic.Int32
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "approval", Version: "1"}, nil)
-	mcp.AddTool(mcpServer, &mcp.Tool{Name: "lookup"}, func(_ context.Context, request *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, map[string]any, error) {
+	mcp.AddTool(mcpServer, keyedTool("lookup", "travel.lookup"), func(_ context.Context, request *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, map[string]any, error) {
 		authorization := request.Extra.Header.Get("Authorization")
 		if authorization != "Bearer token" {
 			return nil, nil, errors.New("approval did not use fresh request credentials")
@@ -182,11 +171,11 @@ func TestAcceptanceThreeServiceHTTPApprovalAndReconnect(t *testing.T) {
 	defer mcpAPI.Close()
 	model := modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		if len(request.ToolResults) == 0 {
-			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "lookup", Arguments: json.RawMessage(`{"amount":1}`)}}, nil
+			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "travel_lookup", Arguments: json.RawMessage(`{"amount":1}`)}}, nil
 		}
 		return agentruntime.ModelResponse{Text: "approved and complete"}, nil
 	})
-	registry := acceptanceRegistry(t, "effectful")
+	registry := acceptanceSet(t, "effectful")
 	a, b, c := threeReplicas(t, pool, registry, model, testTenancy(t, mcpAPI.URL))
 
 	wait := acceptancePost(t, a.url, aguitypes.RunAgentInput{ThreadID: "approval-thread", RunID: "approval-run", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "change"}}})

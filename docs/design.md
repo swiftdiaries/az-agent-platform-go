@@ -439,6 +439,7 @@ The policy overlay assigns each operation a class. The class is authoritative fo
 
 (`idempotent` was named `deduplicated` in the earlier journal; it is renamed with the catalog migration.)
 
+- **An unclassified operation is `effectful`** (decided 2026-10-18): when the overlay gives an operation no class, it requires approval and is never retried.
 - **MCP annotations never grant `read_only`.** The class comes only from the reviewed overlay. The overlay can only narrow, so `approval: required` can add approval to a read-only operation but nothing can remove it.
 - **The run computes `requires_approval`** from the class and the overlay, and the journal enforces it when an attempt begins: a first attempt that requires approval needs a consumed, matching approval.
 - The operation key, alias and `requires_approval` are stored on each operation row. The remote name is not.
@@ -658,7 +659,7 @@ These are inputs from outside the platform, not platform-domain decisions:
 
 Points where the source spec and the migration plan do not fully settle the end state. The migration plan wins where it speaks; these are recorded rather than decided here.
 
-1. **Default class when the overlay is silent.** MCP annotations never grant `read_only`, so an operation with no reviewed class cannot be `read_only`. Whether such an operation is treated as `effectful` (approval required, never retried) is not stated.
+1. **Default class when the overlay is silent.** Decided 2026-10-18: such an operation is `effectful` (approval required, never retried). MCP annotations never grant `read_only`, so an operation with no reviewed class cannot be `read_only`. See [Policy classes](#policy-classes-and-approval).
 2. **Context-budget policy.** The original spec made a bounded-history or compaction policy a V1 requirement, because all journeys share one transcript. The migration plan does not schedule one. Also open: whether active-journey instructions need re-injection after compaction (they are composed per request, so likely not).
 3. **Staleness signals.** The original spec also revalidated on a catalog ETag in `ListToolsResult._meta` and on `notifications/tools/list_changed`. The migration plan revalidates on version, server version, endpoint or TTL only. The TTL value is unspecified, and the ETag depends on a Java input.
 4. **Relaxing the `outcome_unknown` stop.** The original spec lets a later user-started run proceed with the uncertainty surfaced. V1 keeps the thread-level stop; when to relax it to the journey depends on a reconciliation path that Java has not provided.

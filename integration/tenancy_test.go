@@ -15,7 +15,6 @@ import (
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/mcptest"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
@@ -58,7 +57,7 @@ func TestRunScopeRecordedAndDependencyUnavailable(t *testing.T) {
 		return modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 			models.Add(1)
 			if len(request.ToolResults) == 0 {
-				return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "lookup", Arguments: json.RawMessage(`{}`)}}, nil
+				return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "travel_lookup", Arguments: json.RawMessage(`{}`)}}, nil
 			}
 			return agentruntime.ModelResponse{Text: "done"}, nil
 		})
@@ -68,7 +67,7 @@ func TestRunScopeRecordedAndDependencyUnavailable(t *testing.T) {
 		t.Helper()
 		pool := database(t)
 		store := journal.New(pool)
-		p := platform.New(agentruntime.NewRunner(acceptanceRegistry(t, "read_only"), platformmcp.NewClient(), scripted(models), tenancy), store)
+		p := platform.New(agentruntime.NewRunner(acceptanceSet(t, "read_only"), scripted(models), tenancy), store)
 		t.Cleanup(p.Close)
 		c := platform.Command{ThreadID: "tenancy", RunID: "tenancy", CommunicationID: "tenancy", Principal: testPrincipal, Tenant: tenant, Text: "plan"}
 		if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
@@ -175,7 +174,7 @@ func TestRunScopeRecordedAndDependencyUnavailable(t *testing.T) {
 		server := newServer(t)
 		var models atomic.Int32
 		pool := database(t)
-		replica := startAcceptanceReplica(t, pool, acceptanceRegistry(t, "read_only"), scripted(&models), testTenancy(t, server.URL()))
+		replica := startAcceptanceReplica(t, pool, acceptanceSet(t, "read_only"), scripted(&models), testTenancy(t, server.URL()))
 		// token-b authenticates as tenant-b/bob; tenant-b has no directory entry.
 		response := acceptancePostWithHeaders(t, replica.url, aguitypes.RunAgentInput{
 			ThreadID: "unrouted", RunID: "unrouted-run",

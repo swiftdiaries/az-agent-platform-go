@@ -437,6 +437,7 @@ func TestHITLCompletedToolNotReplayed(t *testing.T) {
 	backend := httptest.NewServer(mock)
 	defer backend.Close()
 	model := modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+		requireAliasOffered(t, r)
 		switch len(r.ToolResults) {
 		case 0:
 			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "completed", Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
@@ -464,6 +465,8 @@ func TestHITLCompletedToolNotReplayed(t *testing.T) {
 	if len(mock.calls()) != 1 {
 		t.Fatal("completed tool replayed", len(mock.calls()))
 	}
+	mock.requireRemoteName(t)
+	requireOperationRows(t, pool, 1)
 }
 
 func TestReplyLosslessActionBinding(t *testing.T) {

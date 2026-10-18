@@ -13,13 +13,13 @@ func (r *Runner) route(ctx context.Context, target, text string) (definitions.Jo
 	_, span := otel.Tracer("az-agent-platform/runtime").Start(ctx, "hub.route")
 	defer span.End()
 	if target != "" {
-		journey, ok := r.definitions.Journey(target)
+		journey, ok := r.set.Journey(target)
 		if !ok {
 			return definitions.Journey{}, fmt.Errorf("unknown journey target")
 		}
 		return journey, nil
 	}
-	journey, ok := r.definitions.Infer(text)
+	journey, ok := r.set.Infer(text)
 	if !ok {
 		return definitions.Journey{}, fmt.Errorf("no journey matches request")
 	}

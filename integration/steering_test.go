@@ -21,9 +21,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
@@ -196,8 +194,12 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 	started, release := make(chan struct{}), make(chan struct{})
 	server := mcp.NewServer(&mcp.Implementation{Name: "steering", Version: "1"}, nil)
 	var toolCalls atomic.Int64
-	mcp.AddTool(server, &mcp.Tool{Name: "lookup_destination", Description: "read options"}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, struct{}, error) {
+	var wrongRemoteName atomic.Bool
+	mcp.AddTool(server, lookupTool("read options"), func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, struct{}, error) {
 		toolCalls.Add(1)
+		if req.Params.Name != remoteLookup {
+			wrongRemoteName.Store(true)
+		}
 		close(started)
 		select {
 		case <-release:
@@ -215,21 +217,19 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 		mcpHandler.ServeHTTP(w, r)
 	}))
 	defer endpoint.Close()
-	registry, err := definitions.Load(filepath.Join("..", "configs", "journeys.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	registry := compileSet(t, filepath.Join("..", "configs", "journeys.yaml"))
 	var modelCalls atomic.Int64
 	observed := make(chan agentruntime.ModelRequest, 4)
 	model := modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		modelCalls.Add(1)
+		requireAliasOffered(t, request)
 		observed <- request
 		if len(request.ToolResults) == 0 {
 			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
 		}
 		return agentruntime.ModelResponse{Text: "corrected Kyoto"}, nil
 	})
-	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, endpoint.URL))
+	runner := agentruntime.NewRunner(registry, model, testTenancy(t, endpoint.URL))
 	auth := chat.StaticBearerTokens{"token": testPrincipal}
 	var apis []*httptest.Server
 	for range 3 {
@@ -325,6 +325,10 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 	if modelCalls.Load() != 2 || toolCalls.Load() != 1 || wrongCredentials.Load() {
 		t.Fatalf("replay or credential transfer: models %d tools %d credentials %v", modelCalls.Load(), toolCalls.Load(), wrongCredentials.Load())
 	}
+	if wrongRemoteName.Load() {
+		t.Fatalf("MCP did not receive remote name %q", remoteLookup)
+	}
+	requireOperationRows(t, pool, 1)
 	after, err := journal.New(pool).Snapshot(ctx, thread, testPrincipal)
 	if err != nil {
 		t.Fatal(err)
@@ -479,8 +483,12 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 	started, release, remoteFinished := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var toolCalls, modelCalls atomic.Int64
 	server := mcp.NewServer(&mcp.Implementation{Name: "ownership-loss", Version: "1"}, nil)
-	mcp.AddTool(server, &mcp.Tool{Name: "lookup_destination", Description: "read lookup"}, func(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, struct{}, error) {
+	var wrongRemoteName atomic.Bool
+	mcp.AddTool(server, lookupTool("read lookup"), func(_ context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, struct{}, error) {
 		toolCalls.Add(1)
+		if req.Params.Name != remoteLookup {
+			wrongRemoteName.Store(true)
+		}
 		close(started)
 		<-release // A remote server may finish even after local HTTP cancellation.
 		close(remoteFinished)
@@ -488,17 +496,15 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 	})
 	endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
 	defer endpoint.Close()
-	registry, err := definitions.Load(filepath.Join("..", "configs", "journeys.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	registry := compileSet(t, filepath.Join("..", "configs", "journeys.yaml"))
 	contexts := make(chan context.Context, 1)
-	model := modelFunc(func(ctx context.Context, _ agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	model := modelFunc(func(ctx context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		modelCalls.Add(1)
+		requireAliasOffered(t, request)
 		contexts <- ctx
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
 	})
-	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, endpoint.URL))
+	runner := agentruntime.NewRunner(registry, model, testTenancy(t, endpoint.URL))
 	a := platform.New(runner, journal.New(pool))
 	defer a.Close()
 	b := platform.New(runner, journal.New(pool))
@@ -567,6 +573,10 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 	}
 	assertCommandOutcome(t, snapshot, "initial", "included", "")
 	assertCommandOutcome(t, snapshot, "pending", "interrupted", "interrupted")
+	if wrongRemoteName.Load() {
+		t.Fatalf("MCP did not receive remote name %q", remoteLookup)
+	}
+	requireOperationRows(t, pool, 1)
 	for _, event := range snapshot.Events {
 		if event.Type == "tool.completed" || event.Type == "message.completed" {
 			t.Fatalf("late result committed: %+v", event)

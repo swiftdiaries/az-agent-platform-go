@@ -15,7 +15,7 @@ import (
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/responses"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
@@ -196,7 +196,7 @@ func sanitize(err error) error {
 	}
 	var apiErr *openai.Error
 	if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden) {
-		return fmt.Errorf("LiteLLM authentication failed: %w", platformmcp.ErrAuthRequired)
+		return fmt.Errorf("LiteLLM authentication failed: %w", catalog.ErrAuthRequired)
 	}
 	return errors.New("LiteLLM model request failed")
 }

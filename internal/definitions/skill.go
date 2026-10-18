@@ -24,7 +24,7 @@ func skillFootprint(skill SkillPackage) (int, int) {
 	return bytes, 1 + len(skill.Supporting)
 }
 
-func compileSkill(configRoot string, declaration SkillDeclaration) (SkillPackage, error) {
+func compileSkill(configRoot string, declaration skillDeclaration) (SkillPackage, error) {
 	packageRoot, err := confinedPath(configRoot, declaration.Root)
 	if err != nil {
 		return SkillPackage{}, err
@@ -151,25 +151,25 @@ func skillIdentities(skills []SkillPackage) []skillIdentity {
 	return result
 }
 
-func clonePolicies(in map[string]ToolPolicy) map[string]ToolPolicy {
-	if in == nil {
-		return nil
-	}
-	out := make(map[string]ToolPolicy, len(in))
-	for name, policy := range in {
-		out[name] = policy
-	}
-	return out
+type skillDeclaration struct {
+	Name                 string
+	Root                 string
+	SupportingFiles      []string
+	Disabled             bool
+	AllowSupportingFiles bool
 }
 
-func selectedPolicies(all map[string]ToolPolicy, tools []string) map[string]ToolPolicy {
-	result := make(map[string]ToolPolicy, len(tools))
-	for _, name := range tools {
-		if policy, ok := all[name]; ok {
-			result[name] = policy
-		}
-	}
-	return result
+type SkillFile struct {
+	Name, Path, Root, Relative, Digest string
+	Data                               []byte
+}
+
+type SkillPackage struct {
+	Name, Description              string
+	Disabled, AllowSupportingFiles bool
+	Instructions                   SkillFile
+	Supporting                     map[string]SkillFile
+	Digest                         string
 }
 
 func cloneSkill(in SkillPackage) SkillPackage {
@@ -185,10 +185,9 @@ func cloneSkill(in SkillPackage) SkillPackage {
 
 func cloneJourney(in Journey) Journey {
 	out := in
-	out.MCP.Tools = append([]string(nil), in.MCP.Tools...)
-	out.SkillNames = append([]string(nil), in.SkillNames...)
 	out.Routing = cloneRouting(in.Routing)
-	out.Policies = clonePolicies(in.Policies)
+	out.Tools = cloneSelectors(in.Tools)
+	out.Deny = append([]string(nil), in.Deny...)
 	out.Skills = make([]SkillPackage, len(in.Skills))
 	for i, skill := range in.Skills {
 		out.Skills[i] = cloneSkill(skill)
@@ -201,63 +200,30 @@ func cloneRouting(in Routing) Routing {
 	return in
 }
 
-func cloneServer(in MCPServer) MCPServer {
-	out := in
-	out.Tools = append([]string(nil), in.Tools...)
-	out.Policies = clonePolicies(in.Policies)
-	return out
-}
-
-func (r *Registry) Version(digest string) (Journey, bool) {
-	if r == nil {
-		return Journey{}, false
+func confinedPath(root, relative string) (string, error) {
+	if filepath.IsAbs(relative) {
+		return "", fmt.Errorf("absolute path is not allowed")
 	}
-	journey, ok := r.versions[digest]
-	return cloneJourney(journey), ok
-}
-
-func (r *Registry) HasDigest(digest string) bool {
-	_, versionOK := r.versions[digest]
-	_, serverOK := r.versionServers[digest]
-	return versionOK && serverOK
-}
-
-// JourneyIDForDigest returns the immutable definition identity only when the
-// complete bundle is available to this replica.
-func (r *Registry) JourneyIDForDigest(digest string) (string, bool) {
-	journey, versionOK := r.versions[digest]
-	_, serverOK := r.versionServers[digest]
-	return journey.ID, versionOK && serverOK
-}
-
-func (r *Registry) ServerFor(digest string) (MCPServer, bool) {
-	server, ok := r.versionServers[digest]
-	return cloneServer(server), ok
-}
-
-func (r *Registry) Infer(text string) (Journey, bool) {
-	text = strings.ToLower(strings.TrimSpace(text))
-	if text == "" {
-		return Journey{}, false
-	}
-	bestPriority, bestIndex := 0, -1
-	for index, id := range r.order {
-		journey := r.journeys[id]
-		matched := false
-		for _, keyword := range journey.Routing.Keywords {
-			matched = matched || strings.Contains(text, keyword)
-		}
-		if matched && (bestIndex < 0 || journey.Routing.Priority > bestPriority) {
-			bestPriority, bestIndex = journey.Routing.Priority, index
+	for _, part := range strings.Split(filepath.ToSlash(relative), "/") {
+		if part == ".." {
+			return "", fmt.Errorf("path parent components are not allowed")
 		}
 	}
-	if bestIndex >= 0 {
-		return cloneJourney(r.journeys[r.order[bestIndex]]), true
+	clean := filepath.Clean(relative)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path escapes config directory")
 	}
-	for _, id := range r.order {
-		if r.journeys[id].Routing.Default {
-			return cloneJourney(r.journeys[id]), true
+	path := filepath.Join(root, clean)
+	current := root
+	for _, part := range strings.Split(clean, string(filepath.Separator)) {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("symbolic links are not allowed")
 		}
 	}
-	return r.DefaultJourney()
+	return path, nil
 }

@@ -19,7 +19,6 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
@@ -27,16 +26,16 @@ import (
 func fixtureRunner(t *testing.T, model agentruntime.Model) *agentruntime.Runner {
 	t.Helper()
 	server := mcp.NewServer(&mcp.Implementation{Name: "persistent-fixture", Version: "1"}, nil)
-	mcp.AddTool(server, &mcp.Tool{Name: "lookup_destination"}, func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
+	mcp.AddTool(server, keyedTool(remoteLookup, lookupAlias), func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
 		return nil, struct{}{}, nil
 	})
 	endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
 	t.Cleanup(endpoint.Close)
-	registry, err := definitions.Load(filepath.Join("..", "configs", "journeys.yaml"))
+	registry, err := definitions.Compile(filepath.Join("..", "configs", "journeys.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, endpoint.URL))
+	return agentruntime.NewRunner(registry, model, testTenancy(t, endpoint.URL))
 }
 
 // A request-scoped run context would cancel the model here. A process-local ID map

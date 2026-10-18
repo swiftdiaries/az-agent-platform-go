@@ -9,15 +9,29 @@ import (
 
 var ErrOutcomeUnknown = errors.New("tool outcome unknown")
 
-type Operation struct{ CallID, Name, Arguments, Binding, Policy string }
+// Operation is one model-requested tool call. Name is the alias the model saw;
+// OperationKey is the stable catalog key behind it ("" for callers that predate
+// catalog keys). Approval is required exactly when RequiresApproval is set; only
+// a read_only operation may leave it unset.
+type Operation struct {
+	CallID, Name, Arguments, Binding, Policy string
+	OperationKey                             string
+	RequiresApproval                         bool
+}
+
+func validPolicy(policy string) bool {
+	return policy == "read_only" || policy == "idempotent" || policy == "effectful"
+}
 
 // BeginAttempt commits the exact intent before dispatch; an unclosed intent is
 // uncertain even if the process died in the gap before reaching the transport.
 func (s *Store) BeginAttempt(ctx context.Context, o Owner, op Operation, attempt int, approval string) error {
+	policy := op.Policy
 	binding, err := ActionBinding(op.Name, []byte(op.Arguments))
-	if err != nil || binding != op.Binding || op.CallID == "" || attempt < 1 || attempt > 2 || (op.Policy != "read_only" && op.Policy != "effectful" && op.Policy != "deduplicated") {
+	if err != nil || binding != op.Binding || op.CallID == "" || attempt < 1 || attempt > 2 || !validPolicy(policy) || policy != "read_only" && !op.RequiresApproval {
 		return ErrState
 	}
+	requiresApproval := op.RequiresApproval
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := lockOwner(ctx, tx, o); err != nil {
 			return err
@@ -31,7 +45,7 @@ func (s *Store) BeginAttempt(ctx context.Context, o Owner, op Operation, attempt
 			return ErrOutcomeUnknown
 		}
 		if attempt == 1 {
-			if op.Policy != "read_only" {
+			if requiresApproval {
 				var artifact, reply []byte
 				err := tx.QueryRow(ctx, "SELECT artifact,reply FROM agent_interactions WHERE id=$1 AND thread_id=$2 AND continuation_run_id=$3 AND kind='approval' AND state='consumed' AND expires_at>clock_timestamp()", approval, c.ThreadID, c.RunID).Scan(&artifact, &reply)
 				if err != nil {
@@ -43,15 +57,15 @@ func (s *Store) BeginAttempt(ctx context.Context, o Owner, op Operation, attempt
 					return ErrState
 				}
 			}
-			if _, err := tx.Exec(ctx, "INSERT INTO agent_operations(call_id,thread_id,run_id,name,arguments,binding,policy,outcome) VALUES($1,$2,$3,$4,$5,$6,$7,'dispatching')", op.CallID, c.ThreadID, c.RunID, op.Name, op.Arguments, op.Binding, op.Policy); err != nil {
+			if _, err := tx.Exec(ctx, "INSERT INTO agent_operations(call_id,thread_id,run_id,alias,operation_key,arguments,binding,policy,requires_approval,outcome) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'dispatching')", op.CallID, c.ThreadID, c.RunID, op.Name, op.OperationKey, op.Arguments, op.Binding, policy, requiresApproval); err != nil {
 				return err
 			}
 		} else {
-			var previous, policy, binding string
-			if err := tx.QueryRow(ctx, "SELECT outcome,policy,binding FROM agent_operations WHERE call_id=$1 AND thread_id=$2 AND run_id=$3", op.CallID, c.ThreadID, c.RunID).Scan(&previous, &policy, &binding); err != nil {
+			var previous, stored, binding string
+			if err := tx.QueryRow(ctx, "SELECT outcome,policy,binding FROM agent_operations WHERE call_id=$1 AND thread_id=$2 AND run_id=$3", op.CallID, c.ThreadID, c.RunID).Scan(&previous, &stored, &binding); err != nil {
 				return err
 			}
-			if binding != op.Binding || policy != op.Policy || previous != "rejected" && (previous != "outcome_unknown" || policy == "effectful") {
+			if binding != op.Binding || stored != policy || previous != "rejected" && (previous != "outcome_unknown" || policy == "effectful") {
 				return ErrState
 			}
 			if _, err := tx.Exec(ctx, "UPDATE agent_operations SET outcome='dispatching' WHERE call_id=$1", op.CallID); err != nil {
@@ -96,7 +110,7 @@ func markOperationsUnknown(ctx context.Context, tx pgx.Tx, thread, run string) e
 	if _, err := tx.Exec(ctx, "UPDATE agent_attempts a SET outcome='outcome_unknown' FROM agent_operations o WHERE a.call_id=o.call_id AND o.thread_id=$1 AND o.run_id=$2 AND a.outcome='dispatching'", thread, run); err != nil {
 		return err
 	}
-	rows, err := tx.Query(ctx, "UPDATE agent_operations SET outcome='outcome_unknown' WHERE thread_id=$1 AND run_id=$2 AND outcome='dispatching' RETURNING call_id,name", thread, run)
+	rows, err := tx.Query(ctx, "UPDATE agent_operations SET outcome='outcome_unknown' WHERE thread_id=$1 AND run_id=$2 AND outcome='dispatching' RETURNING call_id,alias", thread, run)
 	if err != nil {
 		return err
 	}

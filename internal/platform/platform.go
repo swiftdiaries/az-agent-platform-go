@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
@@ -233,7 +233,7 @@ func (p *Platform) execute(ctx context.Context, owner journal.Owner, c Command, 
 	var journey, digest string
 	if err == nil {
 		// Resolved once per run; the ErrPending follow-up loop reuses it.
-		in.Endpoint, in.Settings = scope.Endpoint, scope.Settings
+		in.ProductVersion, in.Endpoint, in.Settings = scope.Entry.ProductVersion, scope.Endpoint, scope.Settings
 		journey, digest, err = p.runner.Binding(ctx, in)
 	}
 	if err == nil {
@@ -258,7 +258,7 @@ func (p *Platform) execute(ctx context.Context, owner journal.Owner, c Command, 
 			switch {
 			case errors.Is(err, agentruntime.ErrDependencyUnavailable):
 				state = RunDependencyUnavailable
-			case errors.Is(err, platformmcp.ErrAuthRequired):
+			case errors.Is(err, catalog.ErrAuthRequired):
 				state = RunAuthRequired
 			}
 		}

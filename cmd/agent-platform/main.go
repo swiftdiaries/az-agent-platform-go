@@ -96,7 +96,7 @@ func run(ctx context.Context, lookup func(string) string) error {
 			_ = shutdownTelemetry(shutdownCtx)
 		}
 	}()
-	registry, err := definitions.Load(config.definitionPath, config.retainedConfigs...)
+	defs, err := compileDefinitions(config.definitionPath, config.retainedConfigs)
 	if err != nil {
 		return errors.New("invalid definitions")
 	}
@@ -124,7 +124,7 @@ func run(ctx context.Context, lookup func(string) string) error {
 		return errors.New("invalid model configuration")
 	}
 	app, err := service.New(service.Dependencies{
-		Pool: pool, Registry: registry, Authenticator: authenticator, Model: model,
+		Pool: pool, Definitions: defs, Authenticator: authenticator, Model: model,
 		CredentialHeaders: config.credentialHeaders,
 		Directory:         directory, Endpoints: endpoints, Settings: settingsSource,
 	})
@@ -375,4 +375,22 @@ func telemetryHeaders(value string) (map[string]string, error) {
 		headers[name] = headerValue
 	}
 	return headers, nil
+}
+
+// compileDefinitions compiles the current configuration and every retained one
+// and returns the current set that can also serve the retained journey versions.
+func compileDefinitions(current string, retained []string) (*definitions.Set, error) {
+	set, err := definitions.Compile(current)
+	if err != nil {
+		return nil, err
+	}
+	old := make([]*definitions.Set, 0, len(retained))
+	for _, path := range retained {
+		oldSet, err := definitions.Compile(path)
+		if err != nil {
+			return nil, err
+		}
+		old = append(old, oldSet)
+	}
+	return definitions.Retain(set, old...)
 }

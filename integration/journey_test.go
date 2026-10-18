@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
@@ -22,11 +23,11 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
@@ -38,7 +39,7 @@ func (f modelFunc) Complete(ctx context.Context, req agentruntime.ModelRequest) 
 }
 
 type mcpObservation struct {
-	cookie, authorization, smuggled, callID string
+	tool, cookie, authorization, smuggled, callID string
 }
 
 type transportObservation struct {
@@ -60,7 +61,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	var transportObservations []transportObservation
 	var expiredAttempts int
 	server := mcp.NewServer(&mcp.Implementation{Name: "java-fixture", Version: "1"}, nil)
-	mcp.AddTool(server, &mcp.Tool{Name: "lookup_destination", Description: "look up a destination"},
+	mcp.AddTool(server, lookupTool("look up a destination"),
 		func(_ context.Context, req *mcp.CallToolRequest, input struct {
 			Destination string `json:"destination"`
 		}) (*mcp.CallToolResult, struct {
@@ -68,6 +69,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 		}, error) {
 			mu.Lock()
 			observations = append(observations, mcpObservation{
+				tool:   req.Params.Name,
 				cookie: req.Extra.Header.Get("Cookie"), authorization: req.Extra.Header.Get("Authorization"),
 				smuggled: req.Extra.Header.Get("X-Smuggle"),
 				callID:   req.Extra.Header.Get("X-Platform-Call-ID"),
@@ -104,14 +106,17 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	}))
 	t.Cleanup(httpMCP.Close)
 
-	registry, err := definitions.Load(filepath.Join("..", "configs", "journeys.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	registry := compileSet(t, filepath.Join("..", "configs", "journeys.yaml"))
 	model := modelFunc(func(_ context.Context, req agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		if len(req.ToolResults) == 0 {
+			// The model sees the alias (never the remote name the server publishes).
 			if got := toolNames(req.Tools); !slices.Equal(got, []string{"lookup_destination", "request_user_input", "load_skill", "read_skill_resource"}) {
 				t.Fatalf("model tools = %v", got)
+			}
+			if slices.Contains(req.Messages, "try remote") {
+				return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{
+					Name: remoteLookup, Arguments: json.RawMessage(`{}`),
+				}}, nil
 			}
 			if slices.Contains(req.Messages, "hello") {
 				return agentruntime.ModelResponse{Text: "Hello from the planner"}, nil
@@ -133,7 +138,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 		}
 		return agentruntime.ModelResponse{Text: "Kyoto is available"}, nil
 	})
-	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, httpMCP.URL))
+	runner := agentruntime.NewRunner(registry, model, testTenancy(t, httpMCP.URL))
 	pool := database(t)
 	service := platform.New(runner, journal.New(pool))
 	t.Cleanup(service.Close)
@@ -161,14 +166,14 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	got := slices.Clone(observations)
 	gotTransport := slices.Clone(transportObservations)
 	mu.Unlock()
-	if len(got) != 1 || got[0].cookie != "session=alice" || got[0].authorization != "Bearer alice-token" || got[0].smuggled != "" || got[0].callID == "" || got[0].callID == "provider-call-id" {
+	if len(got) != 1 || got[0].cookie != "session=alice" || got[0].authorization != "Bearer alice-token" || got[0].smuggled != "" || got[0].callID == "" || got[0].callID == "provider-call-id" || got[0].tool != remoteLookup {
 		t.Fatalf("MCP observations = %#v", got)
 	}
 	aliceSession := statefulSessionID(gotTransport, "session=alice", "Bearer alice-token")
 	if aliceSession == "" {
 		t.Fatalf("stateful streamable session did not reuse a session ID with allowlisted headers: %#v", gotTransport)
 	}
-	internalThreadID, internalRunID := assertTrace(t, spanRecorder.Ended(), got[0].callID, body.ThreadID, body.RunID, "Plan Kyoto", "session=alice", "alice-token", "Kyoto")
+	internalThreadID, internalRunID := assertTrace(t, spanRecorder.Ended(), got[0].callID, body.ThreadID, body.RunID, "Plan Kyoto", "session=alice", "alice-token", "Kyoto", remoteLookup)
 	if internalThreadID == body.ThreadID || internalRunID == body.RunID || internalThreadID == "" || internalRunID == "" {
 		t.Fatalf("external identity was not mapped to opaque product IDs: thread=%q run=%q", internalThreadID, internalRunID)
 	}
@@ -183,6 +188,12 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	if callIDFromEvents(firstSnapshot.Events) != got[0].callID {
 		t.Fatalf("event/product call ID does not match Java header: %#v", firstSnapshot.Events)
 	}
+	for _, event := range firstSnapshot.Events {
+		if event.ToolName != "" && event.ToolName != lookupAlias {
+			t.Fatalf("event carries tool name %q, want only the alias %q: %#v", event.ToolName, lookupAlias, event)
+		}
+	}
+	requireOperationRows(t, pool, 1)
 
 	bobSpanStart := len(spanRecorder.Ended())
 	bobBody := body
@@ -248,6 +259,20 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	hidden := postAGUI(t, api.URL, hiddenBody, "alice-token", "session=alice", "")
 	if hidden.StatusCode != http.StatusOK || !strings.Contains(hidden.Body, `"code":"internal_error"`) || strings.Contains(hidden.Body, "hidden_tool") {
 		t.Fatalf("unregistered tool response = %#v", hidden)
+	}
+
+	remoteBody := body
+	remoteBody.ThreadID, remoteBody.RunID = "thread-4b", "message-4b"
+	remoteBody.Messages = []aguitypes.Message{{ID: "message-4b", Role: aguitypes.RoleUser, Content: "try remote"}}
+	remote := postAGUI(t, api.URL, remoteBody, "alice-token", "session=alice", "")
+	if remote.StatusCode != http.StatusOK || !strings.Contains(remote.Body, `"code":"internal_error"`) || strings.Contains(remote.Body, remoteLookup) {
+		t.Fatalf("model-requested remote name response = %#v", remote)
+	}
+	mu.Lock()
+	callCountAfterRemote := len(observations)
+	mu.Unlock()
+	if callCountAfterRemote != 2 {
+		t.Fatalf("remote name proposed by the model reached MCP, observations = %d", callCountAfterRemote)
 	}
 
 	unknownTarget := body
@@ -367,25 +392,30 @@ func TestAuthRejectsMissingCredentials(t *testing.T) {
 
 func TestToolBindingFailsClosed(t *testing.T) {
 	for _, test := range []struct {
-		name    string
-		tools   []string
-		allowed []string
+		name  string
+		tools []*mcp.Tool
+		op    string
 	}{
-		{name: "unavailable allowlisted tool", tools: []string{"registered"}, allowed: []string{"missing"}},
-		{name: "normalized collision", tools: []string{"a b", "a@b"}, allowed: []string{"a_b"}},
+		{name: "missing required operation", tools: []*mcp.Tool{keyedTool("registered", "registered")}, op: "missing"},
+		{name: "ambiguous operation", tools: []*mcp.Tool{keyedTool("a1", "a"), keyedTool("a2", "a")}, op: "a"},
+		{name: "unkeyed tool is never offered", tools: []*mcp.Tool{{Name: "a", InputSchema: map[string]any{"type": "object"}}}, op: "a"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := mcp.NewServer(&mcp.Implementation{Name: "binding-fixture", Version: "1"}, nil)
-			for _, name := range test.tools {
-				mcp.AddTool(server, &mcp.Tool{Name: name}, func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
+			for _, tool := range test.tools {
+				mcp.AddTool(server, tool, func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
 					return nil, struct{}{}, nil
 				})
 			}
 			endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{Stateless: false}))
 			t.Cleanup(endpoint.Close)
-			_, err := platformmcp.NewClient().Bind(t.Context(), definitions.MCPServer{ID: "s"}, testEndpoint(t, endpoint.URL), test.allowed, credential.Credential{})
-			if err == nil {
-				t.Fatal("Bind accepted unsafe tool registry")
+			set := compileSet(t, writeBundleConfig(t, t.TempDir(), "prompt\n", test.op, "read_only"))
+			binding, err := openTestCatalog(t.Context(), t, testEndpoint(t, endpoint.URL), credential.Credential{}, set)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resolution, ok := binding.Resolution("planner"); !ok || resolution.Available() || len(resolution.Tools) != 0 {
+				t.Fatalf("unsafe tool registry resolved: %#v", resolution)
 			}
 		})
 	}
@@ -410,11 +440,10 @@ func TestToolBindingDoesNotForwardCredentialsAcrossRedirect(t *testing.T) {
 	headers := make(http.Header)
 	headers.Set("Authorization", "Bearer redirect-secret")
 	headers.Set("Cookie", "session=redirect-secret")
-	_, err := platformmcp.NewClient().Bind(t.Context(), definitions.MCPServer{
-		ID: "redirect",
-	}, testEndpoint(t, redirect.URL), []string{"lookup_destination"}, credential.FromRequest(&http.Request{Header: headers}, []string{"Authorization", "Cookie"}))
-	if err == nil {
-		t.Fatal("Bind followed an MCP redirect")
+	set := compileSet(t, writeDefinitionBundle(t, t.TempDir(), "prompt\n"))
+	_, err := openTestCatalog(t.Context(), t, testEndpoint(t, redirect.URL), credential.FromRequest(&http.Request{Header: headers}, []string{"Authorization", "Cookie"}), set)
+	if !errors.Is(err, catalog.ErrEndpointUnavailable) {
+		t.Fatalf("Open over an MCP redirect = %v, want ErrEndpointUnavailable", err)
 	}
 	if hostileRequests != 0 || hostileAuthorization != "" || hostileCookie != "" {
 		t.Fatalf("redirect destination received requests=%d authorization=%q cookie=%q", hostileRequests, hostileAuthorization, hostileCookie)
@@ -446,53 +475,162 @@ func statefulSessionID(observations []transportObservation, cookie, authorizatio
 	return sessionID
 }
 
+func replacing(old, new string) func(string) string {
+	return func(config string) string { return strings.Replace(config, old, new, 1) }
+}
+func prepending(text string) func(string) string {
+	return func(config string) string { return text + config }
+}
+func appending(text string) func(string) string {
+	return func(config string) string { return config + text }
+}
+
+const (
+	controlTool    = "      - op: lookup\n"
+	controlToolSet = "    tools:\n      - op: lookup\n        class: read_only\n"
+)
+
+// journeyConfigCases mutate the valid planner bundle written by writeBundleConfig
+// (read-only op "lookup", call_id_header set) so that exactly one fail-closed rule
+// is violated, and require the rejection to name that rule. Each edit must change
+// the text, so a stale anchor cannot make a case pass vacuously.
+var journeyConfigCases = []struct {
+	name     string
+	edit     func(config string) string
+	wantText string
+}{
+	{"unknown top-level field", prepending("extra: true\n"), "unknown field"},
+	{"unknown catalog field", replacing("catalog:\n", "catalog:\n  extra: true\n"), "unknown field"},
+	{"unknown journey field", replacing("    skill:", "    mystery: 1\n    skill:"), "unknown field"},
+	{"unknown tool field", replacing(controlTool, controlTool+"        mystery: 1\n"), "unknown field"},
+	{"trailing document", appending("---\ncatalog:\n  operation_meta_key: operation_key\n"), "exactly one YAML document"},
+	{"empty file", func(string) string { return "" }, "empty"},
+	{"missing operation key selector", replacing(controlTool+"        class: read_only\n", "      - class: read_only\n"), "exactly one of op and tags"},
+	{"op and tags together", replacing(controlTool, controlTool+"        tags: [leave]\n"), "exactly one of op and tags"},
+	{"empty operation key", replacing(controlTool, "      - op: \"\"\n"), "empty"},
+	{"duplicate operation key", appending(controlTool), "more than once"},
+	{"invalid class", replacing("class: read_only", "class: deduplicated"), "invalid class"},
+	{"idempotent without call_id_header", func(c string) string {
+		return strings.Replace(strings.Replace(c, "  call_id_header: X-Platform-Call-ID\n", "", 1), "class: read_only", "class: idempotent", 1)
+	}, "call_id_header"},
+	{"invalid approval", replacing("class: read_only", "class: read_only\n        approval: optional"), "approval"},
+	{"missing operation_meta_key", replacing("  operation_meta_key: operation_key\n", ""), "operation_meta_key"},
+	{"invalid alias", replacing(controlTool, "      - op: 9lives\n"), "alias"},
+	{"reserved alias", replacing(controlTool, "      - op: load_skill\n"), "reserved"},
+	{"empty tools", replacing(controlToolSet, "    tools: []\n"), "tools must not be empty"},
+	{"missing tools", replacing(controlToolSet, ""), "tools must not be empty"},
+	{"duplicate journey", func(c string) string { return c + c[strings.Index(c, "  - id: planner"):] }, "duplicate journey id"},
+	{"escaping prompt", replacing("system_prompt: prompts/planner.md", "system_prompt: ../planner.md"), "parent components"},
+	{"missing prompt", replacing("system_prompt: prompts/planner.md", "system_prompt: prompts/missing.md"), "system_prompt"},
+	{"escaping skill path", replacing("skill: skills/planner", "skill: ../planner"), "parent components"},
+	{"absolute skill path", replacing("skill: skills/planner", "skill: /etc"), "absolute"},
+	{"missing skill bundle", replacing("skill: skills/planner", "skill: skills/absent"), "skill:"},
+	{"max_tools out of range", appending("    max_tools: 65\n"), "max_tools"},
+}
+
 func TestJourneyConfigFailsClosed(t *testing.T) {
-	cases := map[string]string{
-		"empty tools":       `{"mcp_servers":[{"id":"s","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":[]}}]}`,
-		"missing tools":     `{"mcp_servers":[{"id":"s","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s"}}]}`,
-		"unknown field":     `{"extra":true,"mcp_servers":[],"journeys":[]}`,
-		"duplicate journey": `{"mcp_servers":[{"id":"s","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}},{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}}]}`,
-		"escaping prompt":   `{"mcp_servers":[{"id":"s","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"../p.md","mcp":{"server":"s","tools":["t"]}}]}`,
-		"missing prompt":    `{"mcp_servers":[{"id":"s","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"missing.md","mcp":{"server":"s","tools":["t"]}}]}`,
-		"undeclared tool":   `{"mcp_servers":[{"id":"s","tools":["registered"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["registred"]}}]}`,
+	// Positive control: the unmodified bundle compiles, so every rejection below is
+	// caused by its single edit and not by the surrounding fixture.
+	controlRoot := t.TempDir()
+	controlPath := writeBundleConfig(t, controlRoot, "fixture prompt\n", "lookup", "read_only")
+	if _, err := definitions.Compile(controlPath); err != nil {
+		t.Fatalf("control config rejected: %v", err)
 	}
-	for name, config := range cases {
-		t.Run(name, func(t *testing.T) {
-			dir := t.TempDir()
-			if err := writeFixture(filepath.Join(dir, "p.md"), "fixture prompt"); err != nil {
+	control, err := os.ReadFile(controlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range journeyConfigCases {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := writeBundleConfig(t, root, "fixture prompt\n", "lookup", "read_only")
+			edited := test.edit(string(control))
+			if edited == string(control) {
+				t.Fatal("edit did not change the control config")
+			}
+			if err := os.WriteFile(path, []byte(edited), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if err := writeFixture(filepath.Join(dir, "journeys.yaml"), config); err != nil {
-				t.Fatal(err)
+			_, err := definitions.Compile(path)
+			if err == nil {
+				t.Fatalf("Compile accepted invalid config:\n%s", edited)
 			}
-			if _, err := definitions.Load(filepath.Join(dir, "journeys.yaml")); err == nil {
-				t.Fatal("Load accepted invalid config")
+			if test.wantText != "" && !strings.Contains(err.Error(), test.wantText) {
+				t.Fatalf("rejection %q does not mention %q", err, test.wantText)
 			}
 		})
 	}
 }
 
 // MCP URLs come only from the deploy-time allowlist, so a config that still
-// carries one is rejected rather than silently ignored.
+// carries one (at any level) is rejected as an unknown field rather than
+// silently ignored.
 func TestJourneyConfigRejectsEndpoint(t *testing.T) {
-	const valid = `{"mcp_servers":[{"id":"s",%s"tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}}]}`
-	load := func(config string) error {
-		dir := t.TempDir()
-		if err := writeFixture(filepath.Join(dir, "p.md"), "fixture prompt"); err != nil {
+	load := func(edit func(string) string) error {
+		path := writeBundleConfig(t, t.TempDir(), "fixture prompt\n", "lookup", "read_only")
+		data, err := os.ReadFile(path)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if err := writeFixture(filepath.Join(dir, "journeys.yaml"), config); err != nil {
+		edited := edit(string(data))
+		if err := os.WriteFile(path, []byte(edited), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		_, err := definitions.Load(filepath.Join(dir, "journeys.yaml"))
+		_, err = definitions.Compile(path)
 		return err
 	}
-	if err := load(fmt.Sprintf(valid, "")); err != nil {
+	if err := load(func(c string) string { return c }); err != nil {
 		t.Fatalf("control config without endpoint: %v", err)
 	}
-	err := load(fmt.Sprintf(valid, `"endpoint":"http://attacker.example/mcp",`))
-	if err == nil || !strings.Contains(err.Error(), "endpoint") {
-		t.Fatalf("config with endpoint = %v, want unknown-field rejection", err)
+	const endpoint = "endpoint: http://attacker.example/mcp\n"
+	for name, edit := range map[string]func(string) string{
+		"top level": func(c string) string { return endpoint + c },
+		"catalog":   func(c string) string { return strings.Replace(c, "catalog:\n", "catalog:\n  "+endpoint, 1) },
+		"journey":   func(c string) string { return strings.Replace(c, "    skill:", "    "+endpoint+"    skill:", 1) },
+		"selector": func(c string) string {
+			return strings.Replace(c, "      - op: lookup\n", "      - op: lookup\n        "+endpoint, 1)
+		},
+	} {
+		err := load(edit)
+		if err == nil || !strings.Contains(err.Error(), "unknown field") {
+			t.Fatalf("config with endpoint at %s = %v, want unknown-field rejection", name, err)
+		}
+	}
+}
+
+// A journey whose required operation the server does not publish under the
+// configured _meta key is unavailable: the run fails without a model call and
+// without any tool dispatch (an unkeyed tool of the same name is never offered).
+func TestJourneyUnavailableRunFailsWithoutModelCall(t *testing.T) {
+	pool := database(t)
+	for name, tool := range map[string]*mcp.Tool{
+		"wrong operation key": keyedTool(remoteLookup, "some_other_operation"),
+		"unkeyed tool":        {Name: lookupAlias, InputSchema: map[string]any{"type": "object"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var dispatched, models atomic.Int32
+			server := mcp.NewServer(&mcp.Implementation{Name: "unavailable", Version: "1"}, nil)
+			mcp.AddTool(server, tool, func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
+				dispatched.Add(1)
+				return nil, struct{}{}, nil
+			})
+			backend := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
+			defer backend.Close()
+			p := platform.New(policyRunner(t, backend.URL, "read_only", modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+				models.Add(1)
+				return agentruntime.ModelResponse{Text: "must not be asked"}, nil
+			})), journal.New(pool))
+			defer p.Close()
+			id := "unavailable-" + strings.ReplaceAll(name, " ", "-")
+			c := platform.Command{ThreadID: id, RunID: id, CommunicationID: id, Principal: "alice", Tenant: testTenant, Text: "go"}
+			if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
+				t.Fatal(err)
+			}
+			awaitState(t, p, c.ThreadID, c.RunID, journal.RunFailed)
+			if models.Load() != 0 || dispatched.Load() != 0 {
+				t.Fatalf("unavailable journey made %d model calls and %d dispatches", models.Load(), dispatched.Load())
+			}
+		})
 	}
 }
 
@@ -517,7 +655,7 @@ func assertTrace(t *testing.T, spans []sdktrace.ReadOnlySpan, callID string, for
 	if traceID == "" {
 		t.Fatal("chat.accept trace not recorded")
 	}
-	wantNames := map[string]bool{"chat.accept": false, "agent.start_turn": false, "hub.route": false, "journey.run": false, "model.call": false, "mcp.discover": false, "mcp.call": false}
+	wantNames := map[string]bool{"chat.accept": false, "agent.start_turn": false, "hub.route": false, "journey.run": false, "model.call": false, "catalog.resolve": false, "mcp.call": false}
 	spanIDs := make(map[string]string)
 	parents := make(map[string]string)
 	for _, span := range spans {
@@ -541,6 +679,9 @@ func assertTrace(t *testing.T, spans []sdktrace.ReadOnlySpan, callID string, for
 		if span.Name() == "mcp.call" && spanAttribute(span, "call.id") != callID {
 			t.Fatalf("mcp.call call.id = %q, want %q", spanAttribute(span, "call.id"), callID)
 		}
+		if span.Name() == "mcp.call" && (spanAttribute(span, "tool.alias") != lookupAlias || spanAttribute(span, "operation.key") != lookupAlias) {
+			t.Fatalf("mcp.call tool.alias=%q operation.key=%q, want %q for both", spanAttribute(span, "tool.alias"), spanAttribute(span, "operation.key"), lookupAlias)
+		}
 	}
 	for name, found := range wantNames {
 		if !found {
@@ -552,7 +693,7 @@ func assertTrace(t *testing.T, spans []sdktrace.ReadOnlySpan, callID string, for
 		"hub.route":        "agent.start_turn",
 		"journey.run":      "agent.start_turn",
 		"model.call":       "journey.run",
-		"mcp.discover":     "journey.run",
+		"catalog.resolve":  "journey.run",
 		"mcp.call":         "journey.run",
 	} {
 		if parents[child] != spanIDs[parent] {

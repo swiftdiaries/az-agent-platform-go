@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/mcptest"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/modeltest"
@@ -72,9 +73,9 @@ func TestE2EConversationAgent(t *testing.T) {
 		endpoint := mcptest.New(t, mcptest.Options{Name: "e2e", Version: "vN"}, mcptest.Catalog{Tools: []mcptest.Tool{
 			{Name: "lookup", OperationKey: "travel.lookup", Result: "Kyoto is available"},
 		}})
-		registry := acceptanceRegistry(t, "read_only")
+		registry := acceptanceSet(t, "read_only")
 		model := modeltest.New(
-			modeltest.Call("lookup", map[string]any{"destination": "Kyoto"}),
+			modeltest.Call("travel_lookup", map[string]any{"destination": "Kyoto"}),
 			modeltest.Text(answer),
 		)
 		a, b, c := threeReplicas(t, pool, registry, model, testTenancy(t, endpoint.URL()))
@@ -127,19 +128,18 @@ func TestE2EConversationAgent(t *testing.T) {
 		requestsSeen := model.Requests()
 		offered := false
 		for _, tool := range requestsSeen[0].Tools {
-			if tool.Name == "lookup" {
+			if tool.Name == "travel_lookup" {
 				offered = true
 			}
 		}
 		if !offered {
-			t.Fatalf("model request 0 did not offer tool lookup: %#v", requestsSeen[0].Tools)
+			t.Fatalf("model request 0 did not offer tool travel_lookup: %#v", requestsSeen[0].Tools)
 		}
-		// Current code does not populate ToolResult.Name (runtime/run.go:199 sets
-		// only CallID and Value), so tie the single result to the lookup call by
-		// its CallID, which modeltest derives from the request index. Later hops
-		// that populate Name should tighten this to Name == "lookup".
-		if results := requestsSeen[1].ToolResults; len(results) != 1 || results[0].CallID != "modeltest-call-0" || results[0].Value == nil {
-			t.Fatalf("model request 1 tool results = %#v, want exactly one result for call modeltest-call-0", results)
+		// The model sees the alias travel_lookup (MCP received the remote name lookup,
+		// asserted above); the single result is tied to that call by CallID, which
+		// modeltest derives from the request index, and by its alias Name.
+		if results := requestsSeen[1].ToolResults; len(results) != 1 || results[0].CallID != "modeltest-call-0" || results[0].Name != "travel_lookup" || results[0].Value == nil {
+			t.Fatalf("model request 1 tool results = %#v, want exactly one result for travel_lookup call modeltest-call-0", results)
 		}
 
 		threadID := acceptanceThread(t, pool, thread)
@@ -173,9 +173,9 @@ func TestE2EConversationAgent(t *testing.T) {
 		endpoint := mcptest.New(t, mcptest.Options{Name: "e2e", Version: "vN"}, mcptest.Catalog{Tools: []mcptest.Tool{
 			{Name: "lookup", OperationKey: "travel.lookup", Result: "Kyoto is available"},
 		}})
-		registry := acceptanceRegistry(t, "read_only")
+		registry := acceptanceSet(t, "read_only")
 		model := modeltest.New(
-			modeltest.Call("lookup", map[string]any{"destination": "Kyoto"}),
+			modeltest.Call("travel_lookup", map[string]any{"destination": "Kyoto"}),
 			modeltest.Text(answer),
 		)
 		a, b, c := threeReplicas(t, pool, registry, model, testTenancy(t, endpoint.URL()))
@@ -339,12 +339,12 @@ func TestE2EConversationAgent(t *testing.T) {
 
 		// Two completed runs (A then B); tenant C must never reach the model.
 		model := modeltest.New(
-			modeltest.Call("lookup", map[string]any{"destination": "Kyoto"}),
+			modeltest.Call("travel_lookup", map[string]any{"destination": "Kyoto"}),
 			modeltest.Text(answerA),
-			modeltest.Call("lookup", map[string]any{"destination": "Kyoto"}),
+			modeltest.Call("travel_lookup", map[string]any{"destination": "Kyoto"}),
 			modeltest.Text(answerB),
 		)
-		a, b, c := threeReplicas(t, pool, acceptanceRegistry(t, "read_only"), model, tenancy)
+		a, b, c := threeReplicas(t, pool, acceptanceSet(t, "read_only"), model, tenancy)
 
 		type tenantRun struct {
 			name, token, principal, thread, run, answer string
@@ -476,6 +476,280 @@ func TestE2EConversationAgent(t *testing.T) {
 	t.Run("S3", func(t *testing.T) {
 		stage(t, 3, "H3")
 		// A paginated catalog snapshot gives both tenants the same aliases while MCP receives each tenant's own remote names; a second run revalidates without tools/list.
+		const (
+			remoteA = "travel/lookup"
+			remoteB = "travel lookup"
+			alias   = "travel_lookup"
+		)
+		pool := database(t)
+		// Five tools per tenant at page size 2 is three tools/list pages. Only the
+		// target is selected by the journey; the others differ in op key, tags and
+		// annotations, and one has no operation key at all.
+		catalogFor := func(target, suffix, result string) mcptest.Catalog {
+			readOnly := &mcp.ToolAnnotations{ReadOnlyHint: true}
+			destructive := false
+			return mcptest.Catalog{Tools: []mcptest.Tool{
+				{Name: target, OperationKey: "travel.lookup", Tags: []string{"travel"}, Annotations: readOnly, Result: result},
+				{Name: "hotel" + suffix + "book", OperationKey: "hotel.book", Tags: []string{"hotel"}, Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive}},
+				{Name: "leave" + suffix + "request", OperationKey: "leave.request", Tags: []string{"leave", "hr"}},
+				{Name: "scratch notes" + suffix + "b"},
+				{Name: "visa" + suffix + "check", OperationKey: "visa.check", Tags: []string{"visa", "legacy"}, Annotations: readOnly},
+			}}
+		}
+		vN := mcptest.New(t, mcptest.Options{Name: "e2e-vN", Version: "vN", PageSize: 2}, catalogFor(remoteA, "/", "Kyoto via vN"))
+		vN1 := mcptest.New(t, mcptest.Options{Name: "e2e-vN1", Version: "vN+1", PageSize: 2}, catalogFor(remoteB, " ", "Kyoto via vN+1"))
+		allow, err := tenantdir.NewAllowlist(map[string]string{"java-vn": vN.URL(), "java-vn1": vN1.URL()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		source, err := settings.NewMutable(settings.Document{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tenancy := agentruntime.Tenancy{
+			Directory: tenantdir.NewMutable(map[string]tenantdir.Entry{
+				"tenant-a": {ProductVersion: "vN", EndpointID: "java-vn"},
+				"tenant-b": {ProductVersion: "vN+1", EndpointID: "java-vn1"},
+			}),
+			Endpoints: allow,
+			Settings:  source,
+		}
+		// Four sequential runs (A1, B1, A2, B2), each one tool call then an answer.
+		model := modeltest.New(
+			modeltest.Call(alias, map[string]any{"destination": "Kyoto"}), modeltest.Text("A1 done"),
+			modeltest.Call(alias, map[string]any{"destination": "Kyoto"}), modeltest.Text("B1 done"),
+			modeltest.Call(alias, map[string]any{"destination": "Kyoto"}), modeltest.Text("A2 done"),
+			modeltest.Call(alias, map[string]any{"destination": "Kyoto"}), modeltest.Text("B2 done"),
+		)
+		a, b, c := threeReplicas(t, pool, acceptanceSet(t, "read_only"), model, tenancy)
+
+		type tenant struct {
+			name, token, principal, thread, remote, other string
+			server                                        *mcptest.Server
+			serverVersion, version, endpoint              string
+		}
+		tenants := []tenant{
+			{name: "A", token: "token", principal: "tenant-a/alice", thread: "e2e-s3-a", remote: remoteA, other: remoteB, server: vN, serverVersion: "vN", version: "vN", endpoint: "java-vn"},
+			{name: "B", token: "token-b", principal: "tenant-b/bob", thread: "e2e-s3-b", remote: remoteB, other: remoteA, server: vN1, serverVersion: "vN+1", version: "vN+1", endpoint: "java-vn1"},
+		}
+		post := func(tn tenant, replica acceptanceReplica, run, answer string) {
+			t.Helper()
+			body := e2eReadBody(t, "tenant "+tn.name+" "+run, acceptancePostWithHeaders(t, replica.url, aguitypes.RunAgentInput{
+				ThreadID: tn.thread, RunID: run,
+				Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan a trip to Kyoto"}},
+			}, http.Header{"Authorization": {"Bearer " + tn.token}}))
+			if !strings.Contains(body, answer) || !strings.Contains(body, "RUN_FINISHED") {
+				t.Fatalf("tenant %s %s lacks final answer or RUN_FINISHED: %s", tn.name, run, body)
+			}
+		}
+		toolCalls := func(tn tenant) []mcptest.Request {
+			var calls []mcptest.Request
+			for _, request := range tn.server.Requests() {
+				if request.RPCMethod == "tools/call" {
+					calls = append(calls, request)
+				}
+			}
+			return calls
+		}
+
+		// Run 1: the first message on a new thread captures the paginated snapshot.
+		post(tenants[0], a, "e2e-s3-a-run1", "A1 done")
+		post(tenants[1], b, "e2e-s3-b-run1", "B1 done")
+
+		initialized := map[string]int{}
+		for _, tn := range tenants {
+			if got := tn.server.Count("tools/list"); got != 3 {
+				t.Errorf("tenant %s tools/list count after run 1 = %d, want 3 (5 tools, page size 2)", tn.name, got)
+			}
+			if got := tn.server.Count("initialize"); got < 1 {
+				t.Errorf("tenant %s initialize count after run 1 = %d, want >= 1", tn.name, got)
+			}
+			initialized[tn.name] = tn.server.Count("initialize")
+			calls := toolCalls(tn)
+			if len(calls) != 1 || calls[0].Tool != tn.remote || calls[0].Header.Get("Authorization") != "Bearer "+tn.token {
+				t.Errorf("tenant %s tools/call after run 1 = %+v, want exactly one for %q with its own credential", tn.name, calls, tn.remote)
+			}
+			for _, request := range tn.server.Requests() {
+				if request.Tool == tn.other {
+					t.Errorf("tenant %s endpoint received the other tenant's remote name %q", tn.name, tn.other)
+				}
+				if request.Header.Get("Authorization") != "" && request.Header.Get("Authorization") != "Bearer "+tn.token {
+					t.Errorf("tenant %s endpoint %s request carried Authorization %q", tn.name, request.RPCMethod, request.Header.Get("Authorization"))
+				}
+			}
+		}
+
+		// The model was offered exactly the alias (plus product tools), identically for both tenants.
+		if got := model.Count(); got != 4 {
+			t.Fatalf("model requests after run 1 = %d, want 4", got)
+		}
+		offeredNames := func(request agentruntime.ModelRequest) []string {
+			names := make([]string, 0, len(request.Tools))
+			for _, tool := range request.Tools {
+				names = append(names, tool.Name)
+			}
+			slices.Sort(names)
+			return names
+		}
+		offeredA, offeredB := offeredNames(model.Requests()[0]), offeredNames(model.Requests()[2])
+		if !slices.Contains(offeredA, alias) || !slices.Equal(offeredA, offeredB) {
+			t.Errorf("model tool names: tenant A = %v, tenant B = %v, want identical lists containing %q", offeredA, offeredB, alias)
+		}
+		for i, request := range model.Requests() {
+			if got := offeredNames(request); !slices.Equal(got, offeredA) {
+				t.Errorf("model request %d tools = %v, want %v", i, got, offeredA)
+			}
+			dump := fmt.Sprintf("%+v", request)
+			for _, leaked := range []string{remoteA, remoteB, "hotel", "leave", "visa", "scratch notes"} {
+				if strings.Contains(dump, leaked) {
+					t.Errorf("model request %d mentions %q", i, leaked)
+				}
+			}
+		}
+
+		store := journal.New(pool)
+		firstDigest := map[string]string{}
+		for _, tn := range tenants {
+			threadID := acceptanceThreadFor(t, pool, tn.principal, tn.thread)
+			snapshot, err := store.Snapshot(t.Context(), threadID, tn.principal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(snapshot.Runs) != 1 || snapshot.Runs[0].State != journal.RunCompleted {
+				t.Fatalf("tenant %s durable runs = %#v, want one completed run", tn.name, snapshot.Runs)
+			}
+			digest := snapshot.Runs[0].CatalogDigest
+			if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(digest) {
+				t.Fatalf("tenant %s run catalog digest = %q, want 64 hex", tn.name, digest)
+			}
+			firstDigest[tn.name] = digest
+
+			var conversationDigest string
+			if err := pool.QueryRow(t.Context(), `SELECT catalog_digest FROM agent_conversations WHERE id=$1`, threadID).Scan(&conversationDigest); err != nil || conversationDigest != digest {
+				t.Errorf("tenant %s conversation catalog_digest = %q (%v), want run digest %q", tn.name, conversationDigest, err, digest)
+			}
+
+			var (
+				rows                                             int
+				snapTenant, snapPrincipal, version, endpoint, sv string
+				descriptors                                      []byte
+			)
+			if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM agent_catalog_snapshots WHERE principal=$1`, tn.principal).Scan(&rows); err != nil || rows != 1 {
+				t.Fatalf("tenant %s snapshot rows = %d (%v), want 1", tn.name, rows, err)
+			}
+			if err := pool.QueryRow(t.Context(),
+				`SELECT tenant, principal, product_version, endpoint_id, server_version, descriptors FROM agent_catalog_snapshots WHERE digest=$1`, digest,
+			).Scan(&snapTenant, &snapPrincipal, &version, &endpoint, &sv, &descriptors); err != nil {
+				t.Fatalf("tenant %s snapshot %s: %v", tn.name, digest, err)
+			}
+			if snapPrincipal != tn.principal || version != tn.version || endpoint != tn.endpoint || sv != tn.serverVersion {
+				t.Errorf("tenant %s snapshot = %q/%q/%q/%q, want %q/%q/%q/%q", tn.name, snapPrincipal, version, endpoint, sv, tn.principal, tn.version, tn.endpoint, tn.serverVersion)
+			}
+			var tools []struct {
+				Name string         `json:"name"`
+				Meta map[string]any `json:"_meta"`
+			}
+			if err := json.Unmarshal(descriptors, &tools); err != nil || len(tools) != 5 {
+				t.Fatalf("tenant %s snapshot descriptors = %s (%v), want 5", tn.name, descriptors, err)
+			}
+			var names []string
+			var visaTags any
+			var targetKey any
+			for _, tool := range tools {
+				names = append(names, tool.Name)
+				switch {
+				case strings.HasPrefix(tool.Name, "visa"):
+					visaTags = tool.Meta["tags"]
+				case tool.Name == tn.remote:
+					targetKey = tool.Meta["operation_key"]
+				}
+			}
+			if !slices.Contains(names, tn.remote) || slices.Contains(names, tn.other) {
+				t.Errorf("tenant %s snapshot tool names = %v, want its own remote name %q only", tn.name, names, tn.remote)
+			}
+			if tags, _ := visaTags.([]any); !slices.Equal(tags, []any{"visa", "legacy"}) {
+				t.Errorf("tenant %s snapshot did not preserve a non-selected tool's _meta tags: %v", tn.name, visaTags)
+			}
+			if targetKey != "travel.lookup" {
+				t.Errorf("tenant %s snapshot target _meta operation_key = %v, want travel.lookup", tn.name, targetKey)
+			}
+
+			latest, ok, err := store.LatestSnapshot(t.Context(), snapTenant, tn.principal)
+			if err != nil || !ok || latest.Digest != digest {
+				t.Errorf("tenant %s LatestSnapshot = %q ok=%v err=%v, want %q", tn.name, latest.Digest, ok, err, digest)
+			}
+		}
+		if firstDigest["A"] == firstDigest["B"] {
+			t.Errorf("tenants share catalog digest %q, want different digests", firstDigest["A"])
+		}
+		var snapshotRows int
+		if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM agent_catalog_snapshots`).Scan(&snapshotRows); err != nil || snapshotRows != 2 {
+			t.Errorf("snapshot rows after run 1 = %d (%v), want 2", snapshotRows, err)
+		}
+
+		// Run 2: a second message on the same thread, through a different replica, revalidates without tools/list.
+		post(tenants[0], b, "e2e-s3-a-run2", "A2 done")
+		post(tenants[1], c, "e2e-s3-b-run2", "B2 done")
+
+		for _, tn := range tenants {
+			if got := tn.server.Count("tools/list"); got != 3 {
+				t.Errorf("tenant %s tools/list count after run 2 = %d, want unchanged 3", tn.name, got)
+			}
+			if got := tn.server.Count("initialize"); got <= initialized[tn.name] {
+				t.Errorf("tenant %s initialize count after run 2 = %d, want > %d (revalidation handshake)", tn.name, got, initialized[tn.name])
+			}
+			calls := toolCalls(tn)
+			if len(calls) != 2 {
+				t.Fatalf("tenant %s tools/call count after run 2 = %d, want 2", tn.name, len(calls))
+			}
+			for _, call := range calls {
+				if call.Tool != tn.remote || call.Header.Get("Authorization") != "Bearer "+tn.token {
+					t.Errorf("tenant %s tools/call = %q with %q, want %q with its own credential", tn.name, call.Tool, call.Header.Get("Authorization"), tn.remote)
+				}
+			}
+			if got := tn.server.Calls(tn.remote); got != 2 {
+				t.Errorf("tenant %s remote %q calls = %d, want 2", tn.name, tn.remote, got)
+			}
+
+			threadID := acceptanceThreadFor(t, pool, tn.principal, tn.thread)
+			snapshot, err := store.Snapshot(t.Context(), threadID, tn.principal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(snapshot.Runs) != 2 {
+				t.Fatalf("tenant %s durable runs = %#v, want two", tn.name, snapshot.Runs)
+			}
+			for _, run := range snapshot.Runs {
+				if run.State != journal.RunCompleted || run.CatalogDigest != firstDigest[tn.name] {
+					t.Errorf("tenant %s run %s = state %q digest %q, want completed with digest %q", tn.name, run.RunID, run.State, run.CatalogDigest, firstDigest[tn.name])
+				}
+			}
+			var changed int
+			if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM agent_events WHERE thread_id=$1 AND kind='catalog_changed'`, threadID).Scan(&changed); err != nil || changed != 0 {
+				t.Errorf("tenant %s catalog_changed events = %d (%v), want 0", tn.name, changed, err)
+			}
+		}
+		if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM agent_catalog_snapshots`).Scan(&snapshotRows); err != nil || snapshotRows != 2 {
+			t.Errorf("snapshot rows after run 2 = %d (%v), want 2 (revalidation must not re-capture)", snapshotRows, err)
+		}
+		if got := model.Count(); got != 8 {
+			t.Errorf("model requests = %d, want 8", got)
+		}
+
+		// The journal stores the alias, never a remote name.
+		var operations, wrongAlias, wrongKey int
+		if err := pool.QueryRow(t.Context(), `SELECT count(*), count(*) FILTER (WHERE alias <> $1 OR alias ~ '[/ ]' OR alias = ANY($2)), count(*) FILTER (WHERE operation_key <> 'travel.lookup') FROM agent_operations`,
+			alias, []string{remoteA, remoteB}).Scan(&operations, &wrongAlias, &wrongKey); err != nil {
+			t.Fatal(err)
+		}
+		if operations != 4 || wrongAlias != 0 || wrongKey != 0 {
+			t.Errorf("agent_operations: %d rows, %d with a non-alias name, %d with another operation key; want 4, 0, 0", operations, wrongAlias, wrongKey)
+		}
+		var eventLeaks int
+		if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM agent_events WHERE tool_name <> '' AND tool_name <> $1 AND tool_name <> ALL($2)`,
+			alias, []string{"request_user_input", "load_skill", "read_skill_resource", "activate_journey"}).Scan(&eventLeaks); err != nil || eventLeaks != 0 {
+			t.Errorf("agent_events with a tool_name other than the alias = %d (%v), want 0", eventLeaks, err)
+		}
 	})
 	t.Run("S4", func(t *testing.T) {
 		stage(t, 4, "H4b")

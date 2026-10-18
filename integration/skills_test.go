@@ -16,9 +16,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 	platformskills "github.com/swiftdiaries/az-agent-platform-go/internal/skills"
@@ -26,10 +24,7 @@ import (
 
 func TestSkillCatalogAndControlledReads(t *testing.T) {
 	root := t.TempDir()
-	registry, err := definitions.Load(writeDefinitionBundle(t, root, "prompt\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	registry := compileSet(t, writeDefinitionBundle(t, root, "prompt\n"))
 	journey, _ := registry.Journey("planner")
 	source := platformskills.New(journey)
 
@@ -47,10 +42,7 @@ func TestSkillCatalogAndControlledReads(t *testing.T) {
 		t.Fatalf("undeclared resource read = %v", err)
 	}
 
-	registry, err = definitions.Load(writeDefinitionBundle(t, t.TempDir(), "prompt\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	registry = compileSet(t, writeDefinitionBundle(t, t.TempDir(), "prompt\n"))
 	journey, _ = registry.Journey("planner")
 	source = platformskills.New(journey)
 	instructions, err := source.Read("planner", "SKILL.md")
@@ -68,42 +60,45 @@ func TestSkillCatalogAndControlledReads(t *testing.T) {
 	}
 }
 
+// TestSkillPolicyFailsClosed covers what remains of the old resource policy:
+// supporting files are every regular file in the bundle, and anything else
+// (a path outside the bundle, a missing file, a bundle with only SKILL.md) is
+// unavailable.
 func TestSkillPolicyFailsClosed(t *testing.T) {
 	root := t.TempDir()
-	path := writeDefinitionBundle(t, root, "prompt\n")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data = []byte(string(data[:]))
-	data = []byte(strings.Replace(string(data), `"allow_supporting_files":true`, `"allow_supporting_files":false`, 1))
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		t.Fatal(err)
-	}
-	registry, err := definitions.Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	registry := compileSet(t, writeDefinitionBundle(t, root, "prompt\n"))
 	journey, _ := registry.Journey("planner")
-	if _, err := platformskills.New(journey).Read("planner", "guide.md"); !errors.Is(err, platformskills.ErrUnavailable) {
-		t.Fatalf("disabled resource policy = %v", err)
+	source := platformskills.New(journey)
+	if _, err := source.Read("planner", "guide.md"); err != nil {
+		t.Fatalf("bundle file read = %v", err)
+	}
+	for _, resource := range []string{"../../prompts/planner.md", "../planner/guide.md", "/etc/passwd", "missing.md", "reference/missing.md"} {
+		if _, err := source.Read("planner", resource); !errors.Is(err, platformskills.ErrUnavailable) {
+			t.Fatalf("read %q = %v", resource, err)
+		}
+	}
+	if _, err := source.Read("other", "SKILL.md"); !errors.Is(err, platformskills.ErrUnavailable) {
+		t.Fatalf("unknown skill read = %v", err)
 	}
 
-	data = []byte(strings.Replace(string(data), `"allow_supporting_files":false`, `"allow_supporting_files":true,"disabled":true`, 1))
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	bare := t.TempDir()
+	path := writeDefinitionBundle(t, bare, "prompt\n")
+	if err := os.Remove(filepath.Join(bare, "skills/planner/guide.md")); err != nil {
 		t.Fatal(err)
 	}
-	registry, err = definitions.Load(path)
-	if err != nil {
-		t.Fatal(err)
+	journey, _ = compileSet(t, path).Journey("planner")
+	if len(journey.Skills) != 1 || len(journey.Skills[0].Supporting) != 0 || journey.Skills[0].AllowSupportingFiles {
+		t.Fatalf("SKILL.md-only bundle has resources: %#v", journey.Skills)
 	}
-	journey, _ = registry.Journey("planner")
-	source := platformskills.New(journey)
-	if len(source.Catalog()) != 0 {
-		t.Fatal("disabled skill appeared in catalog")
+	source = platformskills.New(journey)
+	if len(source.Catalog()) != 1 {
+		t.Fatalf("catalog = %#v", source.Catalog())
 	}
-	if _, err := source.Read("planner", "SKILL.md"); !errors.Is(err, platformskills.ErrUnavailable) {
-		t.Fatalf("disabled skill read = %v", err)
+	if _, err := source.Read("planner", "SKILL.md"); err != nil {
+		t.Fatalf("instructions read = %v", err)
+	}
+	if _, err := source.Read("planner", "guide.md"); !errors.Is(err, platformskills.ErrUnavailable) {
+		t.Fatalf("resource of SKILL.md-only bundle = %v", err)
 	}
 }
 
@@ -111,10 +106,7 @@ func TestSkillReadRejectsReplacedAncestors(t *testing.T) {
 	t.Run("compiled root", func(t *testing.T) {
 		parent := t.TempDir()
 		root := filepath.Join(parent, "bundle")
-		registry, err := definitions.Load(writeDefinitionBundle(t, root, "prompt\n"))
-		if err != nil {
-			t.Fatal(err)
-		}
+		registry := compileSet(t, writeDefinitionBundle(t, root, "prompt\n"))
 		journey, _ := registry.Journey("planner")
 		real := filepath.Join(parent, "bundle-real")
 		if err := os.Rename(root, real); err != nil {
@@ -131,10 +123,7 @@ func TestSkillReadRejectsReplacedAncestors(t *testing.T) {
 		parent := t.TempDir()
 		ancestor := filepath.Join(parent, "canonical")
 		root := filepath.Join(ancestor, "bundle")
-		registry, err := definitions.Load(writeDefinitionBundle(t, root, "prompt\n"))
-		if err != nil {
-			t.Fatal(err)
-		}
+		registry := compileSet(t, writeDefinitionBundle(t, root, "prompt\n"))
 		journey, _ := registry.Journey("planner")
 		real := filepath.Join(parent, "canonical-real")
 		if err := os.Rename(ancestor, real); err != nil {
@@ -149,10 +138,7 @@ func TestSkillReadRejectsReplacedAncestors(t *testing.T) {
 	})
 	t.Run("package", func(t *testing.T) {
 		root := t.TempDir()
-		registry, err := definitions.Load(writeDefinitionBundle(t, root, "prompt\n"))
-		if err != nil {
-			t.Fatal(err)
-		}
+		registry := compileSet(t, writeDefinitionBundle(t, root, "prompt\n"))
 		journey, _ := registry.Journey("planner")
 		packagePath := filepath.Join(root, "skills/planner")
 		realPath := filepath.Join(root, "skills/planner-real")
@@ -175,18 +161,7 @@ func TestSkillReadRejectsReplacedAncestors(t *testing.T) {
 		if err := os.Rename(filepath.Join(root, "skills/planner/guide.md"), filepath.Join(root, "skills/planner/reference/guide.md")); err != nil {
 			t.Fatal(err)
 		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		data = []byte(strings.Replace(string(data), `"supporting_files":["guide.md"]`, `"supporting_files":["reference/guide.md"]`, 1))
-		if err := os.WriteFile(path, data, 0600); err != nil {
-			t.Fatal(err)
-		}
-		registry, err := definitions.Load(path)
-		if err != nil {
-			t.Fatal(err)
-		}
+		registry := compileSet(t, path)
 		journey, _ := registry.Journey("planner")
 		intermediate := filepath.Join(root, "skills/planner/reference")
 		real := filepath.Join(root, "skills/planner/reference-real")
@@ -219,7 +194,25 @@ func writeTwoJourneyBundle(t *testing.T, root string) string {
 			t.Fatal(err)
 		}
 	}
-	config := `{"mcp_servers":[{"id":"s","tools":["lookup_destination","lookup_shift"],"policies":{"lookup_destination":{"class":"read_only"},"lookup_shift":{"class":"read_only"}}}],"skill_packages":[{"name":"planner","root":"skills/planner"},{"name":"shift-swap","root":"skills/shift-swap"}],"journeys":[{"id":"vacation-planner","description":"travel","routing":{"default":true},"system_prompt":"prompts/planner.md","mcp":{"server":"s","tools":["lookup_destination"]},"skills":["planner"]},{"id":"shift-swap","description":"exchange work time","routing":{"keywords":["shift","swap"],"priority":10},"system_prompt":"prompts/shift-swap.md","mcp":{"server":"s","tools":["lookup_shift"]},"skills":["shift-swap"]}]}`
+	config := `catalog:
+  operation_meta_key: operation_key
+  call_id_header: X-Platform-Call-ID
+journeys:
+  - id: vacation-planner
+    skill: skills/planner
+    system_prompt: prompts/planner.md
+    routing: {default: true}
+    tools:
+      - op: lookup_destination
+        class: read_only
+  - id: shift-swap
+    skill: skills/shift-swap
+    system_prompt: prompts/shift-swap.md
+    routing: {keywords: [shift, swap], priority: 10}
+    tools:
+      - op: lookup_shift
+        class: read_only
+`
 	path := filepath.Join(root, "journeys.yaml")
 	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
 		t.Fatal(err)
@@ -229,20 +222,17 @@ func writeTwoJourneyBundle(t *testing.T, root string) string {
 
 func TestJourneyDefinitionRoutesAndMaterializesContext(t *testing.T) {
 	sdk := mcp.NewServer(&mcp.Implementation{Name: "journeys", Version: "1"}, nil)
-	mcp.AddTool(sdk, &mcp.Tool{Name: "lookup_destination"}, func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
+	mcp.AddTool(sdk, keyedTool("lookup_destination", "lookup_destination"), func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
 		return nil, struct{}{}, nil
 	})
-	mcp.AddTool(sdk, &mcp.Tool{Name: "lookup_shift"}, func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
+	mcp.AddTool(sdk, keyedTool("lookup_shift", "lookup_shift"), func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
 		return nil, struct{}{}, nil
 	})
 	endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return sdk }, nil))
 	t.Cleanup(endpoint.Close)
-	registry, err := definitions.Load(writeTwoJourneyBundle(t, t.TempDir()))
-	if err != nil {
-		t.Fatal(err)
-	}
+	registry := compileSet(t, writeTwoJourneyBundle(t, t.TempDir()))
 	var requests []agentruntime.ModelRequest
-	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	runner := agentruntime.NewRunner(registry, modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		requests = append(requests, request)
 		return agentruntime.ModelResponse{Text: request.Handoff.JourneyID + " answer"}, nil
 	}), testTenancy(t, endpoint.URL))
@@ -324,23 +314,14 @@ func TestJourneyDefinitionRoutesAndMaterializesContext(t *testing.T) {
 
 func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 	sdk := mcp.NewServer(&mcp.Implementation{Name: "versions", Version: "1"}, nil)
-	mcp.AddTool(sdk, &mcp.Tool{Name: "lookup"}, func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
+	mcp.AddTool(sdk, keyedTool("lookup", "lookup"), func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
 		return nil, struct{}{}, nil
 	})
 	endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return sdk }, nil))
 	t.Cleanup(endpoint.Close)
-	makeVersion := func(serverName, prompt, body string) string {
+	makeVersion := func(prompt, body string) string {
 		root := t.TempDir()
 		path := writeDefinitionBundle(t, root, prompt)
-		config, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		config = []byte(strings.ReplaceAll(string(config), `"id":"s"`, fmt.Sprintf(`"id":%q`, serverName)))
-		config = []byte(strings.ReplaceAll(string(config), `"server":"s"`, fmt.Sprintf(`"server":%q`, serverName)))
-		if err := os.WriteFile(path, config, 0600); err != nil {
-			t.Fatal(err)
-		}
 		skillPath := filepath.Join(root, "skills/planner/SKILL.md")
 		skill, err := os.ReadFile(skillPath)
 		if err != nil {
@@ -352,15 +333,9 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 		}
 		return path
 	}
-	oldPath, newPath := makeVersion("legacy", "old system\n", "old skill body"), makeVersion("current", "new system\n", "new skill body")
-	oldRegistry, err := definitions.Load(oldPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	registry, err := definitions.Load(newPath, oldPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	oldPath, newPath := makeVersion("old system\n", "old skill body"), makeVersion("new system\n", "new skill body")
+	oldRegistry := compileSet(t, oldPath)
+	registry := compileSet(t, newPath, oldPath)
 	oldJourney, _ := oldRegistry.Journey("planner")
 	newJourney, _ := registry.Journey("planner")
 	store := journal.New(database(t))
@@ -375,7 +350,7 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 		}
 		return agentruntime.ModelResponse{Text: "done"}, nil
 	})
-	service := platform.New(agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, endpoint.URL)), store)
+	service := platform.New(agentruntime.NewRunner(registry, model, testTenancy(t, endpoint.URL)), store)
 	command := platform.Command{ThreadID: "retained", RunID: "wait", CommunicationID: "wait", Principal: "alice", Tenant: testTenant, Text: "ask", TargetJourney: "planner"}
 	if _, err := service.Submit(t.Context(), command, credential.Credential{}); err != nil {
 		t.Fatal(err)
@@ -395,7 +370,7 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	replacement := platform.New(agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, endpoint.URL)), store)
+	replacement := platform.New(agentruntime.NewRunner(registry, model, testTenancy(t, endpoint.URL)), store)
 	t.Cleanup(replacement.Close)
 	reply := platform.Command{ThreadID: "retained", RunID: "reply", CommunicationID: "reply", Principal: "alice", Tenant: testTenant, InteractionID: interaction.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
 	if _, err := replacement.Submit(t.Context(), reply, credential.Credential{}); err != nil {
@@ -429,16 +404,13 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 
 func TestSkillRuntimeLoadsOnlySelectedMaterial(t *testing.T) {
 	sdk := mcp.NewServer(&mcp.Implementation{Name: "skill-selection", Version: "1"}, nil)
-	mcp.AddTool(sdk, &mcp.Tool{Name: "lookup"}, func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
+	mcp.AddTool(sdk, keyedTool("lookup", "lookup"), func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
 		return nil, struct{}{}, nil
 	})
 	endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return sdk }, nil))
 	t.Cleanup(endpoint.Close)
 	root := t.TempDir()
-	registry, err := definitions.Load(writeDefinitionBundle(t, root, "prompt\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	registry := compileSet(t, writeDefinitionBundle(t, root, "prompt\n"))
 	var requests []agentruntime.ModelRequest
 	model := modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		requests = append(requests, request)
@@ -470,7 +442,7 @@ func TestSkillRuntimeLoadsOnlySelectedMaterial(t *testing.T) {
 		t.Fatal(err)
 	}
 	owner := claimForTest(t, store, command, false)
-	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, endpoint.URL))
+	runner := agentruntime.NewRunner(registry, model, testTenancy(t, endpoint.URL))
 	input := scoped(t, runner, agentruntime.RunInput{Store: store, Owner: owner, ThreadID: command.ThreadID, RunID: command.RunID, Text: command.Text})
 	journey, digest, err := runner.Binding(t.Context(), input)
 	if err != nil {

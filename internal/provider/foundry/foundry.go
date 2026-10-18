@@ -20,7 +20,7 @@ import (
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
@@ -139,7 +139,7 @@ func sanitize(err error) error {
 	}
 	var apiError *openai.Error
 	if errors.As(err, &apiError) && (apiError.StatusCode == http.StatusUnauthorized || apiError.StatusCode == http.StatusForbidden) {
-		return fmt.Errorf("Foundry authentication failed: %w", platformmcp.ErrAuthRequired)
+		return fmt.Errorf("Foundry authentication failed: %w", catalog.ErrAuthRequired)
 	}
 	return errors.New("Foundry model request failed")
 }

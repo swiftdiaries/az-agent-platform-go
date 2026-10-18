@@ -13,7 +13,6 @@ import (
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/service"
@@ -22,17 +21,14 @@ import (
 func TestServiceDrainRejectsNewAdmissionAndInterruptsExpiredOwner(t *testing.T) {
 	pool := database(t)
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "deployment", Version: "1"}, nil)
-	mcp.AddTool(mcpServer, &mcp.Tool{Name: "lookup", Description: "read-only lookup"}, func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
+	mcp.AddTool(mcpServer, withDescription(keyedTool("lookup", "lookup"), "read-only lookup"), func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
 		return &mcp.CallToolResult{}, struct{}{}, nil
 	})
 	mcpHandler := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, nil))
 	defer mcpHandler.Close()
 
 	root := t.TempDir()
-	registry, err := definitions.Load(writeDefinitionBundle(t, root, "prompt\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	registry := compileSet(t, writeDefinitionBundle(t, root, "prompt\n"))
 
 	started := make(chan struct{})
 	cancelled := make(chan struct{})
@@ -45,7 +41,7 @@ func TestServiceDrainRejectsNewAdmissionAndInterruptsExpiredOwner(t *testing.T) 
 	tenancy := testTenancy(t, mcpHandler.URL)
 	app, err := service.New(service.Dependencies{
 		Pool:              pool,
-		Registry:          registry,
+		Definitions:       registry,
 		Authenticator:     acceptanceTokens,
 		Model:             model,
 		CredentialHeaders: []string{"Authorization"},
@@ -154,13 +150,10 @@ func TestServiceShutdownBoundsBlockedAdmissionAndClaim(t *testing.T) {
 		t.Run(barrier.name, func(t *testing.T) {
 			pool := database(t)
 			root := t.TempDir()
-			registry, err := definitions.Load(writeDefinitionBundle(t, root, "prompt\n"))
-			if err != nil {
-				t.Fatal(err)
-			}
+			registry := compileSet(t, writeDefinitionBundle(t, root, "prompt\n"))
 			tenancy := testTenancy(t, "http://127.0.0.1:1")
 			app, err := service.New(service.Dependencies{
-				Pool: pool, Registry: registry, Authenticator: acceptanceTokens,
+				Pool: pool, Definitions: registry, Authenticator: acceptanceTokens,
 				Directory: tenancy.Directory, Endpoints: tenancy.Endpoints, Settings: tenancy.Settings,
 				Model: modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 					return agentruntime.ModelResponse{}, nil

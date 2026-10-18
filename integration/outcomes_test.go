@@ -13,79 +13,105 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 )
 
+// remoteLookup is the remote MCP name of the lookup tool. It deliberately differs
+// from the alias the model sees (definitions.AliasFor of the operation key), so
+// every test that dispatches through it proves the Binding sends the remote name
+// while the model, journal and events only ever carry the alias.
+const (
+	remoteLookup = "destinations.lookup"
+	lookupAlias  = "lookup_destination"
+)
+
+// lookupTool publishes operation key lookup_destination under remoteLookup.
+func lookupTool(description string) *mcp.Tool {
+	return withDescription(keyedTool(remoteLookup, lookupAlias), description)
+}
+
+// policyRunner compiles a one-journey YAML bundle (the planner prompt) whose single
+// tool is operation key lookup_destination with the class under test: "read_only",
+// "idempotent", "effectful" (explicit) or "unclassified" (no class key, which
+// resolves to effectful).
 func policyRunner(t *testing.T, url, class string, model agentruntime.Model) *agentruntime.Runner {
 	t.Helper()
-	data, err := os.ReadFile("../configs/journeys.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var config map[string]any
-	if err = json.Unmarshal(data, &config); err != nil {
-		t.Fatal(err)
-	}
-	server := config["mcp_servers"].([]any)[0].(map[string]any)
-	server["policies"] = map[string]any{"lookup_destination": map[string]any{"class": class, "deduplication_evidence": "fixture verifies same X-Platform-Call-ID yields one mutation"}}
-	server["tools"] = []any{"lookup_destination"}
-	config["journeys"] = config["journeys"].([]any)[:1]
-	config["skill_packages"] = config["skill_packages"].([]any)[:1]
-	dir, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
 	prompt, err := os.ReadFile("../configs/prompts/planner.md")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = os.Mkdir(filepath.Join(dir, "prompts"), 0700); err != nil {
+	written, want := class, definitions.Class(class)
+	if class == "effectful" || class == "unclassified" {
+		written = ""
+	}
+	if class == "unclassified" {
+		want = ""
+	}
+	path := writeBundleConfig(t, t.TempDir(), string(prompt), lookupAlias, written)
+	if class == "effectful" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		edited := strings.Replace(string(data), "      - op: "+lookupAlias+"\n", "      - op: "+lookupAlias+"\n        class: effectful\n", 1)
+		if edited == string(data) {
+			t.Fatal("explicit effectful class was not written")
+		}
+		if err := os.WriteFile(path, []byte(edited), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set := compileSet(t, path)
+	journey, ok := set.Journey("planner")
+	if !ok || len(journey.Tools) != 1 || journey.Tools[0].Class != want {
+		t.Fatalf("compiled %q journey tools = %#v, %v", class, journey.Tools, ok)
+	}
+	return agentruntime.NewRunner(set, model, testTenancy(t, url))
+}
+
+// requireAliasOffered fails the test (without stopping the model goroutine) unless
+// the request offers the alias and never the remote name.
+func requireAliasOffered(t *testing.T, request agentruntime.ModelRequest) {
+	t.Helper()
+	names := toolNames(request.Tools)
+	if !slices.Contains(names, lookupAlias) || slices.Contains(names, remoteLookup) {
+		t.Errorf("model tools = %v, want alias %q and not remote %q", names, lookupAlias, remoteLookup)
+	}
+}
+
+// requireOperationRows asserts every agent_operations row carries the model alias
+// and operation key (never the remote name), and returns the row count.
+func requireOperationRows(t *testing.T, pool *pgxpool.Pool, want int) {
+	t.Helper()
+	var rows, matching int
+	if err := pool.QueryRow(t.Context(), "SELECT count(*), count(*) FILTER (WHERE alias=$1 AND operation_key=$1) FROM agent_operations", lookupAlias).Scan(&rows, &matching); err != nil {
 		t.Fatal(err)
 	}
-	if err = os.MkdirAll(filepath.Join(dir, "skills", "planner"), 0700); err != nil {
-		t.Fatal(err)
+	if rows != want || matching != want {
+		t.Fatalf("agent_operations rows=%d with alias/operation_key %q = %d, want %d", rows, lookupAlias, matching, want)
 	}
-	if err = os.WriteFile(filepath.Join(dir, "prompts/planner.md"), prompt, 0600); err != nil {
-		t.Fatal(err)
-	}
-	skill, err := os.ReadFile("../configs/skills/planner/SKILL.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = os.WriteFile(filepath.Join(dir, "skills/planner/SKILL.md"), skill, 0600); err != nil {
-		t.Fatal(err)
-	}
-	encoded, _ := json.Marshal(config)
-	path := filepath.Join(dir, "journeys.yaml")
-	if err = os.WriteFile(path, encoded, 0600); err != nil {
-		t.Fatal(err)
-	}
-	registry, err := definitions.Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return agentruntime.NewRunner(registry, platformmcp.NewClient(), model, testTenancy(t, url))
 }
 
 func TestToolCallLostAfterEffectNoRetry(t *testing.T) {
 	pool := database(t)
 	var dispatch, models atomic.Int32
+	var remoteNames sync.Map
 	// Stateful SDK session survives an HTTP response lost after the handler applies
 	// its mutation. The client receives a transport error, not an MCP business error.
 	sdk := mcp.NewServer(&mcp.Implementation{Name: "effects", Version: "1"}, nil)
-	mcp.AddTool(sdk, &mcp.Tool{Name: "lookup_destination", Description: "effect"}, func(context.Context, *mcp.CallToolRequest, map[string]any) (*mcp.CallToolResult, any, error) {
+	mcp.AddTool(sdk, lookupTool("effect"), func(_ context.Context, r *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, any, error) {
 		dispatch.Add(1)
+		remoteNames.Store(r.Params.Name, true)
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "applied"}}}, nil, nil
 	})
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return sdk }, nil)
@@ -104,12 +130,13 @@ func TestToolCallLostAfterEffectNoRetry(t *testing.T) {
 	defer backend.Close()
 	model := modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		models.Add(1)
+		requireAliasOffered(t, r)
 		if len(r.ToolResults) > 0 {
 			return agentruntime.ModelResponse{Text: "must not reach"}, nil
 		}
 		return agentruntime.ModelResponse{ToolCalls: []agentruntime.ToolCall{{CallID: "effect", Name: "lookup_destination", Arguments: json.RawMessage(`{"city":"A"}`)}, {CallID: "sibling", Name: "lookup_destination", Arguments: json.RawMessage(`{"city":"B"}`)}}}, nil
 	})
-	p := platform.New(policyRunner(t, backend.URL, "effectful", model), journal.New(pool))
+	p := platform.New(policyRunner(t, backend.URL, "unclassified", model), journal.New(pool))
 	defer p.Close()
 	c := platform.Command{ThreadID: "effect-thread", RunID: "effect-run", CommunicationID: "effect-comm", Principal: "alice", Tenant: testTenant, Text: "change"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
@@ -137,6 +164,15 @@ func TestToolCallLostAfterEffectNoRetry(t *testing.T) {
 	}
 	if outcome != "outcome_unknown" || attempts != 1 || dispatch.Load() != 1 || models.Load() != 1 {
 		t.Fatal(outcome, attempts, dispatch.Load(), models.Load())
+	}
+	if _, ok := remoteNames.Load(remoteLookup); !ok {
+		t.Fatalf("MCP did not receive remote name %q", remoteLookup)
+	}
+	requireOperationRows(t, pool, 1)
+	var policy string
+	var approval bool
+	if err := pool.QueryRow(t.Context(), "SELECT policy,requires_approval FROM agent_operations").Scan(&policy, &approval); err != nil || policy != "effectful" || !approval {
+		t.Fatalf("unclassified tool stored policy=%q requires_approval=%v: %v", policy, approval, err)
 	}
 	later := c
 	later.RunID = "later"
@@ -173,7 +209,7 @@ func (b requestBody) method() string {
 
 func TestBeginAttemptSecondAttemptPredecessorMatrix(t *testing.T) {
 	for _, predecessor := range []string{"dispatching", "completed", "rejected", "auth_required", "outcome_unknown"} {
-		for _, policy := range []string{"read_only", "deduplicated", "effectful"} {
+		for _, policy := range []string{"read_only", "idempotent", "effectful"} {
 			t.Run(predecessor+"/"+policy, func(t *testing.T) {
 				pool := database(t)
 				store := journal.New(pool)
@@ -189,8 +225,8 @@ func TestBeginAttemptSecondAttemptPredecessorMatrix(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				op := journal.Operation{CallID: "stable-product-call", Name: "lookup_destination", Arguments: `{"city":"A"}`, Binding: binding, Policy: policy}
-				if _, err := pool.Exec(t.Context(), "INSERT INTO agent_operations(call_id,thread_id,run_id,name,arguments,binding,policy,outcome) VALUES($1,$2,$3,$4,$5,$6,$7,$8)", op.CallID, command.ThreadID, command.RunID, op.Name, op.Arguments, op.Binding, op.Policy, predecessor); err != nil {
+				op := journal.Operation{CallID: "stable-product-call", Name: lookupAlias, OperationKey: lookupAlias, Arguments: `{"city":"A"}`, Binding: binding, Policy: policy, RequiresApproval: policy != "read_only"}
+				if _, err := pool.Exec(t.Context(), "INSERT INTO agent_operations(call_id,thread_id,run_id,alias,operation_key,arguments,binding,policy,requires_approval,outcome) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)", op.CallID, command.ThreadID, command.RunID, op.Name, op.OperationKey, op.Arguments, op.Binding, op.Policy, op.RequiresApproval, predecessor); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := pool.Exec(t.Context(), "INSERT INTO agent_attempts(call_id,attempt,outcome) VALUES($1,1,$2)", op.CallID, predecessor); err != nil {
@@ -221,8 +257,40 @@ func TestBeginAttemptSecondAttemptPredecessorMatrix(t *testing.T) {
 	}
 }
 
+// The removed "deduplicated" policy and an unapproved effectful/idempotent
+// operation are both refused before anything is stored.
+func TestBeginAttemptRejectsRemovedAndUnapprovedPolicies(t *testing.T) {
+	pool := database(t)
+	store := journal.New(pool)
+	command := journal.Command{ThreadID: "policy-vocabulary", RunID: "policy-vocabulary", CommunicationID: "policy-vocabulary", Principal: "alice", Text: "go"}
+	if _, _, err := store.Admit(t.Context(), command); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := store.Claim(t.Context(), command, "policy-owner", journal.LeaseDuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := journal.ActionBinding(lookupAlias, []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []journal.Operation{
+		{CallID: "c1", Name: lookupAlias, OperationKey: lookupAlias, Arguments: `{}`, Binding: binding, Policy: "deduplicated", RequiresApproval: true},
+		{CallID: "c2", Name: lookupAlias, OperationKey: lookupAlias, Arguments: `{}`, Binding: binding, Policy: "idempotent"},
+		{CallID: "c3", Name: lookupAlias, OperationKey: lookupAlias, Arguments: `{}`, Binding: binding, Policy: "effectful"},
+	} {
+		if err := store.BeginAttempt(t.Context(), owner, op, 1, ""); !errors.Is(err, journal.ErrState) {
+			t.Fatalf("BeginAttempt(%s, approval=%v) = %v, want ErrState", op.Policy, op.RequiresApproval, err)
+		}
+	}
+	requireOperationRows(t, pool, 0)
+	if _, err := pool.Exec(t.Context(), "INSERT INTO agent_operations(call_id,thread_id,run_id,alias,operation_key,arguments,binding,policy,requires_approval,outcome) VALUES('c4',$1,$2,$3,$3,'{}',$4,'deduplicated',true,'dispatching')", command.ThreadID, command.RunID, lookupAlias, binding); err == nil {
+		t.Fatal("database accepted the removed deduplicated policy")
+	}
+}
+
 func TestToolCallVerifiedRetryStableID(t *testing.T) {
-	for _, class := range []string{"read_only", "deduplicated"} {
+	for _, class := range []string{"read_only", "idempotent"} {
 		t.Run(class, func(t *testing.T) {
 			pool := database(t)
 			var mu sync.Mutex
@@ -230,8 +298,10 @@ func TestToolCallVerifiedRetryStableID(t *testing.T) {
 			effects := map[string]bool{}
 			var dispatch, mutations atomic.Int32
 			sdk := mcp.NewServer(&mcp.Implementation{Name: "retry", Version: "1"}, nil)
-			mcp.AddTool(sdk, &mcp.Tool{Name: "lookup_destination", Description: "lookup"}, func(ctx context.Context, r *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, any, error) {
+			var remoteNames sync.Map
+			mcp.AddTool(sdk, lookupTool("lookup"), func(ctx context.Context, r *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, any, error) {
 				dispatch.Add(1)
+				remoteNames.Store(r.Params.Name, true)
 				id := r.Extra.Header.Get("X-Platform-Call-ID")
 				mu.Lock()
 				if !effects[id] {
@@ -264,6 +334,7 @@ func TestToolCallVerifiedRetryStableID(t *testing.T) {
 			}))
 			defer backend.Close()
 			model := modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+				requireAliasOffered(t, r)
 				if len(r.ToolResults) > 0 {
 					return agentruntime.ModelResponse{Text: "done"}, nil
 				}
@@ -276,7 +347,7 @@ func TestToolCallVerifiedRetryStableID(t *testing.T) {
 				t.Fatal(err)
 			}
 			run := c.RunID
-			if class == "deduplicated" {
+			if class == "idempotent" {
 				s := awaitState(t, p, c.ThreadID, c.RunID, journal.RunAwaitingInput)
 				i := s.Runs[0].Interaction
 				if i == nil {
@@ -298,6 +369,15 @@ func TestToolCallVerifiedRetryStableID(t *testing.T) {
 			if err := pool.QueryRow(t.Context(), "SELECT count(DISTINCT attempt) FROM agent_attempts").Scan(&n); err != nil || n != 2 {
 				t.Fatal(n, err)
 			}
+			if _, ok := remoteNames.Load(remoteLookup); !ok {
+				t.Fatalf("MCP did not receive remote name %q", remoteLookup)
+			}
+			requireOperationRows(t, pool, 1)
+			var policy string
+			var approval bool
+			if err := pool.QueryRow(t.Context(), "SELECT policy,requires_approval FROM agent_operations").Scan(&policy, &approval); err != nil || policy != class || approval != (class != "read_only") {
+				t.Fatalf("stored policy=%q requires_approval=%v: %v", policy, approval, err)
+			}
 		})
 	}
 }
@@ -307,14 +387,14 @@ func TestToolCallPredispatchPersistenceFailure(t *testing.T) {
 	mock := newMockMCP(t)
 	backend := httptest.NewServer(mock)
 	defer backend.Close()
-	registry, err := definitions.Load("../configs/journeys.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
+	registry := compileSet(t, "../configs/journeys.yaml")
 	if _, err := pool.Exec(t.Context(), `CREATE FUNCTION fail_intent() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'intent unavailable'; END $$;CREATE TRIGGER fail_intent BEFORE INSERT ON agent_operations FOR EACH ROW EXECUTE FUNCTION fail_intent()`); err != nil {
 		t.Fatal(err)
 	}
-	p := platform.New(agentruntime.NewRunner(registry, platformmcp.NewClient(), modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	var models atomic.Int32
+	p := platform.New(agentruntime.NewRunner(registry, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+		models.Add(1)
+		requireAliasOffered(t, r)
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "pre", Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
 	}), testTenancy(t, backend.URL)), journal.New(pool))
 	defer p.Close()
@@ -325,6 +405,11 @@ func TestToolCallPredispatchPersistenceFailure(t *testing.T) {
 	awaitState(t, p, c.ThreadID, c.RunID, journal.RunFailed)
 	if len(mock.calls()) != 0 {
 		t.Fatal("dispatched without committed intent")
+	}
+	// The journey must have been available and the call proposed: the failure is the
+	// intent write, not a missing tool.
+	if models.Load() != 1 {
+		t.Fatalf("model calls = %d, want 1 (journey unavailable instead of intent failure?)", models.Load())
 	}
 	var n int
 	if err := pool.QueryRow(t.Context(), "SELECT count(*) FROM agent_operations").Scan(&n); err != nil || n != 0 {
@@ -342,8 +427,9 @@ func TestToolCallCompletionPersistenceFailurePublishesUnknownBeforeRunFailure(t 
 	defer backend.Close()
 	const providerCallID = "provider-completion-sentinel"
 	var models atomic.Int32
-	runner := policyRunner(t, backend.URL, "read_only", modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	runner := policyRunner(t, backend.URL, "read_only", modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		models.Add(1)
+		requireAliasOffered(t, r)
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: providerCallID, Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
 	}))
 	p := platform.New(runner, journal.New(pool))
@@ -357,9 +443,14 @@ func TestToolCallCompletionPersistenceFailurePublishesUnknownBeforeRunFailure(t 
 		t.Fatalf("unsafe or missing live uncertainty: %d %s", response.StatusCode, response.Body)
 	}
 	var thread, productCallID, toolName, operation, attempt, run string
-	if err := pool.QueryRow(t.Context(), "SELECT o.thread_id,o.call_id,o.name,o.outcome,a.outcome,r.state FROM agent_operations o JOIN agent_attempts a ON a.call_id=o.call_id JOIN agent_runs r ON r.id=o.run_id").Scan(&thread, &productCallID, &toolName, &operation, &attempt, &run); err != nil || productCallID == providerCallID || operation != "outcome_unknown" || attempt != "outcome_unknown" || run != "failed" {
+	if err := pool.QueryRow(t.Context(), "SELECT o.thread_id,o.call_id,o.alias,o.outcome,a.outcome,r.state FROM agent_operations o JOIN agent_attempts a ON a.call_id=o.call_id JOIN agent_runs r ON r.id=o.run_id").Scan(&thread, &productCallID, &toolName, &operation, &attempt, &run); err != nil || productCallID == providerCallID || operation != "outcome_unknown" || attempt != "outcome_unknown" || run != "failed" {
 		t.Fatal(thread, productCallID, toolName, operation, attempt, run, err)
 	}
+	if toolName != lookupAlias {
+		t.Fatalf("journal tool name = %q, want alias %q", toolName, lookupAlias)
+	}
+	mock.requireRemoteName(t)
+	requireOperationRows(t, pool, 1)
 	snapshot, err := journal.New(pool).Snapshot(t.Context(), thread, testPrincipal)
 	if err != nil {
 		t.Fatal(err)
@@ -385,6 +476,7 @@ func TestToolCallZeroOneMultipleAndDelayed(t *testing.T) {
 			release := make(chan struct{})
 			model := modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 				round := models.Add(1)
+				requireAliasOffered(t, r)
 				if round == 1 {
 					close(entered)
 					<-release
@@ -425,9 +517,11 @@ func TestToolCallZeroOneMultipleAndDelayed(t *testing.T) {
 			for _, c := range mock.calls() {
 				ids[c.callID] = true
 			}
-			if len(ids) != n {
-				t.Fatal("call IDs reused", ids)
+			if len(ids) != n || ids[""] {
+				t.Fatal("call IDs reused or missing from the configured header", ids)
 			}
+			mock.requireRemoteName(t)
+			requireOperationRows(t, pool, n)
 		})
 	}
 }
@@ -441,6 +535,7 @@ func TestApprovalFreshCredentialsAndRejectedReplies(t *testing.T) {
 			defer backend.Close()
 			var resumed *agentruntime.ModelRequest
 			p := platform.New(policyRunner(t, backend.URL, "effectful", modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+				requireAliasOffered(t, r)
 				if len(r.ToolResults) > 0 {
 					copy := r
 					resumed = &copy
@@ -485,6 +580,8 @@ func TestApprovalFreshCredentialsAndRejectedReplies(t *testing.T) {
 				if len(calls) != 1 || calls[0].authorization != "fresh-live-auth" {
 					t.Fatal("approval did not use fresh owner credentials")
 				}
+				mock.requireRemoteName(t)
+				requireOperationRows(t, pool, 1)
 				var included bool
 				var reason string
 				if err := pool.QueryRow(t.Context(), "SELECT included,terminal_reason FROM agent_commands WHERE communication_id=$1", reply.CommunicationID).Scan(&included, &reason); err != nil || included || reason != "consumed" {
@@ -524,9 +621,9 @@ func newMockMCP(t *testing.T) *capturedMCP {
 	t.Helper()
 	captured := new(capturedMCP)
 	sdk := mcp.NewServer(&mcp.Implementation{Name: "captured", Version: "1"}, nil)
-	mcp.AddTool(sdk, &mcp.Tool{Name: "lookup_destination"}, func(_ context.Context, r *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, any, error) {
+	mcp.AddTool(sdk, lookupTool("look up a destination"), func(_ context.Context, r *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, any, error) {
 		captured.mu.Lock()
-		captured.observed = append(captured.observed, mcpObservation{callID: r.Extra.Header.Get("X-Platform-Call-ID"), authorization: r.Extra.Header.Get("Authorization")})
+		captured.observed = append(captured.observed, mcpObservation{tool: r.Params.Name, callID: r.Extra.Header.Get("X-Platform-Call-ID"), authorization: r.Extra.Header.Get("Authorization")})
 		captured.mu.Unlock()
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "result"}}}, nil, nil
 	})
@@ -540,18 +637,33 @@ func (c *capturedMCP) calls() []mcpObservation {
 	return append([]mcpObservation(nil), c.observed...)
 }
 
+// requireRemoteName fails unless every observed call reached the MCP server under
+// the remote name (the model only ever saw the alias).
+func (c *capturedMCP) requireRemoteName(t *testing.T) {
+	t.Helper()
+	for _, call := range c.calls() {
+		if call.tool != remoteLookup {
+			t.Fatalf("MCP received tool %q, want remote name %q", call.tool, remoteLookup)
+		}
+	}
+}
+
 func TestBusinessErrorChangedActionRequiresNewApproval(t *testing.T) {
 	pool := database(t)
 	var calls, models atomic.Int32
 	sdk := mcp.NewServer(&mcp.Implementation{Name: "reject", Version: "1"}, nil)
-	mcp.AddTool(sdk, &mcp.Tool{Name: "lookup_destination"}, func(context.Context, *mcp.CallToolRequest, map[string]any) (*mcp.CallToolResult, any, error) {
+	mcp.AddTool(sdk, lookupTool("look up a destination"), func(_ context.Context, r *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, any, error) {
 		calls.Add(1)
+		if r.Params.Name != remoteLookup {
+			t.Errorf("MCP received tool %q, want remote name %q", r.Params.Name, remoteLookup)
+		}
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: "private rejection details"}}}, nil, nil
 	})
 	backend := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return sdk }, nil))
 	defer backend.Close()
 	p := platform.New(policyRunner(t, backend.URL, "effectful", modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		round := models.Add(1)
+		requireAliasOffered(t, r)
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: fmt.Sprintf("call-%d", round), Name: "lookup_destination", Arguments: json.RawMessage(fmt.Sprintf(`{"attempt":%d}`, round))}}, nil
 	})), journal.New(pool))
 	defer p.Close()
@@ -608,7 +720,10 @@ func TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted(t *testing.T) {
 	entered, release, applied := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var calls, models atomic.Int32
 	sdk := mcp.NewServer(&mcp.Implementation{Name: "loss", Version: "1"}, nil)
-	mcp.AddTool(sdk, &mcp.Tool{Name: "lookup_destination"}, func(context.Context, *mcp.CallToolRequest, map[string]any) (*mcp.CallToolResult, any, error) {
+	mcp.AddTool(sdk, lookupTool("look up a destination"), func(_ context.Context, r *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, any, error) {
+		if r.Params.Name != remoteLookup {
+			t.Errorf("MCP received tool %q, want remote name %q", r.Params.Name, remoteLookup)
+		}
 		close(entered)
 		<-release
 		calls.Add(1)
@@ -617,8 +732,9 @@ func TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted(t *testing.T) {
 	})
 	backend := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return sdk }, nil))
 	defer backend.Close()
-	p := platform.New(policyRunner(t, backend.URL, "read_only", modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	p := platform.New(policyRunner(t, backend.URL, "read_only", modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		models.Add(1)
+		requireAliasOffered(t, r)
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: providerCallID, Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
 	})), journal.New(ownerPool))
 	defer p.Close()
@@ -642,9 +758,10 @@ func TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted(t *testing.T) {
 		t.Fatal(run, outcome, attempt, calls.Load(), models.Load(), err)
 	}
 	var productCallID, toolName string
-	if err := pool.QueryRow(t.Context(), "SELECT call_id,name FROM agent_operations").Scan(&productCallID, &toolName); err != nil || productCallID == providerCallID {
+	if err := pool.QueryRow(t.Context(), "SELECT call_id,alias FROM agent_operations").Scan(&productCallID, &toolName); err != nil || productCallID == providerCallID || toolName != lookupAlias {
 		t.Fatal(productCallID, toolName, err)
 	}
+	requireOperationRows(t, pool, 1)
 	snapshot, err := journal.New(pool).Snapshot(t.Context(), c.ThreadID, c.Principal)
 	if err != nil {
 		t.Fatal(err)

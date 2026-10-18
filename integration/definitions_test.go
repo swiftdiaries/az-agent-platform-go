@@ -2,7 +2,6 @@ package integration_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -13,11 +12,20 @@ import (
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
+// writeDefinitionBundle writes a one-journey ("planner") bundle whose single
+// tool is the read-only operation "lookup".
 func writeDefinitionBundle(t *testing.T, root, prompt string) string {
+	t.Helper()
+	return writeBundleConfig(t, root, prompt, "lookup", "read_only")
+}
+
+// writeBundleConfig writes the planner bundle (prompt, skill with guide.md and a
+// journeys.yaml) with one tool selecting operation key op. class "" or
+// "effectful" leaves the tool unclassified (effectful).
+func writeBundleConfig(t *testing.T, root, prompt, op, class string) string {
 	t.Helper()
 	for _, dir := range []string{"prompts", "skills/planner"} {
 		if err := os.MkdirAll(filepath.Join(root, dir), 0700); err != nil {
@@ -34,7 +42,12 @@ func writeDefinitionBundle(t *testing.T, root, prompt string) string {
 	if err := os.WriteFile(filepath.Join(root, "skills/planner/guide.md"), []byte("Prefer direct routes.\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	config := `{"mcp_servers":[{"id":"s","tools":["lookup"],"policies":{"lookup":{"class":"read_only"}}}],"skill_packages":[{"name":"planner","root":"skills/planner","supporting_files":["guide.md"],"allow_supporting_files":true}],"journeys":[{"id":"planner","description":"Plan a trip","system_prompt":"prompts/planner.md","mcp":{"server":"s","tools":["lookup"]},"skills":["planner"]}]}`
+	tool := "      - op: " + op + "\n"
+	if class != "" && class != "effectful" {
+		tool += "        class: " + class + "\n"
+	}
+	config := "catalog:\n  operation_meta_key: " + testMetaKey + "\n  call_id_header: X-Platform-Call-ID\n" +
+		"journeys:\n  - id: planner\n    skill: skills/planner\n    system_prompt: prompts/planner.md\n    tools:\n" + tool
 	path := filepath.Join(root, "journeys.yaml")
 	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
 		t.Fatal(err)
@@ -42,19 +55,39 @@ func writeDefinitionBundle(t *testing.T, root, prompt string) string {
 	return path
 }
 
+// compileSet compiles path and, when retained paths are given, retains their
+// journey versions in the returned set.
+func compileSet(t *testing.T, path string, retained ...string) *definitions.Set {
+	t.Helper()
+	current, err := definitions.Compile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retained) == 0 {
+		return current
+	}
+	var old []*definitions.Set
+	for _, p := range retained {
+		set, err := definitions.Compile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		old = append(old, set)
+	}
+	set, err := definitions.Retain(current, old...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return set
+}
+
 func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 	ctx := context.Background()
 	oldRoot, newRoot := t.TempDir(), t.TempDir()
 	oldPath := writeDefinitionBundle(t, oldRoot, "old prompt\n")
 	newPath := writeDefinitionBundle(t, newRoot, "new prompt\n")
-	oldRegistry, err := definitions.Load(oldPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	registry, err := definitions.Load(newPath, oldPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	oldRegistry := compileSet(t, oldPath)
+	registry := compileSet(t, newPath, oldPath)
 	oldJourney, _ := oldRegistry.Journey("planner")
 	newJourney, _ := registry.Journey("planner")
 	pool := database(t)
@@ -105,10 +138,7 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 		t.Fatalf("failed activation changed current = %q, %v", current, err)
 	}
 
-	candidateOnly, err := definitions.Load(newPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	candidateOnly := compileSet(t, newPath)
 	if ready, err := store.DefinitionsReady(ctx, candidateOnly.JourneyIDForDigest); err != nil || ready {
 		t.Fatalf("missing retained bundle readiness = %v, %v", ready, err)
 	}
@@ -123,18 +153,9 @@ func TestCrossJourneyActivationCannotMutateCurrentOrPin(t *testing.T) {
 	oldPath := writeDefinitionBundle(t, oldRoot, "old prompt\n")
 	currentPath := writeDefinitionBundle(t, currentRoot, "current prompt\n")
 	secondJourneyPath := writeTwoJourneyBundle(t, secondJourneyRoot)
-	oldRegistry, err := definitions.Load(oldPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondJourneyRegistry, err := definitions.Load(secondJourneyPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	registry, err := definitions.Load(currentPath, oldPath, secondJourneyPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	oldRegistry := compileSet(t, oldPath)
+	secondJourneyRegistry := compileSet(t, secondJourneyPath)
+	registry := compileSet(t, currentPath, oldPath, secondJourneyPath)
 	oldPlanner, _ := oldRegistry.Journey("planner")
 	currentPlanner, _ := registry.Journey("planner")
 	shiftSwap, _ := secondJourneyRegistry.Journey("shift-swap")
@@ -187,17 +208,17 @@ func TestDeclarativeJourneyRouting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	config := strings.ReplaceAll(string(data), `"id":"vacation-planner"`, `"id":"alpha"`)
-	config = strings.ReplaceAll(config, `"id":"shift-swap"`, `"id":"beta"`)
-	config = strings.Replace(config, `"routing":{"keywords":["shift","swap"],"priority":10}`, `"routing":{"keywords":["quasar"],"priority":7}`, 1)
+	config := strings.ReplaceAll(string(data), "id: vacation-planner", "id: alpha")
+	config = strings.ReplaceAll(config, "id: shift-swap", "id: beta")
+	config = strings.Replace(config, "routing: {keywords: [shift, swap], priority: 10}", "routing: {keywords: [quasar], priority: 7}", 1)
+	if !strings.Contains(config, "quasar") || !strings.Contains(config, "id: alpha") {
+		t.Fatal("routing edit did not apply")
+	}
 	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
-	registry, err := definitions.Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), nil, agentruntime.Tenancy{}) // Binding only: no tenancy needed
+	registry := compileSet(t, path)
+	runner := agentruntime.NewRunner(registry, nil, agentruntime.Tenancy{}) // Binding only: no tenancy needed
 	store := journal.New(database(t))
 	bind := func(thread, text, target, want string) {
 		command := journal.Command{ThreadID: thread, RunID: thread, CommunicationID: thread, Principal: "alice", Text: text, TargetJourney: target}
@@ -262,36 +283,27 @@ func TestDefinitionCompilationIsImmutableAndContentAddressed(t *testing.T) {
 	a, b := t.TempDir(), t.TempDir()
 	oldPath := writeDefinitionBundle(t, a, "old prompt\n")
 	copyPath := writeDefinitionBundle(t, b, "old prompt\n")
-	old, err := definitions.Load(oldPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	copyRegistry, err := definitions.Load(copyPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	old := compileSet(t, oldPath)
+	copyRegistry := compileSet(t, copyPath)
 	first, _ := old.Journey("planner")
 	second, _ := copyRegistry.Journey("planner")
 	if first.Digest == "" || first.Digest != second.Digest {
 		t.Fatalf("root-dependent digest: %q != %q", first.Digest, second.Digest)
 	}
 
-	first.MCP.Tools[0] = "mutated"
-	first.Policies["lookup"] = definitions.ToolPolicy{Class: "effectful"}
+	first.Tools[0].Ops[0] = "mutated"
+	first.Tools[0].Class = definitions.ClassEffectful
 	first.Skills[0].Instructions.Data[0] = 'X'
-	again, _ := old.Version(second.Digest)
-	if again.MCP.Tools[0] != "lookup" || again.Policies["lookup"].Class != "read_only" || string(again.Skills[0].Instructions.Data) != "---\nname: planner\ndescription: Plan a trip\n---\nUse the destination tool.\n" {
+	again, _, ok := old.Pinned(second.Digest)
+	if !ok || again.Tools[0].Ops[0] != "lookup" || again.Tools[0].Class != definitions.ClassReadOnly || string(again.Skills[0].Instructions.Data) != "---\nname: planner\ndescription: Plan a trip\n---\nUse the destination tool.\n" {
 		t.Fatalf("caller mutation changed compiled definition: %#v", again)
 	}
 
 	newRoot := t.TempDir()
 	newPath := writeDefinitionBundle(t, newRoot, "new prompt\n")
-	registry, err := definitions.Load(newPath, oldPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	registry := compileSet(t, newPath, oldPath)
 	current, _ := registry.Journey("planner")
-	retained, ok := registry.Version(second.Digest)
+	retained, _, ok := registry.Pinned(second.Digest)
 	if !ok || retained.Prompt != "old prompt\n" || current.Digest == retained.Digest {
 		t.Fatalf("retained versions: current=%#v old=%#v", current, retained)
 	}
@@ -322,7 +334,7 @@ func TestDefinitionCompilationRejectsUnsafePackages(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			data = []byte(strings.Replace(string(data), `"root":"skills/planner"`, `"root":"../planner"`, 1))
+			data = []byte(strings.Replace(string(data), "skill: skills/planner", "skill: ../planner", 1))
 			if err := os.WriteFile(path, data, 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -333,39 +345,32 @@ func TestDefinitionCompilationRejectsUnsafePackages(t *testing.T) {
 			root := t.TempDir()
 			path := writeDefinitionBundle(t, root, "prompt\n")
 			test.edit(t, root)
-			if _, err := definitions.Load(path); err == nil {
-				t.Fatal(fmt.Sprintf("accepted %s", test.name))
+			if _, err := definitions.Compile(path); err == nil {
+				t.Fatalf("accepted %s", test.name)
 			}
 		})
 	}
 }
 
-func TestDefinitionRetainsVersionServerBinding(t *testing.T) {
-	oldPath := writeDefinitionBundle(t, t.TempDir(), "old prompt\n")
-	newPath := writeDefinitionBundle(t, t.TempDir(), "new prompt\n")
-	for path, name := range map[string]string{oldPath: "legacy", newPath: "current"} {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		data = []byte(strings.ReplaceAll(string(data), `"id":"s"`, fmt.Sprintf(`"id":%q`, name)))
-		data = []byte(strings.ReplaceAll(string(data), `"server":"s"`, fmt.Sprintf(`"server":%q`, name)))
-		if err := os.WriteFile(path, data, 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	old, err := definitions.Load(oldPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+// TestDefinitionRetainsVersionCatalogBinding checks that a retained journey
+// version keeps its own tool selection and class, not the current set's.
+func TestDefinitionRetainsVersionCatalogBinding(t *testing.T) {
+	oldPath := writeBundleConfig(t, t.TempDir(), "old prompt\n", "legacy_lookup", "read_only")
+	newPath := writeBundleConfig(t, t.TempDir(), "new prompt\n", "current_lookup", "")
+	old := compileSet(t, oldPath)
 	oldJourney, _ := old.Journey("planner")
-	registry, err := definitions.Load(newPath, oldPath)
-	if err != nil {
-		t.Fatal(err)
+	registry := compileSet(t, newPath, oldPath)
+	retained, _, ok := registry.Pinned(oldJourney.Digest)
+	if !ok || !registry.HasDigest(oldJourney.Digest) || len(retained.Tools) != 1 || retained.Tools[0].Ops[0] != "legacy_lookup" || retained.Tools[0].Class != definitions.ClassReadOnly {
+		t.Fatalf("retained binding = %#v, %v", retained.Tools, ok)
 	}
-	server, ok := registry.ServerFor(oldJourney.Digest)
-	if !ok || server.ID != "legacy" || !registry.HasDigest(oldJourney.Digest) {
-		t.Fatalf("retained binding = %#v, %v", server, ok)
+	current, _ := registry.Journey("planner")
+	if current.Tools[0].Ops[0] != "current_lookup" || current.Tools[0].Class != "" {
+		t.Fatalf("current tools = %#v", current.Tools)
+	}
+	pinnedCurrent, _, ok := registry.Pinned(current.Digest)
+	if !ok || pinnedCurrent.Tools[0].Ops[0] != "current_lookup" {
+		t.Fatalf("current pinned = %#v, %v", pinnedCurrent.Tools, ok)
 	}
 }
 
@@ -388,30 +393,17 @@ func TestDefinitionRejectsAggregateSkillLimits(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(root, "skills", "planner", "SKILL.md"), []byte("---\nname: planner\ndescription: Plan\n---\nbody\n"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			files := make([]string, test.files)
-			for i := range files {
-				files[i] = fmt.Sprintf("file-%04d.txt", i)
-				if err := os.WriteFile(filepath.Join(root, "skills", "planner", files[i]), []byte(test.body), 0600); err != nil {
+			for i := 0; i < test.files; i++ {
+				if err := os.WriteFile(filepath.Join(root, "skills", "planner", fmt.Sprintf("file-%04d.txt", i)), []byte(test.body), 0600); err != nil {
 					t.Fatal(err)
 				}
 			}
-			config, err := json.Marshal(struct {
-				MCPServers    []definitions.MCPServer        `json:"mcp_servers"`
-				SkillPackages []definitions.SkillDeclaration `json:"skill_packages"`
-				Journeys      []definitions.Journey          `json:"journeys"`
-			}{
-				MCPServers:    []definitions.MCPServer{{ID: "s", Tools: []string{"lookup"}}},
-				SkillPackages: []definitions.SkillDeclaration{{Name: "planner", Root: "skills/planner", SupportingFiles: files, AllowSupportingFiles: true}},
-				Journeys:      []definitions.Journey{{ID: "planner", Description: "Plan", SystemPrompt: "prompt.md", MCP: definitions.MCPBinding{Server: "s", Tools: []string{"lookup"}}, SkillNames: []string{"planner"}}},
-			})
-			if err != nil {
+			config := "catalog:\n  operation_meta_key: operation_key\njourneys:\n  - id: planner\n    skill: skills/planner\n    system_prompt: prompt.md\n    tools:\n      - op: lookup\n"
+			path := filepath.Join(root, "journeys.yaml")
+			if err := os.WriteFile(path, []byte(config), 0600); err != nil {
 				t.Fatal(err)
 			}
-			path := filepath.Join(root, "journeys.json")
-			if err := os.WriteFile(path, config, 0600); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := definitions.Load(path); err == nil {
+			if _, err := definitions.Compile(path); err == nil {
 				t.Fatal("aggregate skill limit accepted")
 			}
 		})

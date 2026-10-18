@@ -16,7 +16,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/microsoft/agent-framework-go/message"
 
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
@@ -133,7 +133,7 @@ func TestCompleteSanitizesAuthAndHonorsCancellation(t *testing.T) {
 	defer server.Close()
 
 	_, err := newAdapter(t, server).Complete(t.Context(), runtime.ModelRequest{ProviderMessages: []*message.Message{message.NewText("secret prompt")}})
-	if !errors.Is(err, platformmcp.ErrAuthRequired) || strings.Contains(err.Error(), secret) {
+	if !errors.Is(err, catalog.ErrAuthRequired) || strings.Contains(err.Error(), secret) {
 		t.Fatalf("auth error = %v", err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())

@@ -46,6 +46,8 @@ type Event struct {
 	Type, RunID, CallID, ToolName, Answer string
 	CommunicationID                       string
 	Reason                                string
+	// Detail is an optional JSON object; empty is stored as NULL.
+	Detail json.RawMessage
 }
 type CommandOutcome struct {
 	CommunicationID, State, Reason string
@@ -66,6 +68,8 @@ type Run struct {
 	// Scope and server info recorded by the owner; empty/nil when unrecorded.
 	ProductVersion, EndpointID string
 	Settings, ServerInfo       json.RawMessage
+	// CatalogDigest is the catalog snapshot the run used; empty when unrecorded.
+	CatalogDigest string
 }
 
 type Snapshot struct {
@@ -93,6 +97,10 @@ func appendEvent(ctx context.Context, tx pgx.Tx, thread string, e Event) error {
 	if err := tx.QueryRow(ctx, "UPDATE agent_conversations SET sequence=sequence+1 WHERE id=$1 RETURNING sequence", thread).Scan(&sequence); err != nil {
 		return err
 	}
-	_, err := tx.Exec(ctx, "INSERT INTO agent_events(thread_id,sequence,run_id,kind,call_id,tool_name,answer,communication_id,reason) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)", thread, sequence, e.RunID, e.Type, e.CallID, e.ToolName, e.Answer, e.CommunicationID, e.Reason)
+	var detail []byte // nil is NULL
+	if len(e.Detail) > 0 {
+		detail = e.Detail
+	}
+	_, err := tx.Exec(ctx, "INSERT INTO agent_events(thread_id,sequence,run_id,kind,call_id,tool_name,answer,communication_id,reason,detail) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)", thread, sequence, e.RunID, e.Type, e.CallID, e.ToolName, e.Answer, e.CommunicationID, e.Reason, detail)
 	return err
 }

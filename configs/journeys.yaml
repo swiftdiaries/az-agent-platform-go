@@ -1,42 +1,21 @@
-{
-  "mcp_servers": [
-    {
-      "id": "java-monolith",
-      "call_id_header": "X-Platform-Call-ID",
-      "tools": ["lookup_destination", "lookup_shift", "request_shift_swap"],
-      "policies": {
-        "lookup_destination": {"class":"read_only"},
-        "lookup_shift": {"class":"read_only"},
-        "request_shift_swap": {"class":"effectful"}
-      }
-    }
-  ],
-  "skill_packages": [
-    {"name":"planner", "root":"skills/planner"},
-    {"name":"shift-swap", "root":"skills/shift-swap"}
-  ],
-  "journeys": [
-    {
-      "id": "vacation-planner",
-      "description": "Plan a vacation using the configured read-only destination lookup",
-      "routing": {"default":true},
-      "system_prompt": "prompts/planner.md",
-      "mcp": {
-        "server": "java-monolith",
-        "tools": ["lookup_destination"]
-      },
-      "skills": ["planner"]
-    },
-    {
-      "id": "shift-swap",
-      "description": "Review available work shifts and request an explicit swap",
-      "routing": {"keywords":["shift", "swap"], "priority":10},
-      "system_prompt": "prompts/shift-swap.md",
-      "mcp": {
-        "server": "java-monolith",
-        "tools": ["lookup_shift", "request_shift_swap"]
-      },
-      "skills": ["shift-swap"]
-    }
-  ]
-}
+# Journey definitions (strict YAML; see docs/design.md "Journey definition").
+# Operation keys and the _meta key name are integration inputs agreed with the Java team.
+catalog:
+  operation_meta_key: operation_key
+  call_id_header: X-Platform-Call-ID
+journeys:
+  - id: vacation-planner
+    skill: skills/planner
+    system_prompt: prompts/planner.md
+    routing: {default: true}
+    tools:
+      - op: lookup_destination
+        class: read_only
+  - id: shift-swap
+    skill: skills/shift-swap
+    system_prompt: prompts/shift-swap.md
+    routing: {keywords: [shift, swap], priority: 10}
+    tools:
+      - op: lookup_shift
+        class: read_only
+      - op: request_shift_swap
