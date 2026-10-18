@@ -1,6 +1,6 @@
 # Conversation-Agent Platform Design
 
-Status: **approved design (single conversation agent, operation-key tool selection, catalog snapshots, product-version axis, 2026-10-17/18), plus the settings and cost seams (2026-10-18).** This document describes the end state of `github.com/swiftdiaries/az-agent-platform-go`. How the existing code gets there is in [migration.md](migration.md). Domain terms are defined in [CONTEXT.md](../CONTEXT.md).
+Status: **approved design (single conversation agent, operation-key tool selection, catalog snapshots, product-version axis, 2026-10-17/18), plus the settings and cost seams (2026-10-18), plus the arena-review amendments M4, M5, M6, M7, M9, M14 and M15 (2026-10-18; scheduled as H6b in migration.md).** This document describes the end state of `github.com/swiftdiaries/az-agent-platform-go`. How the existing code gets there is in [migration.md](migration.md). Domain terms are defined in [CONTEXT.md](../CONTEXT.md).
 
 The earlier hub-and-spoke design under `docs/superpowers/` is historical and superseded.
 
@@ -51,6 +51,8 @@ The steering requirement does **not** promise cancellation of a running model ca
 ### Definitions
 
 - Journey definitions are versioned files compiled at startup into a **definition set**, identified by a digest. A conversation pins one set digest; new conversations use the current one. The `agent_definition_current` pointer is a single row.
+- **Re-pin when idle** (M6). At run start, a conversation that is idle (no pending interaction, not a reply continuation, no unresolved operation) is re-pinned to the current set in the same transaction as the pin read, and a `definition_changed` event (old and new digest) is appended. A conversation that is not idle keeps its pin, because approval bindings include the set digest. Readiness and retention therefore need only the current set plus sets referenced by open waits or unresolved operations (see [Rollout](#journey-definition)).
+  - Alternative considered: permanent pins with retained configs forever. Retention grows per deploy, fixes never reach old threads, and a removed schema key makes an old config fail strict decoding, so pods never become Ready.
 - The set identifies each journey's instructions, tool selector and policy overlay. It does not identify the tools a given user can reach (those come from the user's catalog snapshot at that user's product version), and it does not freeze behaviour behind an external model or MCP server.
 - Journey instructions are immutable `SKILL.md` packages: metadata is available for selection, and instructions and configured supporting files load on demand. Executable actions are MCP tools, never skill scripts. Runtime skill installation, arbitrary file access and shell execution are outside this contract.
 - Definition sets are immutable after startup. There is no in-process activation API or hot reload.
@@ -64,10 +66,10 @@ The steering requirement does **not** promise cancellation of a running model ca
 
 ### Tools, catalogs and versions
 
-- **Tools are selected by `_meta` operation key, never by name.** Java owns the keys, tags and annotations. The platform owns the selectors and a policy overlay that can only narrow. The model sees stable aliases.
+- **Tools are selected by `_meta` operation key, never by name.** Java owns the keys, tags and annotations. The platform owns the selectors and a policy overlay that can only narrow. The model sees stable aliases, one per op selector; a selector with alternatives declares its alias (see [Aliases](#aliases)).
 - **Catalog snapshots** are raw paginated `tools/list` descriptors captured at the first message. They are immutable, addressed by digest, stored per principal, and each conversation pins one. They are revalidated at run start and are never authorization.
 - **Product versions.** A tenant directory maps tenant to product version to endpoint ID, and the endpoint is allowlisted before any credential is sent. A support window and per-version CI fixtures guard compatibility.
-- **Error encoding.** Business, entitlement and validation rejections become model-visible results. Only `outcome_unknown`, `auth_required` and internal failures are errors.
+- **Error encoding.** Business, entitlement and validation rejections become model-visible results. Only `outcome_unknown`, `auth_required` and internal failures are errors. On `tools/call`, HTTP 401 is `auth_required` and HTTP 403 is the entitlement result `{"error":"not_permitted"}` (see [Effects](#effects-retry-and-errors)).
 
 ### Human interaction
 
@@ -76,7 +78,7 @@ The steering requirement does **not** promise cancellation of a running model ca
 
 ### Settings and cost
 
-- **Settings** are resolved from a `settings.Source` port, layered default, tenant, user, with a user value able only to narrow. They are typed, digest-versioned, and resolved once at run start.
+- **Settings** are resolved from a `settings.Source` port, layered default, tenant, user, with a user value able only to narrow: shared resolve code clamps it to the tenant's value. They are typed, digest-versioned, and resolved once at run start.
 - **The active-journey limit is per tenant** (`max_active_journeys`).
 - **Cost enforcement is outside the platform.** The platform owns attribution, typed outcomes and a usage record; the enforcement point owns budgets, counting and pricing.
 
@@ -98,6 +100,8 @@ The original hub-and-spoke spec assumed a Microsoft Agent Framework (MAF) kernel
 | Cross-journey context | Not applicable | Removed: one history per thread has no "selected context" from another journey |
 | Supporting files | On-demand | `load_skill` is removed; `read_skill_resource` stays, scoped to active journeys |
 | Definition config | Not specified | Real YAML, strictly decoded |
+| Context budget | Bounded history or compaction, V1 | Deterministic bounded history per provider request; compaction deferred |
+| Definition pin | Permanent per conversation | Re-pinned to current when the conversation is idle |
 
 ## Approach: product-owned tool loop
 
@@ -116,7 +120,7 @@ Alternatives considered and not taken:
 - **A hub with a persistent session per journey.** It adds a routing model call and a misrouting risk on follow-up turns ("yes, the second option"), copies lossy context across handoffs, serves one specialist at a time (a message spanning two use cases must be split), and was never qualified as two sessions per conversation. The dynamic per-user catalog fits catalog-derived journey availability better than pre-bound journey agents.
 - **MAF run segments with a forked provider middleware.** It was the original plan. The product's own loop makes it unnecessary.
 
-The cost of one conversation agent is a growing transcript and possible instruction bleed between active journeys. These are handled by the active-set cap and a context-budget policy (see [Open questions](#open-questions)).
+The cost of one conversation agent is a growing transcript and possible instruction bleed between active journeys. These are handled by the active-set cap and the [context budget](#context-budget).
 
 ### Reference synthesis
 
@@ -141,7 +145,7 @@ Only the ports below are interfaces with more than one adapter. Everything else 
 | Catalog and Binding | `internal/catalog` | `Open(ctx, scope, cred, owner, set) (*Binding, error)`: directory, allowlist, `initialize`, revalidation, paginated listing, snapshot commit. Pure `Resolve(journey, snapshot, metaKey) Resolution`. Aliases, collision checks, guard, retry, classification |
 | Journeys | `internal/journeys` | Pure logic: active set, LRU, pinning, `Fit`, instruction composition. `internal/skills` keeps `SKILL.md` bundle reading |
 | Transcript | `internal/journal` inbox and `internal/runtime` | `Pending`/`Included`, history. Regression-guarded |
-| Kernel | `internal/runtime` | `runHarness`, per-round inner agent, dispatcher, `activate_journey`, `request_user_input`, `read_skill_resource` |
+| Kernel | `internal/runtime` | `runHarness`, per-round inner agent, dispatcher, `activate_journey`, `request_user_input`, `read_skill_resource`, the per-request history budget |
 | Settings | `internal/settings` | `Source` port: static file, mutable (tests); an API adapter is left room for |
 | Cost | `internal/cost` | `Gate` port: `Open`, `Headers`, `Scripted`; `Attribution`, `Decision`, `Access`, `Usage` |
 | Credential | `internal/credential` | Opaque, self-redacting `Credential`. A leaf package, so the catalog can import it |
@@ -228,11 +232,11 @@ Provider messages, MCP sessions, catalog descriptors and dynamic tool names stay
 
 | State | Purpose | Authority | Recovery claim |
 |---|---|---|---|
-| Durable conversation | User messages, visible answers, history, active set, accepted steering, run status, recorded tool outcomes | PostgreSQL journal on the conversation row; Chat renders a projection | Return to an idle thread from any replica |
+| Durable conversation | User messages, visible answers, history (full), active set (in recency order), definition-set pin, accepted steering, run status, recorded tool outcomes | PostgreSQL journal on the conversation row; Chat renders a projection | Return to an idle thread from any replica; an idle thread re-pins to the current set at its next run start |
 | Catalog snapshot | The user's tool descriptors (names, schemas, `_meta`, annotations) at one product version, plus digest and endpoint ID | PostgreSQL; immutable, addressed by digest, per principal, with a per-principal "latest" pointer; nonsecret | Each conversation pins one digest and revalidates at its own run start; never authorization |
 | Settings | Resolved limits and cost profile for one run | Recorded on the run (digest plus applied values) | Reproducible record of what governed the run |
 | Streaming history | Current run snapshot plus ordered domain events after a cursor | Sequenced PostgreSQL events; Chat encodes AG-UI | Live reconnect through any replica |
-| Model context | Base prompt, available-journey metadata, active journey instructions, advertised tools, tool calls and results | Rebuilt by Agent for each provider call | Derived data; never the sole record |
+| Model context | Base prompt, available-journey metadata, active journey instructions, advertised tools, and the history within the budget | Rebuilt by Agent for each provider call | Derived data; never the sole record. The persisted history stays full |
 | Human wait | Pending question or approval, pinned history and call identity, the answer or decision | PostgreSQL journal | Releases the owner; an authorized reply resumes on any replica without replaying completed tools |
 | Usage | Per-model-call token usage with attribution | `agent_usage` rows, fenced writes | Read side for a future cost API |
 
@@ -293,14 +297,29 @@ sequenceDiagram
 
 - At most **N** journeys are active, where N is the tenant's `max_active_journeys` (default 2, allowed 1 to 4). The cap bounds the tools in one request to N times `max_tools`.
 - Activating beyond N evicts the least recently used **unpinned** journey. V1 has no model-facing deactivate tool.
+- **Use is true LRU** (M9). A journey's recency is bumped when it is activated (by the model or an explicit target), when one of its aliases is dispatched (the owning journey from `owningJourney`), and when `read_skill_resource` reads its bundle. A call answered `tool_not_active` or "not executed" bumps nothing. `ActiveSet.Touch(id)` moves the journey to most recent without evicting; the round persists a changed order through the existing fenced active-set write (`SetActiveJourneys`), and `Wait` and `Finish` persist it as before.
+  - Alternative considered: keep least recently *activated* and rename the rule. It evicts the journey in active use while an idle one stays.
 - A journey with a pending approval or an unresolved `outcome_unknown` operation is **pinned** and is never evicted.
 - If all N active journeys are pinned, a further activation is refused, and the refusal is returned to the model as the activation's tool result.
-- A user-level setting may narrow the tenant's limit (for example to 1) but never raise it.
+- A user-level setting may narrow the tenant's limit (for example to 1) but never raise it; a higher user value is clamped to the tenant's.
 - **Lowering a limit mid-conversation:** the next run start evicts unpinned journeys (LRU first) down to the new limit. Pinned journeys are never evicted, and activations are refused until the set is below the limit.
 - The active set persists in `Wait` and `Finish`, so it survives owner changes and restarts.
 - The limit always comes from the run's resolved `Settings`, never from journey configuration.
 
-The `internal/journeys` logic is pure: `ActiveSet.Activate(id, limit, pinned)`, `Fit(limit, pinned)` and `Compose(base, available, active)`.
+The `internal/journeys` logic is pure: `ActiveSet.Activate(id, limit, pinned)`, `Touch(id)`, `Fit(limit, pinned)` and `Compose(base, available, active)`.
+
+### Context budget
+
+V1 bounds the history sent to the provider deterministically (M5). There is no summarisation.
+
+- **Budget.** Per model, from deploy config (`AGENT_PLATFORM_HISTORY_BUDGET`, `model=tokens` pairs). It covers history only; the operator sets it below the model window minus the headroom for instructions and tools (at most N × `max_tools`). Startup fails if the configured model has no budget.
+- **Estimate.** A fixed bytes-per-token estimate over the serialized messages; no tokenizer dependency. It is deterministic, so the same history and budget always yield the same request.
+- **Rule.** Before each provider request, if the estimate exceeds the budget, drop the oldest whole turns until it fits. A turn starts at a user message (including an admitted correction) and runs to the next one, so a function call and its result are never split; results always precede newly admitted user messages (`interactions.go:330`).
+- **Kept regardless:** the latest turn, and any turn holding a call that a pending interaction, the current reply continuation or an unresolved operation references. If the kept turns alone exceed the budget, the request is sent as is and a provider context error ends the run `failed`; the next run can drop that turn because it is no longer latest.
+- **Event.** `history_truncated` with `{turns_dropped, messages_dropped, estimate_before, estimate_after, budget}`, once per request that drops anything. Counts only, never content.
+- **Persisted history stays full.** Only the request is trimmed. A larger budget or a later compaction step can still use the dropped prefix, and the request provenance digest covers what the model actually saw. Reconnect replays sequenced events, not history, so replay is unaffected either way. Row growth is the known cost; bounding storage is deferred with compaction.
+- Instructions are composed per request from the active set, so truncation can never drop them.
+- Alternative considered: summarise or compact old turns. It needs a model call per compaction, a prompt to review and a correctness argument for tool calls; deferred until measured need.
 
 ## Tool catalog and operation keys
 
@@ -317,10 +336,19 @@ At run start, Catalog resolves every journey's selector against the snapshot:
 - A required operation that matches zero tools, or more than one, makes the journey **unavailable** to this user, with a typed reason. It is hidden from the metadata the model sees, so it never fails mid-turn.
 - A resolved set larger than `max_tools` makes the journey unavailable.
 - Name normalization and collision checks run per journey, after filtering. One tenant's oddly named tool cannot disable unrelated journeys.
+- Each resolved tool carries its selector's alias (see [Aliases](#aliases)); Binding routes alias → this tenant's resolved key → remote name.
 
 ### Aliases
 
-The model sees a stable alias derived from the operation key (for example `leave_balance`), never the dynamic name. Binding maps each alias to the user's remote name at call time, using the **remote** name as the server knows it, so names with characters outside `[A-Za-z0-9_.-]` (such as `/`, a space or `:`) are called correctly. Descriptions and input schemas come from the server. This keeps skill text, evals and the provider prompt cache stable across tenants and avoids provider name-length and character limits.
+The model sees a stable alias, never the dynamic name. **The alias belongs to the selector, not to the resolved key** (M4):
+
+- **An op selector with more than one alternative must declare `alias:`**; compile fails without it. `op: [leave.request.v2, leave.request]` with `alias: leave_request` exposes `leave_request` on every tenant, whichever alternative resolves, and keeps it across a version flip and when a newer alternative is prepended.
+- A single-alternative op selector defaults to `AliasFor(its key)`, and may still set `alias:`. A tool matched only by a tag selector takes `AliasFor(its own key)`.
+- `alias:` is allowed only on op selectors. Compile rejects a multi-alternative op selector without one, an invalid or reserved alias, two op selectors in one journey with one alias, and one alias given to different alternative lists in different journeys of a set, so an alias names one selector set-wide.
+- A key bump inside one selector keeps the alias, so history and skill text stay valid. The approval binding covers the operation key, so a decided approval for the old key is still superseded.
+- Alternatives considered: (a) derive the alias from the resolved key: the same selector shows different aliases per tenant and across a flip, and history names an alias that disappears; (b) default to `AliasFor` of the first alternative: stable across tenants, but prepending a newer alternative silently renames the tool for every conversation.
+
+Binding maps each alias to the user's remote name at call time, using the **remote** name as the server knows it, so names with characters outside `[A-Za-z0-9_.-]` (such as `/`, a space or `:`) are called correctly. Descriptions and input schemas come from the server. This keeps skill text, evals and the provider prompt cache stable across tenants and avoids provider name-length and character limits.
 
 ### Catalog snapshots
 
@@ -374,7 +402,7 @@ The MCP server ships in step with the product. Each product version has its own 
 - **Compatibility.** Each journey declares `product_versions` and relies on its required keys. A journey out of range for the tenant is unavailable, through the same fail-closed path as an unresolved selector. The support window is the current version plus the two before it (proposed). CI resolves every journey against a recorded `tools/list` fixture per supported version (`testdata/catalogs/<version>/tools.json`) and fails on unexpected unavailability, ambiguity, collision or `max_tools` overflow.
 - **Upgrade or rollback mid-conversation:**
   - the next run re-lists, re-resolves and records `catalog_changed`;
-  - history stays coherent through the aliases;
+  - history stays coherent through the aliases: a selector keeps its alias when the tenant moves from one alternative to another (`leave.request` to `leave.request.v2`), and the model sees the new key's schema under the same alias;
   - decided approvals become superseded, and clarifications survive;
   - `outcome_unknown` stays unresolved, and reconciliation must not assume the new version's semantics;
   - versions are not assumed to increase.
@@ -409,10 +437,12 @@ journeys:
     product_versions: {min: "2026.2", max_exclusive: "2027.1"}
     tools:
       - op: leave.balance
+        class: read_only                        # class is allowed only on op selectors
       - op: [leave.request.v2, leave.request]   # alternatives in preference order
+        alias: leave_request                    # required: more than one alternative
         approval: required                      # overlay may only narrow
-      - tags: [leave]
-        read_only: true
+      - tags: [leave]                           # no class: tag-only matches are effectful
+        read_only: true                         # hint filter, not a class: keeps readOnlyHint tools
     max_tools: 15
 ```
 
@@ -420,12 +450,12 @@ The vacation label is illustrative. The platform schema has no vacation, shift, 
 
 Startup validation:
 
-- **Rejects** duplicate journey IDs, missing or escaping skill paths (no symlinks), malformed selectors, empty selector lists, unknown policy fields, and invalid product-version ranges.
+- **Rejects** duplicate journey IDs, missing or escaping skill paths (no symlinks), malformed selectors, empty selector lists, unknown policy fields, invalid product-version ranges, `class:` or `alias:` on a tag selector, an op selector with more than one alternative and no `alias:`, and alias conflicts (see [Aliases](#aliases)).
 - **Never validates tool names.** No tenant-independent name exists. Selectors are checked against per-version fixtures in CI instead.
 
 Each journey's instructions are an immutable bundle rooted at a `SKILL.md`. Its frontmatter `name` and `description` are the metadata the model sees. Supporting files load on demand within the bundle only. Where prose must differ by product version, the bundle may contain a version-range overlay file; whole journeys are not forked per version.
 
-**Rollout.** The compiled set is digest-addressed and additive. `AGENT_PLATFORM_RETAINED_CONFIGS` keeps pinned sets loadable. A pod becomes Ready only when it has every database-referenced pinned set plus the current one. The database marks a new set current only after the new replicas are ready. On graceful termination a pod fails readiness, stops new owner claims, and finishes its owned runs within the grace period without handoff. A forced stop leads to lease expiry and an interrupted run, not automatic continuation.
+**Rollout.** The compiled set is digest-addressed and additive. `AGENT_PLATFORM_RETAINED_CONFIGS` keeps loadable the sets that non-idle conversations still need. A pod becomes Ready only when it serves the current set plus every set referenced by an open wait (a pending interaction, or a consumed one whose continuation has not finished) or by the run of an unresolved operation; `ActivateDefinition` checks the same set. Idle conversations pinned to other sets do not count: they re-pin at their next run start. A retained config can be dropped once no such reference names it. The database marks a new set current only after the new replicas are ready. On graceful termination a pod fails readiness, stops new owner claims, and finishes its owned runs within the grace period without handoff. A forced stop leads to lease expiry and an interrupted run, not automatic continuation.
 
 ## Policy classes and approval
 
@@ -440,6 +470,8 @@ The policy overlay assigns each operation a class. The class is authoritative fo
 (`idempotent` was named `deduplicated` in the earlier journal; it is renamed with the catalog migration.)
 
 - **An unclassified operation is `effectful`** (decided 2026-10-18): when the overlay gives an operation no class, it requires approval and is never retried.
+- **`class:` is allowed only on `op:` selectors** (M7). A tag selector carries no class, and compile rejects `class:` on one. A tool matched only by tag selectors is `effectful`. A tool that an op selector names takes that selector's class; a tag match on the same tool adds only its `approval: required`, never a class. So a tool Java later tags into a journey always needs approval and is never retried until a reviewed op selector names it.
+  - Alternative considered: allow `class:` on tags and rely on review. The class would then apply to tools that did not exist when it was reviewed.
 - **MCP annotations never grant `read_only`.** The class comes only from the reviewed overlay. The overlay can only narrow, so `approval: required` can add approval to a read-only operation but nothing can remove it.
 - **The run computes `requires_approval`** from the class and the overlay, and the journal enforces it when an attempt begins: a first attempt that requires approval needs a consumed, matching approval.
 - The operation key, alias and `requires_approval` are stored on each operation row. The remote name is not.
@@ -502,7 +534,9 @@ Every MCP call gets a stable opaque call ID. After a live transport failure wher
 - **Transient MCP failure:** retried only for `read_only` or `idempotent` operations. The Binding, not the model, owns those attempts.
 - **Business rejection:** returned as a small structured result so the model can repair its arguments within a per-turn tool-error budget. Changed arguments are a new proposed action and need a new approval where approval applies.
 - **Ambiguous effectful call:** `outcome_unknown`. The run ends, the operation's journey is **pinned**, and no model re-issue happens. Reconciliation or explicit product policy is required before another related action. V1 keeps TARGET's **thread-level stop**: a later run start is refused while an operation is unresolved. The journey pin is recorded as well, so a later reconcile path can relax the stop to the journey.
-- **Auth failure:** `auth_required`. A call rejected because the user's entitlement changed after the snapshot is an auth or business rejection, never `outcome_unknown`.
+- **Auth failure (401):** credential missing or expired. `auth_required`, and the Binding is marked broken so no later call in the run is sent.
+- **Entitlement rejection (403)** on `tools/call` (M15): the model sees the nil-error result `{"error":"not_permitted"}`. The operation's outcome is `rejected`; it is not retried, it does not mark the Binding broken, and other tools stay callable. A 403 on `initialize` or `tools/list` stays `auth_required`, since there is no call to answer. A call rejected because the user's entitlement changed after the snapshot is one of these two, never `outcome_unknown`.
+  - Alternative considered: both codes `auth_required` (current `catalog/transport.go:62`). Re-authenticating cannot fix a missing entitlement, and one forbidden tool would end the run and block every other tool.
 - **Directory, allowlist, endpoint or settings failure at run start:** `dependency_unavailable`, before any dispatch.
 - **Limit rejection:** `limit_exceeded` (see [Cost seam](#cost-seam)).
 - **Invalid configuration and unexpected internal failure** terminate the run. Chat maps typed outcomes to AG-UI and never exposes raw transport errors, stack traces, credentials or unreviewed Java details. Restricted traces retain an incident/correlation ID.
@@ -514,7 +548,9 @@ Conversation persistence does not recover a process that died mid-tool. Reopenin
 Settings decouple per-tenant and per-user behaviour from code and deployment. The seam is built and tested now; the HTTP/API adapter and an admin API that writes settings are left room for.
 
 - **Port.** `settings.Source` with `Resolve(ctx, Scope{Tenant, Principal}) (Settings, error)`. Adapters: a static strict-YAML file (`AGENT_PLATFORM_SETTINGS`) and a mutable one for tests.
-- **Layering.** Values layer deploy default, then tenant, then user. A user value may only **narrow** the tenant's limits. Bounds are checked.
+- **Layering.** Values layer deploy default, then tenant, then user. A user value may only **narrow** the tenant's limits. Bounds are checked per layer.
+- **Narrowing is enforced at resolve time** (M14), in one shared pure function that every `Source` adapter calls with its three layers: effective limit = min(tenant value, or the deploy default when the tenant sets none; user value). A user value above the tenant's is clamped, not a document error, so lowering a tenant's limit never rejects the whole settings document, and a future API adapter gets the same rule. The recorded settings carry the clamped value.
+  - Alternative considered: reject at `Compile` (current `settings.go:172`). It applies only to the static file, and one tenant change can invalidate every user override.
 - **Typing.** `Settings` is a typed struct with a version digest. Unknown fields are rejected, so each new setting is a code change.
 - **When it applies.** Settings are resolved once at run start (after the tenant directory) and recorded on the run: digest plus applied values. A resolution failure is `dependency_unavailable`, before any dispatch.
 - **Fields:**
@@ -601,7 +637,8 @@ Propagating a trace into Java must be verified against the MCP transport. If tra
 | Variable | Purpose |
 |---|---|
 | `AGENT_PLATFORM_CONFIG` | Current definition set (YAML) |
-| `AGENT_PLATFORM_RETAINED_CONFIGS` | Older sets that conversations still pin |
+| `AGENT_PLATFORM_RETAINED_CONFIGS` | Older sets still referenced by open waits or unresolved operations |
+| `AGENT_PLATFORM_HISTORY_BUDGET` | Per-model history budget in tokens (`model=tokens` pairs) |
 | `AGENT_PLATFORM_CREDENTIAL_HEADERS` | Header names Chat copies into a `Credential` |
 | `AGENT_PLATFORM_TENANT_DIRECTORY` | Static tenant directory (tenant to product version and endpoint ID) |
 | `AGENT_PLATFORM_MCP_ENDPOINTS` | Endpoint allowlist: endpoint ID to URL |
@@ -617,6 +654,7 @@ In scope:
 
 - One conversation agent and one retained history per conversation, at most one active run per conversation, and active journeys activated by explicit target or by the model. No nested agent execution.
 - Journey activation by tool, with a per-tenant limit, LRU eviction and pinning; instructions supplied by the composed system prompt rather than the transcript.
+- A deterministic per-request history budget that drops the oldest whole turns.
 - Operation-key selectors, aliases and policy overlays; per-user catalog snapshots captured at the first message and revalidated per run.
 - Tenant-directory resolution of product version and allowlisted endpoint; several product versions at once within a support window, with per-version fixtures in CI.
 - Tenant and user settings through the settings seam.
@@ -635,11 +673,12 @@ Deferred or out of scope:
 - Automatic continuation after process death mid-model or mid-tool.
 - General workflow graphs, dynamic agent creation and cross-thread messaging.
 - Runtime journey editing or hot reload, long-term memory and semantic retrieval.
+- History summarisation or compaction, and bounding persisted history storage.
 - Building the cost enforcement mechanism, the cost API, the settings API adapter and the admin write API (see [Room left](#room-left-not-built)).
 
 ## Verification
 
-Behaviour is proven by a black-box end-to-end check over real Chat HTTP, three in-process replicas, PostgreSQL 16, controllable MCP endpoints per product version, two tenants with different remote tool names, and a scripted model; the cost path additionally runs the real LiteLLM provider against a scripted enforcement stub. It covers, among others: credential non-leakage, allowlist fail-closed, paginated snapshots and remote-name calls, activation, eviction and pinning under per-tenant limits, steering across replicas, approval supersede on a product-version flip, limit outcomes and usage rows, and `outcome_unknown` handling.
+Behaviour is proven by a black-box end-to-end check over real Chat HTTP, three in-process replicas, PostgreSQL 16, controllable MCP endpoints per product version, two tenants with different remote tool names, and a scripted model; the cost path additionally runs the real LiteLLM provider against a scripted enforcement stub. It covers, among others: credential non-leakage, allowlist fail-closed, paginated snapshots and remote-name calls, activation, eviction and pinning under per-tenant limits, steering across replicas, approval supersede on a product-version flip, limit outcomes and usage rows, alias stability across a versioned key, history truncation, idle definition re-pin, use-based eviction, 403 handling, and `outcome_unknown` handling.
 
 Unit tests cover definition compilation, fail-closed selector resolution, alias mapping, snapshot keying and revalidation, endpoint allowlisting, settings layering and bounds, active-set logic, communication-ID deduplication, monotonic event sequences, admission versus completion, and epoch-fenced transitions. A missing database reports BLOCKED, never a pass. Real Keycloak, Foundry, Java MCP, a cost gateway and Kubernetes stay BLOCKED in [acceptance.md](acceptance.md). The staged plan, ratchet and task cards are in [migration.md](migration.md).
 
@@ -660,7 +699,7 @@ These are inputs from outside the platform, not platform-domain decisions:
 Points where the source spec and the migration plan do not fully settle the end state. The migration plan wins where it speaks; these are recorded rather than decided here.
 
 1. **Default class when the overlay is silent.** Decided 2026-10-18: such an operation is `effectful` (approval required, never retried). MCP annotations never grant `read_only`, so an operation with no reviewed class cannot be `read_only`. See [Policy classes](#policy-classes-and-approval).
-2. **Context-budget policy.** The original spec made a bounded-history or compaction policy a V1 requirement, because all journeys share one transcript. The migration plan does not schedule one. Also open: whether active-journey instructions need re-injection after compaction (they are composed per request, so likely not).
+2. **Context-budget policy.** Decided 2026-10-18: deterministic bounded history per provider request, compaction deferred; scheduled in H6b. See [Context budget](#context-budget). Instructions are composed per request, so they need no re-injection.
 3. **Staleness signals.** The original spec also revalidated on a catalog ETag in `ListToolsResult._meta` and on `notifications/tools/list_changed`. The migration plan revalidates on version, server version, endpoint or TTL only. The TTL value is unspecified, and the ETag depends on a Java input.
 4. **Relaxing the `outcome_unknown` stop.** The original spec lets a later user-started run proceed with the uncertainty surfaced. V1 keeps the thread-level stop; when to relax it to the journey depends on a reconciliation path that Java has not provided.
 5. **Deactivation.** There is no model-facing deactivate tool in V1. Whether a journey unloads at the end of its use case, by a budget or by a tool is open.
