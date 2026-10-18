@@ -75,7 +75,6 @@ func TestModelRecordsRequests(t *testing.T) {
 	req := agentruntime.ModelRequest{
 		Instructions: "be brief",
 		Messages:     []string{"hi"},
-		Context:      []string{"ctx"},
 		OnDispatch:   func(context.Context) error { return nil },
 	}
 	if _, err := m.Complete(context.Background(), req); err != nil {
@@ -88,7 +87,7 @@ func TestModelRecordsRequests(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("len = %d", len(got))
 	}
-	if got[0].Instructions != "be brief" || len(got[0].Messages) != 1 || got[0].Messages[0] != "hi" || got[0].Context[0] != "ctx" {
+	if got[0].Instructions != "be brief" || len(got[0].Messages) != 1 || got[0].Messages[0] != "hi" {
 		t.Fatalf("request 0 = %+v", got[0])
 	}
 	if got[0].OnDispatch != nil {

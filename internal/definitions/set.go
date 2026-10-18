@@ -10,21 +10,21 @@ import (
 )
 
 // Set is an immutable compiled definition set. It serves its current
-// journeys and, after Retain, older journey versions by digest.
+// journeys and, after Retain, older compiled sets by set digest.
 type Set struct {
 	catalog    CatalogConfig
 	digest     string
 	order      []string
 	journeys   map[string]Journey
-	versions   map[string]Journey
-	origin     map[string]*Set // retained digest -> set it was compiled in
+	sets       map[string]*Set // retained set digest -> original compiled set
+	original   *Set            // compiled set a Retain copy was made from; nil if compiled
 	canonical  map[string][]byte
 	skillBytes int
 	skillFiles int
 }
 
-// Retain returns a copy of current that can also serve the journey versions of
-// the retained sets. A digest present with different canonical content is an
+// Retain returns a copy of current that can also serve the retained sets by
+// set digest. A journey digest present with different canonical content is an
 // error, as is exceeding the aggregate skill limits.
 func Retain(current *Set, retained ...*Set) (*Set, error) {
 	if current == nil {
@@ -34,19 +34,16 @@ func Retain(current *Set, retained ...*Set) (*Set, error) {
 		catalog: current.catalog, digest: current.digest,
 		order:      append([]string(nil), current.order...),
 		journeys:   make(map[string]Journey, len(current.journeys)),
-		versions:   make(map[string]Journey, len(current.versions)),
-		origin:     make(map[string]*Set, len(current.origin)),
+		sets:       make(map[string]*Set, len(current.sets)),
+		original:   current.compiled(),
 		canonical:  make(map[string][]byte, len(current.canonical)),
 		skillBytes: current.skillBytes, skillFiles: current.skillFiles,
 	}
 	for id, j := range current.journeys {
 		out.journeys[id] = j
 	}
-	for digest, j := range current.versions {
-		out.versions[digest] = j
-	}
-	for digest, o := range current.origin {
-		out.origin[digest] = o
+	for digest, o := range current.sets {
+		out.sets[digest] = o
 	}
 	for digest, c := range current.canonical {
 		out.canonical[digest] = bytes.Clone(c)
@@ -55,35 +52,65 @@ func Retain(current *Set, retained ...*Set) (*Set, error) {
 		if old == nil {
 			continue
 		}
-		retain := false
-		for digest := range old.versions {
-			if _, exists := out.versions[digest]; !exists {
-				retain = true
-			}
+		contributes := !out.Serves(old.digest)
+		for digest := range old.sets {
+			contributes = contributes || !out.Serves(digest)
 		}
-		if retain && (out.skillBytes > MaxCompiledSkillBytes-old.skillBytes || out.skillFiles > MaxCompiledSkillFiles-old.skillFiles) {
+		if contributes && (out.skillBytes > MaxCompiledSkillBytes-old.skillBytes || out.skillFiles > MaxCompiledSkillFiles-old.skillFiles) {
 			return nil, fmt.Errorf("retained skill bundles exceed aggregate limits")
 		}
-		if retain {
+		if contributes {
 			out.skillBytes += old.skillBytes
 			out.skillFiles += old.skillFiles
 		}
-		for digest, journey := range old.versions {
-			if existing, ok := out.canonical[digest]; ok && !bytes.Equal(existing, old.canonical[digest]) {
-				return nil, fmt.Errorf("definition digest collision %s", digest)
-			}
-			if _, ok := out.versions[digest]; !ok {
-				out.versions[digest] = journey
-				out.canonical[digest] = bytes.Clone(old.canonical[digest])
-				if o, ok := old.origin[digest]; ok {
-					out.origin[digest] = o
-				} else {
-					out.origin[digest] = old
+		for digest, canonical := range old.canonical {
+			if existing, ok := out.canonical[digest]; ok {
+				if !bytes.Equal(existing, canonical) {
+					return nil, fmt.Errorf("definition digest collision %s", digest)
 				}
+				continue
 			}
+			out.canonical[digest] = bytes.Clone(canonical)
+		}
+		for digest, o := range old.sets {
+			if _, ok := out.sets[digest]; !ok && digest != out.digest {
+				out.sets[digest] = o
+			}
+		}
+		if _, ok := out.sets[old.digest]; !ok && old.digest != out.digest {
+			out.sets[old.digest] = old.compiled()
 		}
 	}
 	return out, nil
+}
+
+// compiled returns the originally compiled set a Retain copy was made from, or
+// s itself when s was compiled directly.
+func (s *Set) compiled() *Set {
+	if s.original != nil {
+		return s.original
+	}
+	return s
+}
+
+// Version returns the compiled set with this set digest: s itself for
+// s.Digest(), or a set retained by Retain (the original compiled *Set, also
+// through chained Retain calls).
+func (s *Set) Version(digest string) (*Set, bool) {
+	if s == nil {
+		return nil, false
+	}
+	if digest == s.digest {
+		return s, true
+	}
+	v, ok := s.sets[digest]
+	return v, ok
+}
+
+// Serves reports whether Version(digest) succeeds.
+func (s *Set) Serves(digest string) bool {
+	_, ok := s.Version(digest)
+	return ok
 }
 
 // Digest identifies the catalog configuration and the ordered current journeys.
@@ -141,34 +168,6 @@ func (s *Set) Infer(text string) (Journey, bool) {
 		}
 	}
 	return s.DefaultJourney()
-}
-
-// Pinned returns any current or retained journey version by digest together
-// with the compiled set it belongs to.
-func (s *Set) Pinned(digest string) (Journey, *Set, bool) {
-	if s == nil {
-		return Journey{}, nil, false
-	}
-	j, ok := s.versions[digest]
-	if !ok {
-		return Journey{}, nil, false
-	}
-	if o, ok := s.origin[digest]; ok {
-		return cloneJourney(j), o, true
-	}
-	return cloneJourney(j), s, true
-}
-
-// JourneyIDForDigest returns the journey ID of a current or retained version.
-func (s *Set) JourneyIDForDigest(digest string) (string, bool) {
-	j, ok := s.versions[digest]
-	return j.ID, ok
-}
-
-// HasDigest reports whether the set can serve the journey version.
-func (s *Set) HasDigest(digest string) bool {
-	_, ok := s.versions[digest]
-	return ok
 }
 
 type canonicalJourney struct {

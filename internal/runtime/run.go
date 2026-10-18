@@ -43,7 +43,6 @@ type Handoff struct{ JourneyID, Text string }
 
 type ModelRequest struct {
 	Handoff         Handoff
-	Context         []string
 	History         json.RawMessage
 	PendingCommands []journal.Input
 	Instructions    string
@@ -68,8 +67,8 @@ type ModelRequest struct {
 type SkillMetadata struct{ Name, Description string }
 
 type RequestProvenance struct {
-	Definition, System, Handoff, Catalog, Context, History MaterialProvenance
-	Pending, IncludedInput, ContextInputs, Skills          []MaterialProvenance
+	Definition, System, Handoff, Catalog, History MaterialProvenance
+	Pending, IncludedInput, Skills                []MaterialProvenance
 }
 
 type MaterialProvenance struct{ ID, Digest string }
@@ -190,24 +189,26 @@ func (r *Runner) Ready(ctx context.Context, store *journal.Store) (bool, error) 
 	if r == nil || r.set == nil || store == nil {
 		return false, journal.ErrDefinition
 	}
-	return store.DefinitionsReady(ctx, r.set.JourneyIDForDigest)
+	return store.DefinitionsReady(ctx, r.set.Serves)
 }
 
-// Binding resolves an existing session's pin or the database current pointer for a new one.
+// Binding resolves the conversation's pinned definition set (or the database
+// current pointer for a new one) and routes the request within that set.
 func (r *Runner) Binding(ctx context.Context, in RunInput) (string, string, error) {
-	journey, err := r.route(ctx, in.TargetJourney, in.Text)
+	if r == nil || r.set == nil || in.Store == nil {
+		return "", "", journal.ErrDefinition
+	}
+	digest, err := in.Store.ResolveDefinition(ctx, in.Owner, r.set.Digest(), r.set.Serves)
 	if err != nil {
 		return "", "", err
 	}
-	if in.Store == nil {
+	set, ok := r.set.Version(digest)
+	if !ok {
 		return "", "", journal.ErrDefinition
 	}
-	digest, err := in.Store.ResolveDefinition(ctx, in.Owner, journey.ID, journey.Digest, r.set.JourneyIDForDigest)
+	journey, err := r.route(ctx, set, in.TargetJourney, in.Text)
 	if err != nil {
 		return "", "", err
-	}
-	if !r.set.HasDigest(digest) {
-		return "", "", journal.ErrDefinition
 	}
 	return journey.ID, digest, nil
 }
@@ -216,8 +217,12 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 	if !input.Endpoint.Valid() {
 		return RunOutput{}, fmt.Errorf("%w: no allowlisted endpoint", ErrDependencyUnavailable)
 	}
-	journey, set, ok := r.set.Pinned(input.DefinitionDigest)
-	if !ok || journey.ID != input.TargetJourney {
+	set, ok := r.set.Version(input.DefinitionDigest)
+	if !ok {
+		return RunOutput{}, journal.ErrDefinition
+	}
+	journey, ok := set.Journey(input.TargetJourney)
+	if !ok {
 		return RunOutput{}, journal.ErrDefinition
 	}
 	ctx, span := otel.Tracer("az-agent-platform/runtime").Start(ctx, "journey.run")

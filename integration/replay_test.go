@@ -119,7 +119,7 @@ func TestPersistenceDisconnectAndReplacement(t *testing.T) {
 		t.Fatalf("observation authorization %d", denied.StatusCode)
 	}
 	var persisted string
-	err = pool.QueryRow(context.Background(), `SELECT (SELECT json_agg(c)::text FROM agent_commands c)||(SELECT json_agg(s)::text FROM agent_sessions s)||(SELECT json_agg(e)::text FROM agent_events e)`).Scan(&persisted)
+	err = pool.QueryRow(context.Background(), `SELECT (SELECT json_agg(c)::text FROM agent_commands c)||(SELECT json_agg(v)::text FROM agent_conversations v)||(SELECT json_agg(e)::text FROM agent_events e)`).Scan(&persisted)
 	if err != nil {
 		t.Fatal(err)
 	}

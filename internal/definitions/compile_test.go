@@ -325,19 +325,16 @@ func TestCompileRetain(t *testing.T) {
 	cj, _ := current.Journey("j")
 	oj, _ := old.Journey("j")
 	gj, _ := gone.Journey("other")
-	for _, digest := range []string{cj.Digest, oj.Digest, gj.Digest} {
-		if !retained.HasDigest(digest) {
-			t.Fatalf("HasDigest(%s) = false", digest)
+	for name, digest := range map[string]string{"current": current.Digest(), "old": old.Digest(), "gone": gone.Digest()} {
+		if !retained.Serves(digest) {
+			t.Fatalf("Serves(%s set) = false", name)
 		}
 	}
-	if id, ok := retained.JourneyIDForDigest(oj.Digest); !ok || id != "j" {
-		t.Fatalf("JourneyIDForDigest = %q %v", id, ok)
-	}
-	if id, ok := retained.JourneyIDForDigest(gj.Digest); !ok || id != "other" {
-		t.Fatalf("JourneyIDForDigest = %q %v", id, ok)
-	}
-	if _, ok := retained.JourneyIDForDigest("nope"); ok || retained.HasDigest("nope") {
+	if retained.Serves("nope") {
 		t.Fatal("unknown digest accepted")
+	}
+	if _, ok := retained.Version("nope"); ok {
+		t.Fatal("unknown digest versioned")
 	}
 	if got := retained.Journeys(); len(got) != 1 || got[0].ID != "j" || got[0].Digest != cj.Digest {
 		t.Fatalf("Journeys() must only list current journeys: %+v", got)
@@ -349,34 +346,46 @@ func TestCompileRetain(t *testing.T) {
 		t.Fatal("Retain changed the set digest")
 	}
 
-	pj, owner, ok := retained.Pinned(oj.Digest)
-	if !ok || owner != old || pj.Prompt != "v1 prompt\n" {
-		t.Fatalf("retained Pinned = %q owner=%p want %p ok=%v", pj.Prompt, owner, old, ok)
+	oldSet, ok := retained.Version(old.Digest())
+	if !ok || oldSet != old {
+		t.Fatalf("retained Version = %p want %p ok=%v", oldSet, old, ok)
 	}
-	pj, owner, ok = retained.Pinned(cj.Digest)
-	if !ok || owner != retained || pj.Prompt != "v2 prompt\n" {
-		t.Fatalf("current Pinned owner = %p want %p ok=%v", owner, retained, ok)
+	pj, ok := oldSet.Journey("j")
+	if !ok || pj.Prompt != "v1 prompt\n" || pj.Digest != oj.Digest {
+		t.Fatalf("retained old journey = %q %v", pj.Prompt, ok)
 	}
-	if _, _, ok := retained.Pinned("nope"); ok {
-		t.Fatal("unknown digest pinned")
+	goneSet, ok := retained.Version(gone.Digest())
+	if !ok || goneSet != gone {
+		t.Fatalf("retained gone Version = %p want %p ok=%v", goneSet, gone, ok)
 	}
-	if current.HasDigest(oj.Digest) {
+	if gj2, ok := goneSet.Journey("other"); !ok || gj2.Digest != gj.Digest {
+		t.Fatalf("retained gone journey = %+v %v", gj2, ok)
+	}
+	currentSet, ok := retained.Version(current.Digest())
+	if !ok || currentSet != retained {
+		t.Fatalf("current Version = %p want %p ok=%v", currentSet, retained, ok)
+	}
+	pj, ok = currentSet.Journey("j")
+	if !ok || pj.Prompt != "v2 prompt\n" || pj.Digest != cj.Digest {
+		t.Fatalf("current journey = %q %v", pj.Prompt, ok)
+	}
+	if current.Serves(old.Digest()) {
 		t.Fatal("Retain mutated the current set")
 	}
-	// Retaining a retained copy keeps the original owner.
+	// Retaining a retained copy keeps the original pointer.
 	again, err := Retain(retained, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, owner, _ := again.Pinned(oj.Digest); owner != old {
-		t.Fatal("owner lost across Retain")
+	if v, ok := again.Version(old.Digest()); !ok || v != old {
+		t.Fatal("original set lost across Retain")
 	}
 	chained, err := Retain(current, retained)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, owner, _ := chained.Pinned(oj.Digest); owner != old {
-		t.Fatal("chained retained owner is not the original set")
+	if v, ok := chained.Version(old.Digest()); !ok || v != old {
+		t.Fatal("chained retained set is not the original")
 	}
 	if _, err := Retain(nil); err == nil {
 		t.Fatal("Retain(nil) succeeded")
@@ -389,9 +398,7 @@ func TestCompileRetainCollisionAndLimits(t *testing.T) {
 	oj, _ := old.Journey("j")
 
 	forged := *current
-	forged.versions = map[string]Journey{oj.Digest: oj}
 	forged.canonical = map[string][]byte{oj.Digest: []byte("different")}
-	forged.origin = map[string]*Set{}
 	if _, err := Retain(old, &forged); err == nil || !strings.Contains(err.Error(), "digest collision") {
 		t.Fatalf("collision not detected: %v", err)
 	}

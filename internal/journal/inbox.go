@@ -14,11 +14,7 @@ type Input struct {
 	Payload                       json.RawMessage
 	Materialized                  bool
 }
-type Inbox struct {
-	Commands      []Input
-	Context       []string
-	ContextInputs []Input
-}
+type Inbox struct{ Commands []Input }
 
 // Pending materializes input, but does not claim provider inclusion.
 func (s *Store) Pending(ctx context.Context, o Owner) (Inbox, error) {
@@ -73,51 +69,6 @@ func (s *Store) Pending(ctx context.Context, o Owner) (Inbox, error) {
 		if err := rows.Err(); err != nil {
 			return err
 		}
-		// Selected conversation context: every provider-observed input from the
-		// latest completed turn outside this journey, followed by its final answer.
-		var contextRun, answer string
-		err = tx.QueryRow(ctx, `SELECT r.id,r.answer FROM agent_runs r JOIN agent_events e ON e.thread_id=r.thread_id AND e.run_id=r.id AND e.kind='run.completed' WHERE r.thread_id=$1 AND r.state='completed' AND r.journey_id IS DISTINCT FROM (SELECT journey_id FROM agent_runs WHERE id=$2) ORDER BY e.sequence DESC LIMIT 1`, o.Command.ThreadID, o.Command.RunID).Scan(&contextRun, &answer)
-		if err == pgx.ErrNoRows {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		rows, err = tx.Query(ctx, "SELECT communication_id,payload FROM agent_commands WHERE thread_id=$1 AND execution_run_id=$2 AND included ORDER BY ordinal", o.Command.ThreadID, contextRun)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			var input Input
-			var payload []byte
-			if err := rows.Scan(&input.CommunicationID, &payload); err != nil {
-				rows.Close()
-				return err
-			}
-			var command Command
-			if err := json.Unmarshal(payload, &command); err != nil {
-				rows.Close()
-				return err
-			}
-			if command.Text == "" {
-				continue
-			}
-			input.Text = command.Text
-			input.Payload, err = json.Marshal(command.Text)
-			if err != nil {
-				rows.Close()
-				return err
-			}
-			input.Materialized = true
-			input.Digest = fmt.Sprintf("%x", sha256.Sum256(input.Payload))
-			inbox.Context = append(inbox.Context, input.Text)
-			inbox.ContextInputs = append(inbox.ContextInputs, input)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		inbox.Context = append(inbox.Context, answer)
 		return nil
 	})
 	return inbox, err

@@ -91,7 +91,7 @@ func TestMigration000008(t *testing.T) {
 		t.Fatalf("second Migrate: %v", err)
 	}
 	var count int
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_schema_migrations").Scan(&count); err != nil || count != 8 {
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_schema_migrations").Scan(&count); err != nil || count != len(migrationNames) {
 		t.Fatalf("migrations = %d %v", count, err)
 	}
 	mustExec(t, pool, "UPDATE agent_schema_migrations SET checksum='x' WHERE version=8")

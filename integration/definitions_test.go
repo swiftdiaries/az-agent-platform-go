@@ -88,11 +88,13 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 	newPath := writeDefinitionBundle(t, newRoot, "new prompt\n")
 	oldRegistry := compileSet(t, oldPath)
 	registry := compileSet(t, newPath, oldPath)
-	oldJourney, _ := oldRegistry.Journey("planner")
-	newJourney, _ := registry.Journey("planner")
+	oldDigest, newDigest := oldRegistry.Digest(), registry.Digest()
+	if oldDigest == newDigest {
+		t.Fatal("old and new set digests must differ")
+	}
 	pool := database(t)
 	store := journal.New(pool)
-	if err := store.ActivateDefinition(ctx, "planner", "", oldJourney.Digest, oldRegistry.JourneyIDForDigest); err != nil {
+	if err := store.ActivateDefinition(ctx, "", oldDigest, oldRegistry.Serves); err != nil {
 		t.Fatal(err)
 	}
 
@@ -101,11 +103,11 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	owner := claimForTest(t, store, command, true)
-	resolved, err := store.ResolveDefinition(ctx, owner, "planner", newJourney.Digest, registry.JourneyIDForDigest)
-	if err != nil || resolved != oldJourney.Digest {
+	resolved, err := store.ResolveDefinition(ctx, owner, newDigest, registry.Serves)
+	if err != nil || resolved != oldDigest {
 		t.Fatalf("old current resolution = %q, %v", resolved, err)
 	}
-	if err := store.ActivateDefinition(ctx, "planner", oldJourney.Digest, newJourney.Digest, registry.JourneyIDForDigest); err != nil {
+	if err := store.ActivateDefinition(ctx, oldDigest, newDigest, registry.Serves); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.Start(ctx, owner, "planner", resolved); err != nil {
@@ -120,7 +122,7 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	continuedOwner := claimForTest(t, store, continued, false)
-	if resolved, err = store.ResolveDefinition(ctx, continuedOwner, "planner", newJourney.Digest, registry.JourneyIDForDigest); err != nil || resolved != oldJourney.Digest {
+	if resolved, err = store.ResolveDefinition(ctx, continuedOwner, newDigest, registry.Serves); err != nil || resolved != oldDigest {
 		t.Fatalf("completed session fell forward = %q, %v", resolved, err)
 	}
 	newCommand := journal.Command{ThreadID: "new-thread", RunID: "new-run", CommunicationID: "new-command", Principal: "alice", Text: "plan"}
@@ -128,21 +130,21 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	newOwner := claimForTest(t, store, newCommand, false)
-	if resolved, err = store.ResolveDefinition(ctx, newOwner, "planner", oldJourney.Digest, registry.JourneyIDForDigest); err != nil || resolved != newJourney.Digest {
+	if resolved, err = store.ResolveDefinition(ctx, newOwner, oldDigest, registry.Serves); err != nil || resolved != newDigest {
 		t.Fatalf("new session ignored current = %q, %v", resolved, err)
 	}
-	if err := store.ActivateDefinition(ctx, "planner", oldJourney.Digest, oldJourney.Digest, registry.JourneyIDForDigest); !errors.Is(err, journal.ErrDefinition) {
+	if err := store.ActivateDefinition(ctx, oldDigest, oldDigest, registry.Serves); !errors.Is(err, journal.ErrDefinition) {
 		t.Fatalf("stale activation = %v", err)
 	}
-	if current, err := store.CurrentDefinition(ctx, "planner"); err != nil || current != newJourney.Digest {
+	if current, err := store.CurrentDefinition(ctx); err != nil || current != newDigest {
 		t.Fatalf("failed activation changed current = %q, %v", current, err)
 	}
 
 	candidateOnly := compileSet(t, newPath)
-	if ready, err := store.DefinitionsReady(ctx, candidateOnly.JourneyIDForDigest); err != nil || ready {
+	if ready, err := store.DefinitionsReady(ctx, candidateOnly.Serves); err != nil || ready {
 		t.Fatalf("missing retained bundle readiness = %v, %v", ready, err)
 	}
-	if ready, err := store.DefinitionsReady(ctx, registry.JourneyIDForDigest); err != nil || !ready {
+	if ready, err := store.DefinitionsReady(ctx, registry.Serves); err != nil || !ready {
 		t.Fatalf("complete retained bundle readiness = %v, %v", ready, err)
 	}
 }
@@ -155,49 +157,51 @@ func TestCrossJourneyActivationCannotMutateCurrentOrPin(t *testing.T) {
 	secondJourneyPath := writeTwoJourneyBundle(t, secondJourneyRoot)
 	oldRegistry := compileSet(t, oldPath)
 	secondJourneyRegistry := compileSet(t, secondJourneyPath)
-	registry := compileSet(t, currentPath, oldPath, secondJourneyPath)
-	oldPlanner, _ := oldRegistry.Journey("planner")
-	currentPlanner, _ := registry.Journey("planner")
-	shiftSwap, _ := secondJourneyRegistry.Journey("shift-swap")
+	// This replica retains the old bundle but not the two-journey bundle.
+	registry := compileSet(t, currentPath, oldPath)
+	oldDigest, currentDigest, unservedDigest := oldRegistry.Digest(), registry.Digest(), secondJourneyRegistry.Digest()
+	if registry.Serves(unservedDigest) {
+		t.Fatal("replica unexpectedly serves the two-journey set")
+	}
 	pool := database(t)
 	store := journal.New(pool)
-	if err := store.ActivateDefinition(ctx, "planner", "", oldPlanner.Digest, registry.JourneyIDForDigest); err != nil {
+	if err := store.ActivateDefinition(ctx, "", oldDigest, registry.Serves); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ActivateDefinition(ctx, "planner", oldPlanner.Digest, shiftSwap.Digest, registry.JourneyIDForDigest); !errors.Is(err, journal.ErrDefinition) {
-		t.Fatalf("cross-journey activation = %v", err)
+	if err := store.ActivateDefinition(ctx, oldDigest, unservedDigest, registry.Serves); !errors.Is(err, journal.ErrDefinition) {
+		t.Fatalf("unserved activation = %v", err)
 	}
 	var current string
-	if err := pool.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current WHERE journey_id='planner'").Scan(&current); err != nil || current != oldPlanner.Digest {
-		t.Fatalf("cross-journey activation changed current = %q, %v", current, err)
+	if err := pool.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current").Scan(&current); err != nil || current != oldDigest {
+		t.Fatalf("unserved activation changed current = %q, %v", current, err)
 	}
 	var pins int
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_sessions WHERE journey_id='planner'").Scan(&pins); err != nil || pins != 0 {
-		t.Fatalf("cross-journey activation created pins = %d, %v", pins, err)
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_conversations WHERE definition_digest IS NOT NULL").Scan(&pins); err != nil || pins != 0 {
+		t.Fatalf("unserved activation created pins = %d, %v", pins, err)
 	}
-	if err := store.ActivateDefinition(ctx, "planner", oldPlanner.Digest, currentPlanner.Digest, registry.JourneyIDForDigest); err != nil {
+	if err := store.ActivateDefinition(ctx, oldDigest, currentDigest, registry.Serves); err != nil {
 		t.Fatalf("retained activation = %v", err)
 	}
-	if err := pool.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current WHERE journey_id='planner'").Scan(&current); err != nil || current != currentPlanner.Digest {
+	if err := pool.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current").Scan(&current); err != nil || current != currentDigest {
 		t.Fatalf("retained activation current = %q, %v", current, err)
 	}
 
-	if _, err := pool.Exec(ctx, "UPDATE agent_definition_current SET definition_digest=$1 WHERE journey_id='planner'", shiftSwap.Digest); err != nil {
+	if _, err := pool.Exec(ctx, "UPDATE agent_definition_current SET definition_digest=$1", unservedDigest); err != nil {
 		t.Fatal(err)
 	}
-	if ready, err := store.DefinitionsReady(ctx, registry.JourneyIDForDigest); err != nil || ready {
-		t.Fatalf("mismatched current readiness = %v, %v", ready, err)
+	if ready, err := store.DefinitionsReady(ctx, registry.Serves); err != nil || ready {
+		t.Fatalf("unserved current readiness = %v, %v", ready, err)
 	}
 	command := journal.Command{ThreadID: "mismatched-current", RunID: "mismatched-current", CommunicationID: "mismatched-current", Principal: "alice", Text: "plan"}
 	if _, _, err := store.Admit(ctx, command); err != nil {
 		t.Fatal(err)
 	}
 	owner := claimForTest(t, store, command, false)
-	if _, err := store.ResolveDefinition(ctx, owner, "planner", currentPlanner.Digest, registry.JourneyIDForDigest); !errors.Is(err, journal.ErrDefinition) {
-		t.Fatalf("mismatched current resolution = %v", err)
+	if _, err := store.ResolveDefinition(ctx, owner, currentDigest, registry.Serves); !errors.Is(err, journal.ErrDefinition) {
+		t.Fatalf("unserved current resolution = %v", err)
 	}
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_sessions WHERE thread_id=$1", command.ThreadID).Scan(&pins); err != nil || pins != 0 {
-		t.Fatalf("mismatched current created pin = %d, %v", pins, err)
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_conversations WHERE id=$1 AND definition_digest IS NOT NULL", command.ThreadID).Scan(&pins); err != nil || pins != 0 {
+		t.Fatalf("unserved current created pin = %d, %v", pins, err)
 	}
 }
 
@@ -257,7 +261,7 @@ func TestResolveDefinitionRejectsOwnerExpiredWhileWaitingForRollout(t *testing.T
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := store.ResolveDefinition(context.Background(), owner, "planner", strings.Repeat("a", 64), func(string) (string, bool) { return "planner", true })
+		_, err := store.ResolveDefinition(context.Background(), owner, strings.Repeat("a", 64), func(string) bool { return true })
 		done <- err
 	}()
 	waitDatabase(t, pool, "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted)")
@@ -273,9 +277,9 @@ func TestResolveDefinitionRejectsOwnerExpiredWhileWaitingForRollout(t *testing.T
 	if err := <-done; !errors.Is(err, journal.ErrOwnership) {
 		t.Fatalf("stale definition pin = %v", err)
 	}
-	var sessions int
-	if err := pool.QueryRow(t.Context(), "SELECT count(*) FROM agent_sessions WHERE thread_id=$1", command.ThreadID).Scan(&sessions); err != nil || sessions != 0 {
-		t.Fatalf("stale owner inserted %d sessions: %v", sessions, err)
+	var pinned int
+	if err := pool.QueryRow(t.Context(), "SELECT count(*) FROM agent_conversations WHERE id=$1 AND definition_digest IS NOT NULL", command.ThreadID).Scan(&pinned); err != nil || pinned != 0 {
+		t.Fatalf("stale owner pinned %d conversations: %v", pinned, err)
 	}
 }
 
@@ -290,11 +294,18 @@ func TestDefinitionCompilationIsImmutableAndContentAddressed(t *testing.T) {
 	if first.Digest == "" || first.Digest != second.Digest {
 		t.Fatalf("root-dependent digest: %q != %q", first.Digest, second.Digest)
 	}
+	if old.Digest() == "" || old.Digest() != copyRegistry.Digest() {
+		t.Fatalf("root-dependent set digest: %q != %q", old.Digest(), copyRegistry.Digest())
+	}
 
 	first.Tools[0].Ops[0] = "mutated"
 	first.Tools[0].Class = definitions.ClassEffectful
 	first.Skills[0].Instructions.Data[0] = 'X'
-	again, _, ok := old.Pinned(second.Digest)
+	pinnedSet, ok := old.Version(old.Digest())
+	if !ok {
+		t.Fatal("compiled set does not serve its own digest")
+	}
+	again, ok := pinnedSet.Journey("planner")
 	if !ok || again.Tools[0].Ops[0] != "lookup" || again.Tools[0].Class != definitions.ClassReadOnly || string(again.Skills[0].Instructions.Data) != "---\nname: planner\ndescription: Plan a trip\n---\nUse the destination tool.\n" {
 		t.Fatalf("caller mutation changed compiled definition: %#v", again)
 	}
@@ -303,7 +314,11 @@ func TestDefinitionCompilationIsImmutableAndContentAddressed(t *testing.T) {
 	newPath := writeDefinitionBundle(t, newRoot, "new prompt\n")
 	registry := compileSet(t, newPath, oldPath)
 	current, _ := registry.Journey("planner")
-	retained, _, ok := registry.Pinned(second.Digest)
+	retainedSet, ok := registry.Version(old.Digest())
+	if !ok || !registry.Serves(old.Digest()) || registry.Digest() == old.Digest() {
+		t.Fatalf("old set not retained distinctly: ok=%v", ok)
+	}
+	retained, ok := retainedSet.Journey("planner")
 	if !ok || retained.Prompt != "old prompt\n" || current.Digest == retained.Digest {
 		t.Fatalf("retained versions: current=%#v old=%#v", current, retained)
 	}
@@ -360,15 +375,23 @@ func TestDefinitionRetainsVersionCatalogBinding(t *testing.T) {
 	old := compileSet(t, oldPath)
 	oldJourney, _ := old.Journey("planner")
 	registry := compileSet(t, newPath, oldPath)
-	retained, _, ok := registry.Pinned(oldJourney.Digest)
-	if !ok || !registry.HasDigest(oldJourney.Digest) || len(retained.Tools) != 1 || retained.Tools[0].Ops[0] != "legacy_lookup" || retained.Tools[0].Class != definitions.ClassReadOnly {
+	retainedSet, ok := registry.Version(old.Digest())
+	if !ok || !registry.Serves(old.Digest()) {
+		t.Fatal("old set not retained")
+	}
+	retained, ok := retainedSet.Journey("planner")
+	if !ok || retained.Digest != oldJourney.Digest || len(retained.Tools) != 1 || retained.Tools[0].Ops[0] != "legacy_lookup" || retained.Tools[0].Class != definitions.ClassReadOnly {
 		t.Fatalf("retained binding = %#v, %v", retained.Tools, ok)
 	}
 	current, _ := registry.Journey("planner")
 	if current.Tools[0].Ops[0] != "current_lookup" || current.Tools[0].Class != "" {
 		t.Fatalf("current tools = %#v", current.Tools)
 	}
-	pinnedCurrent, _, ok := registry.Pinned(current.Digest)
+	currentSet, ok := registry.Version(registry.Digest())
+	if !ok || !registry.Serves(registry.Digest()) {
+		t.Fatal("current set not served")
+	}
+	pinnedCurrent, ok := currentSet.Journey("planner")
 	if !ok || pinnedCurrent.Tools[0].Ops[0] != "current_lookup" {
 		t.Fatalf("current pinned = %#v, %v", pinnedCurrent.Tools, ok)
 	}

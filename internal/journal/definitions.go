@@ -6,50 +6,62 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func (s *Store) ResolveDefinition(ctx context.Context, o Owner, journey, bootstrap string, identity func(string) (string, bool)) (string, error) {
-	if len(bootstrap) != 64 || identity == nil || !matchesJourney(identity, journey, bootstrap) {
+// definitionLock serializes conversation pinning/bootstrapping with activation, so
+// activation cannot miss a pin that is being written.
+const definitionLock = "SELECT pg_advisory_xact_lock(789134628)"
+
+// ResolveDefinition returns the conversation's pinned definition set digest. An
+// unpinned conversation (new, or migrated by 000009) is pinned to current; current
+// is bootstrapped to bootstrap when absent. A pinned or current digest that this
+// replica cannot serve is ErrDefinition and nothing is written.
+func (s *Store) ResolveDefinition(ctx context.Context, o Owner, bootstrap string, served func(string) bool) (string, error) {
+	if len(bootstrap) != 64 || served == nil || !served(bootstrap) {
 		return "", ErrDefinition
 	}
 	var digest string
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(789134628)"); err != nil {
+		if _, err := tx.Exec(ctx, definitionLock); err != nil {
 			return err
 		}
 		if err := lockOwner(ctx, tx, o); err != nil {
 			return err
 		}
 		thread := o.Command.ThreadID
-		err := tx.QueryRow(ctx, "SELECT definition_digest FROM agent_sessions WHERE thread_id=$1 AND journey_id=$2", thread, journey).Scan(&digest)
-		if err == nil {
-			if !matchesJourney(identity, journey, digest) {
-				return ErrDefinition
-			}
-			return nil
-		}
-		if err != pgx.ErrNoRows {
+		var pin *string
+		if err := tx.QueryRow(ctx, "SELECT definition_digest FROM agent_conversations WHERE id=$1", thread).Scan(&pin); err != nil {
 			return err
 		}
-		err = tx.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current WHERE journey_id=$1", journey).Scan(&digest)
+		if pin != nil {
+			if !served(*pin) {
+				return ErrDefinition
+			}
+			digest = *pin
+			return nil
+		}
+		err := tx.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current").Scan(&digest)
 		if err == pgx.ErrNoRows {
 			digest = bootstrap
-			if _, err = tx.Exec(ctx, "INSERT INTO agent_definition_current(journey_id,definition_digest) VALUES($1,$2)", journey, digest); err != nil {
+			if _, err = tx.Exec(ctx, "INSERT INTO agent_definition_current(definition_digest) VALUES($1)", digest); err != nil {
 				return err
 			}
 		} else if err != nil {
 			return err
-		}
-		if !matchesJourney(identity, journey, digest) {
+		} else if !served(digest) {
 			return ErrDefinition
 		}
-		_, err = tx.Exec(ctx, "INSERT INTO agent_sessions(thread_id,journey_id,definition_digest) VALUES($1,$2,$3)", thread, journey, digest)
+		_, err = tx.Exec(ctx, "UPDATE agent_conversations SET definition_digest=$2 WHERE id=$1", thread, digest)
 		return err
 	})
-	return digest, err
+	if err != nil {
+		return "", err
+	}
+	return digest, nil
 }
 
-func (s *Store) CurrentDefinition(ctx context.Context, journey string) (string, error) {
+// CurrentDefinition returns the singleton current set digest; ErrDefinition when absent.
+func (s *Store) CurrentDefinition(ctx context.Context) (string, error) {
 	var digest string
-	if err := s.pool.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current WHERE journey_id=$1", journey).Scan(&digest); err != nil {
+	if err := s.pool.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current").Scan(&digest); err != nil {
 		if err == pgx.ErrNoRows {
 			return "", ErrDefinition
 		}
@@ -58,28 +70,28 @@ func (s *Store) CurrentDefinition(ctx context.Context, journey string) (string, 
 	return digest, nil
 }
 
-// ActivateDefinition conditionally advances current after the candidate and every
-// definition retained by a session are available to this replica.
-func (s *Store) ActivateDefinition(ctx context.Context, journey, expected, candidate string, identity func(string) (string, bool)) error {
-	if len(candidate) != 64 || identity == nil || !matchesJourney(identity, journey, candidate) {
+// ActivateDefinition conditionally advances current from expected ("" = absent) to
+// candidate after the candidate, the present current and every conversation pin are
+// served by this replica.
+func (s *Store) ActivateDefinition(ctx context.Context, expected, candidate string, served func(string) bool) error {
+	if len(candidate) != 64 || served == nil || !served(candidate) {
 		return ErrDefinition
 	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		// Serialize with first-session pinning so activation cannot miss a new old pin.
-		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(789134628)"); err != nil {
+		if _, err := tx.Exec(ctx, definitionLock); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, "SELECT DISTINCT journey_id, definition_digest FROM agent_sessions")
+		rows, err := tx.Query(ctx, "SELECT DISTINCT definition_digest FROM agent_conversations WHERE definition_digest IS NOT NULL")
 		if err != nil {
 			return err
 		}
 		for rows.Next() {
-			var retainedJourney, digest string
-			if err := rows.Scan(&retainedJourney, &digest); err != nil {
+			var pin string
+			if err := rows.Scan(&pin); err != nil {
 				rows.Close()
 				return err
 			}
-			if !matchesJourney(identity, retainedJourney, digest) {
+			if !served(pin) {
 				rows.Close()
 				return ErrDefinition
 			}
@@ -88,54 +100,45 @@ func (s *Store) ActivateDefinition(ctx context.Context, journey, expected, candi
 		if err := rows.Err(); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1,0))", journey); err != nil {
-			return err
-		}
 		var current string
-		err = tx.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current WHERE journey_id=$1 FOR UPDATE", journey).Scan(&current)
+		err = tx.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current FOR UPDATE").Scan(&current)
 		if err == pgx.ErrNoRows {
 			if expected != "" {
 				return ErrDefinition
 			}
-			_, err = tx.Exec(ctx, "INSERT INTO agent_definition_current(journey_id,definition_digest) VALUES($1,$2)", journey, candidate)
+			_, err = tx.Exec(ctx, "INSERT INTO agent_definition_current(definition_digest) VALUES($1)", candidate)
 			return err
 		}
 		if err != nil {
 			return err
 		}
-		if !matchesJourney(identity, journey, current) {
+		if !served(current) || current != expected {
 			return ErrDefinition
 		}
-		if current != expected {
-			return ErrDefinition
-		}
-		_, err = tx.Exec(ctx, "UPDATE agent_definition_current SET definition_digest=$2 WHERE journey_id=$1", journey, candidate)
+		_, err = tx.Exec(ctx, "UPDATE agent_definition_current SET definition_digest=$1", candidate)
 		return err
 	})
 }
 
-func (s *Store) DefinitionsReady(ctx context.Context, identity func(string) (string, bool)) (bool, error) {
-	if identity == nil {
+// DefinitionsReady reports whether current (if any) and every distinct non-NULL
+// conversation pin are served. The agent_*_archived tables are never consulted.
+func (s *Store) DefinitionsReady(ctx context.Context, served func(string) bool) (bool, error) {
+	if served == nil {
 		return false, ErrDefinition
 	}
-	rows, err := s.pool.Query(ctx, `SELECT journey_id, definition_digest FROM agent_definition_current UNION SELECT journey_id, definition_digest FROM agent_sessions`)
+	rows, err := s.pool.Query(ctx, `SELECT definition_digest FROM agent_definition_current UNION SELECT definition_digest FROM agent_conversations WHERE definition_digest IS NOT NULL`)
 	if err != nil {
 		return false, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var journey, digest string
-		if err := rows.Scan(&journey, &digest); err != nil {
+		var digest string
+		if err := rows.Scan(&digest); err != nil {
 			return false, err
 		}
-		if !matchesJourney(identity, journey, digest) {
+		if !served(digest) {
 			return false, nil
 		}
 	}
 	return true, rows.Err()
-}
-
-func matchesJourney(identity func(string) (string, bool), journey, digest string) bool {
-	actual, ok := identity(digest)
-	return ok && actual == journey
 }

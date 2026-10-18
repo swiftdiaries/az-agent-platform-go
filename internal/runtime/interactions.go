@@ -87,8 +87,6 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 		output.History, _ = json.Marshal(history)
 	}()
 	var pending []journal.Input
-	var selected []string
-	var selectedInputs []journal.Input
 	var requestHistory json.RawMessage
 	skillSource := platformskills.New(journey)
 	skillCatalog := skillSource.Catalog()
@@ -105,7 +103,6 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 	}
 	inner := agent.New(agent.ProviderConfig{ProviderName: "configured-model", Run: modelRun(ctx, r.model, stableCallID(in.ThreadID, in.RunID), func(ctx context.Context, req *ModelRequest) error {
 		req.Handoff = Handoff{JourneyID: journey.ID, Text: in.Text}
-		req.Context = selected
 		req.PendingCommands = pending
 		req.History = requestHistory
 		req.DefinitionDigest = journey.Digest
@@ -116,7 +113,6 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 			System:     MaterialProvenance{ID: journey.ID + "/system", Digest: digestValue(req.Instructions)},
 			Handoff:    MaterialProvenance{ID: journey.ID, Digest: digestValue(req.Handoff)},
 			Catalog:    MaterialProvenance{ID: journey.ID + "/skills", Digest: digestValue(req.SkillCatalog)},
-			Context:    MaterialProvenance{ID: in.ThreadID + "/selected-context", Digest: digestValue(req.Context)},
 			History:    MaterialProvenance{ID: in.ThreadID + "/" + journey.ID, Digest: digestValue(req.History)},
 		}
 		for _, command := range req.PendingCommands {
@@ -126,9 +122,6 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 			item := MaterialProvenance{ID: command.CommunicationID, Digest: command.Digest}
 			req.Provenance.Pending = append(req.Provenance.Pending, item)
 			req.Provenance.IncludedInput = append(req.Provenance.IncludedInput, item)
-		}
-		for _, input := range selectedInputs {
-			req.Provenance.ContextInputs = append(req.Provenance.ContextInputs, MaterialProvenance{ID: input.CommunicationID, Digest: input.Digest})
 		}
 		for _, material := range req.SkillMaterial {
 			req.Provenance.Skills = append(req.Provenance.Skills, MaterialProvenance{ID: material.Name + "/" + material.Resource, Digest: material.FileDigest})
@@ -171,8 +164,6 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 			return nil, err
 		}
 		pending = inbox.Commands
-		selected = inbox.Context
-		selectedInputs = inbox.ContextInputs
 		requestHistory, err = json.Marshal(history)
 		if err != nil {
 			return nil, err

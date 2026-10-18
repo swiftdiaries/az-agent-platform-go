@@ -172,8 +172,7 @@ func Compile(path string) (*Set, error) {
 	}
 
 	set := &Set{
-		catalog: catalog, journeys: make(map[string]Journey), versions: make(map[string]Journey),
-		origin: make(map[string]*Set), canonical: make(map[string][]byte),
+		catalog: catalog, journeys: make(map[string]Journey), canonical: make(map[string][]byte),
 	}
 	skills := make(map[string]SkillPackage)
 	var digests []string
@@ -192,7 +191,6 @@ func Compile(path string) (*Set, error) {
 		}
 		journey.Digest = hexDigest(canonical)
 		set.journeys[journey.ID] = journey
-		set.versions[journey.Digest] = journey
 		set.canonical[journey.Digest] = canonical
 		set.order = append(set.order, journey.ID)
 		digests = append(digests, journey.Digest)

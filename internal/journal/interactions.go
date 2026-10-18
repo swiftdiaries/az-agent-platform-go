@@ -177,7 +177,7 @@ func (s *Store) Wait(ctx context.Context, o Owner, i Interaction, checkpoint, hi
 		if _, err = tx.Exec(ctx, "INSERT INTO agent_interactions(id,thread_id,run_id,journey_id,definition_digest,kind,artifact,checkpoint,history,expires_at) SELECT $3,thread_id,id,journey_id,definition_digest,$4,$5,$6,$7,$8 FROM agent_runs WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID, i.ID, i.Kind, artifact, checkpoint, history, i.ExpiresAt); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, "UPDATE agent_sessions s SET history=$3 FROM agent_runs r WHERE r.thread_id=$1 AND r.id=$2 AND s.thread_id=r.thread_id AND s.journey_id=r.journey_id", c.ThreadID, c.RunID, history); err != nil {
+		if _, err = tx.Exec(ctx, "UPDATE agent_conversations SET history=$2 WHERE id=$1", c.ThreadID, history); err != nil {
 			return err
 		}
 		if _, err = tx.Exec(ctx, "UPDATE agent_runs SET state='awaiting_input',owner_id='',lease_until=clock_timestamp() WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID); err != nil {
@@ -206,8 +206,7 @@ func expireInteractions(ctx context.Context, tx pgx.Tx, thread string) error {
 	}
 	for _, run := range runs {
 		var artifact, history []byte
-		var journey string
-		if err := tx.QueryRow(ctx, "SELECT artifact,history,journey_id FROM agent_interactions WHERE thread_id=$1 AND run_id=$2 AND state='expired'", thread, run).Scan(&artifact, &history, &journey); err != nil {
+		if err := tx.QueryRow(ctx, "SELECT artifact,history FROM agent_interactions WHERE thread_id=$1 AND run_id=$2 AND state='expired'", thread, run).Scan(&artifact, &history); err != nil {
 			return err
 		}
 		var i Interaction
@@ -220,7 +219,7 @@ func expireInteractions(ctx context.Context, tx pgx.Tx, thread string) error {
 		if err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, "UPDATE agent_sessions SET history=$3 WHERE thread_id=$1 AND journey_id=$2", thread, journey, closed); err != nil {
+		if _, err = tx.Exec(ctx, "UPDATE agent_conversations SET history=$2 WHERE id=$1", thread, closed); err != nil {
 			return err
 		}
 

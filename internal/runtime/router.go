@@ -9,17 +9,17 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 )
 
-func (r *Runner) route(ctx context.Context, target, text string) (definitions.Journey, error) {
+func (r *Runner) route(ctx context.Context, set *definitions.Set, target, text string) (definitions.Journey, error) {
 	_, span := otel.Tracer("az-agent-platform/runtime").Start(ctx, "hub.route")
 	defer span.End()
 	if target != "" {
-		journey, ok := r.set.Journey(target)
+		journey, ok := set.Journey(target)
 		if !ok {
 			return definitions.Journey{}, fmt.Errorf("unknown journey target")
 		}
 		return journey, nil
 	}
-	journey, ok := r.set.Infer(text)
+	journey, ok := set.Infer(text)
 	if !ok {
 		return definitions.Journey{}, fmt.Errorf("no journey matches request")
 	}

@@ -64,8 +64,7 @@ func TestSkillSnapshotsAreSharedAndCallerImmutable(t *testing.T) {
 		t.Fatal("journey compilation copied supporting bodies")
 	}
 
-	digest := set.journeys["journey-000"].Digest
-	copy, _, ok := set.Pinned(digest)
+	copy, ok := set.Journey("journey-000")
 	if !ok {
 		t.Fatal("compiled version is missing")
 	}

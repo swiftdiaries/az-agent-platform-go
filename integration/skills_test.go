@@ -289,18 +289,27 @@ func TestJourneyDefinitionRoutesAndMaterializesContext(t *testing.T) {
 		if i == 0 {
 			wantPending = 2
 		}
-		if request.DefinitionDigest == "" || request.Provenance.Definition.ID != want.journey || request.Provenance.Definition.Digest != request.DefinitionDigest || request.Provenance.System.Digest == "" || request.Provenance.Handoff.Digest == "" || request.Provenance.Catalog.Digest == "" || request.Provenance.Context.Digest == "" || request.Provenance.History.Digest == "" || len(request.Provenance.Pending) != wantPending || request.Provenance.Pending[0].ID == "" || len(request.Provenance.IncludedInput) != wantPending || request.Provenance.IncludedInput[0] != request.Provenance.Pending[0] {
+		if request.DefinitionDigest == "" || request.Provenance.Definition.ID != want.journey || request.Provenance.Definition.Digest != request.DefinitionDigest || request.Provenance.System.Digest == "" || request.Provenance.Handoff.Digest == "" || request.Provenance.Catalog.Digest == "" || request.Provenance.History.Digest == "" || len(request.Provenance.Pending) != wantPending || request.Provenance.Pending[0].ID == "" || len(request.Provenance.IncludedInput) != wantPending || request.Provenance.IncludedInput[0] != request.Provenance.Pending[0] {
 			t.Fatalf("journey %d provenance: %#v", i, request.Provenance)
 		}
 	}
 	if requests[0].DefinitionDigest == requests[1].DefinitionDigest {
 		t.Fatal("journeys share a definition digest")
 	}
-	if !slices.Equal(requests[1].Context, []string{"plan Kyoto", "Kyoto instead", "vacation-planner answer"}) {
-		t.Fatalf("selected prior context = %#v", requests[1].Context)
-	}
-	if got := requests[1].Provenance.ContextInputs; len(got) != 2 || got[0].ID != "vacation" || got[1].ID != "vacation-correction" || got[0].Digest == "" || got[1].Digest == "" {
-		t.Fatalf("selected context provenance = %#v", got)
+	// One history per thread: the shift run receives the vacation run's turns
+	// (user text, steering, answer) in order, then its own user text.
+	next := 0
+	for _, want := range []string{"plan Kyoto", "Kyoto instead", "vacation-planner answer", "swap my Friday shift"} {
+		found := false
+		for ; next < len(requests[1].Messages); next++ {
+			if strings.Contains(requests[1].Messages[next], want) {
+				found, next = true, next+1
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("shift run history lacks %q in order: %#v", want, requests[1].Messages)
+		}
 	}
 	command := journal.Command{ThreadID: "new", RunID: "new", CommunicationID: "new", Principal: "alice", Text: "swap", TargetJourney: "vacation-planner"}
 	if _, _, err := store.Admit(t.Context(), command); err != nil {
@@ -339,7 +348,7 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 	oldJourney, _ := oldRegistry.Journey("planner")
 	newJourney, _ := registry.Journey("planner")
 	store := journal.New(database(t))
-	if err := store.ActivateDefinition(t.Context(), "planner", "", oldJourney.Digest, registry.JourneyIDForDigest); err != nil {
+	if err := store.ActivateDefinition(t.Context(), "", oldRegistry.Digest(), registry.Serves); err != nil {
 		t.Fatal(err)
 	}
 	var requests []agentruntime.ModelRequest
@@ -366,7 +375,7 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 		t.Fatal("missing clarification")
 	}
 	service.Close()
-	if err := store.ActivateDefinition(t.Context(), "planner", oldJourney.Digest, newJourney.Digest, registry.JourneyIDForDigest); err != nil {
+	if err := store.ActivateDefinition(t.Context(), oldRegistry.Digest(), registry.Digest(), registry.Serves); err != nil {
 		t.Fatal(err)
 	}
 

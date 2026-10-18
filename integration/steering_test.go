@@ -360,7 +360,7 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 		t.Fatal("fresh Chat reconnect reexecuted the run")
 	}
 	var durable string
-	if err := pool.QueryRow(ctx, `SELECT jsonb_build_array((SELECT jsonb_agg(c) FROM agent_commands c),(SELECT jsonb_agg(s) FROM agent_sessions s),(SELECT jsonb_agg(r) FROM agent_runs r),(SELECT jsonb_agg(e) FROM agent_events e))::text`).Scan(&durable); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT jsonb_build_array((SELECT jsonb_agg(c) FROM agent_commands c),(SELECT jsonb_agg(to_jsonb(v)) FROM agent_conversations v),(SELECT jsonb_agg(r) FROM agent_runs r),(SELECT jsonb_agg(e) FROM agent_events e))::text`).Scan(&durable); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(durable, "secret") || strings.Contains(durable, "Bearer") {
@@ -426,7 +426,7 @@ func TestSteeringInclusionFailureStopsDispatch(t *testing.T) {
 		t.Fatalf("failed command retried provider: %+v calls %d", retry, calls.Load())
 	}
 	var history string
-	if err := pool.QueryRow(ctx, "SELECT history::text FROM agent_sessions").Scan(&history); err != nil || history != "[]" {
+	if err := pool.QueryRow(ctx, "SELECT history::text FROM agent_conversations WHERE id = $1", thread).Scan(&history); err != nil || history != "[]" {
 		t.Fatalf("failed request history committed %s: %v", history, err)
 	}
 }

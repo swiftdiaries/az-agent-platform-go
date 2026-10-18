@@ -57,7 +57,7 @@ func (s *Store) BeginAttempt(ctx context.Context, o Owner, op Operation, attempt
 					return ErrState
 				}
 			}
-			if _, err := tx.Exec(ctx, "INSERT INTO agent_operations(call_id,thread_id,run_id,alias,operation_key,arguments,binding,policy,requires_approval,outcome) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'dispatching')", op.CallID, c.ThreadID, c.RunID, op.Name, op.OperationKey, op.Arguments, op.Binding, policy, requiresApproval); err != nil {
+			if _, err := tx.Exec(ctx, "INSERT INTO agent_operations(call_id,thread_id,run_id,alias,operation_key,arguments,binding,policy,requires_approval,outcome,journey_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'dispatching',(SELECT journey_id FROM agent_runs WHERE thread_id=$2 AND id=$3))", op.CallID, c.ThreadID, c.RunID, op.Name, op.OperationKey, op.Arguments, op.Binding, policy, requiresApproval); err != nil {
 				return err
 			}
 		} else {

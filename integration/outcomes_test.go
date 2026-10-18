@@ -601,7 +601,7 @@ func TestApprovalFreshCredentialsAndRejectedReplies(t *testing.T) {
 				}
 			}
 			var persisted string
-			if err := pool.QueryRow(t.Context(), "SELECT concat((SELECT jsonb_agg(to_jsonb(c))::text FROM agent_commands c),(SELECT jsonb_agg(to_jsonb(i))::text FROM agent_interactions i),(SELECT jsonb_agg(to_jsonb(s))::text FROM agent_sessions s))").Scan(&persisted); err != nil {
+			if err := pool.QueryRow(t.Context(), "SELECT concat((SELECT jsonb_agg(to_jsonb(c))::text FROM agent_commands c),(SELECT jsonb_agg(to_jsonb(i))::text FROM agent_interactions i),(SELECT jsonb_agg(to_jsonb(v))::text FROM agent_conversations v))").Scan(&persisted); err != nil {
 				t.Fatal(err)
 			}
 			if strings.Contains(persisted, "live-auth") {

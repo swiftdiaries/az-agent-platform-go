@@ -211,7 +211,7 @@ func TestReplyWaitTransactionsAndTTL(t *testing.T) {
 		t.Fatal(state, err)
 	}
 	var history string
-	if err := pool.QueryRow(t.Context(), "SELECT history::text FROM agent_sessions").Scan(&history); err != nil || !strings.Contains(history, "interaction_expired") {
+	if err := pool.QueryRow(t.Context(), "SELECT history::text FROM agent_conversations WHERE id='thread'").Scan(&history); err != nil || !strings.Contains(history, "interaction_expired") {
 		t.Fatal("expired call not closed", err)
 	}
 
@@ -250,7 +250,7 @@ func TestReplyWaitTransactionsAndTTL(t *testing.T) {
 	if err := pool.QueryRow(t.Context(), "SELECT i.state,(SELECT count(*) FROM agent_commands WHERE run_id='reply'),(SELECT count(*) FROM agent_runs WHERE id='reply'),(SELECT count(*) FROM agent_events WHERE kind='interaction.expired') FROM agent_interactions i").Scan(&state, &n, &runs, &events); err != nil || state != "expired" || n != 0 || runs != 0 || events != 1 {
 		t.Fatal(state, n, runs, events, err)
 	}
-	if err := pool.QueryRow(t.Context(), "SELECT history::text FROM agent_sessions").Scan(&history); err != nil || !strings.Contains(history, "interaction_expired") {
+	if err := pool.QueryRow(t.Context(), "SELECT history::text FROM agent_conversations WHERE id='thread'").Scan(&history); err != nil || !strings.Contains(history, "interaction_expired") {
 		t.Fatal("expiry during lock wait did not close history", err)
 	}
 }

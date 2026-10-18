@@ -75,7 +75,7 @@ func TestPersistenceAtomicCompletion(t *testing.T) {
 		err := pool.QueryRow(ctx, `SELECT md5(jsonb_build_array(
  (SELECT jsonb_agg(c ORDER BY id) FROM agent_conversations c),
  (SELECT jsonb_agg(c ORDER BY run_id) FROM agent_commands c),
- (SELECT jsonb_agg(s ORDER BY journey_id) FROM agent_sessions s),
+ (SELECT jsonb_agg(jsonb_build_object('id', c.id, 'history', c.history, 'definition_digest', c.definition_digest) ORDER BY c.id) FROM agent_conversations c),
  (SELECT jsonb_agg(r ORDER BY id) FROM agent_runs r),
  (SELECT jsonb_agg(e ORDER BY sequence) FROM agent_events e))::text)`).Scan(&result)
 		if err != nil {
@@ -110,6 +110,14 @@ func TestPersistenceAtomicCompletion(t *testing.T) {
 	}
 	if err := store.Finish(ctx, owner, journal.RunCompleted, []byte(`[{"role":"assistant"}]`), "answer", "call", "tool"); err != nil {
 		t.Fatal(err)
+	}
+	var committedHistory string
+	var pinned *string
+	if err := pool.QueryRow(ctx, "SELECT history::text, definition_digest FROM agent_conversations WHERE id = 't'").Scan(&committedHistory, &pinned); err != nil {
+		t.Fatal(err)
+	}
+	if committedHistory != `[{"role": "assistant"}]` || pinned == nil || *pinned != digest {
+		t.Fatalf("conversation after completion: history %s pin %v", committedHistory, pinned)
 	}
 	after, _ = store.Snapshot(ctx, "t", "alice")
 	if after.RunState != journal.RunCompleted || after.Answer != "answer" || after.Watermark != 6 {
