@@ -14,6 +14,7 @@ import (
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	"go.opentelemetry.io/otel"
@@ -24,6 +25,8 @@ type handler struct {
 	auth     Authenticator
 	platform *platform.Platform
 	ids      IdentityMap
+
+	credentialHeaders []string
 }
 
 type interactionCall struct {
@@ -47,8 +50,8 @@ func safeInteraction(i *journal.Interaction) *interaction {
 	return &interaction{ID: i.ID, Kind: i.Kind, Questions: i.Questions, Call: interactionCall{CallID: i.Call.CallID, Name: i.Call.Name, Arguments: i.Call.Arguments, Binding: i.Call.Binding}, ExpiresAt: i.ExpiresAt}
 }
 
-func NewHandler(auth Authenticator, service *platform.Platform, pool *pgxpool.Pool) http.Handler {
-	return &handler{auth: auth, platform: service, ids: IdentityMap{pool: pool}}
+func NewHandler(auth Authenticator, service *platform.Platform, pool *pgxpool.Pool, credentialHeaders []string) http.Handler {
+	return &handler{auth: auth, platform: service, ids: IdentityMap{pool: pool}, credentialHeaders: slices.Clone(credentialHeaders)}
 }
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	principal, err := h.auth.Authenticate(r)
@@ -131,9 +134,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer span.End()
 	span.SetAttributes(attribute.String("thread.id", thread), attribute.String("run.id", run))
 	if create {
-		// Submit synchronously selects only the journey's configured MCP header names;
-		// no inbound header map is retained by execution or written to persistence.
-		_, err = h.platform.Submit(ctx, platform.Submission{Command: platform.Command{ThreadID: thread, RunID: run, CommunicationID: communication, Principal: principal, Text: text, TargetJourney: target, InteractionID: reply.InteractionID, ReplyKind: reply.Kind, ReplyJSON: replyJSON}, Headers: r.Header})
+		// Chat copies only the configured credential header names into the
+		// Credential; no inbound header map is retained or persisted.
+		_, err = h.platform.Submit(ctx, platform.Command{ThreadID: thread, RunID: run, CommunicationID: communication, Principal: principal, Text: text, TargetJourney: target, InteractionID: reply.InteractionID, ReplyKind: reply.Kind, ReplyJSON: replyJSON}, credential.FromRequest(r, h.credentialHeaders))
 		if err != nil {
 			commandError(w, err)
 			return

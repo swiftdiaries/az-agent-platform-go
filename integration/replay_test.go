@@ -66,7 +66,7 @@ func TestPersistenceDisconnectAndReplacement(t *testing.T) {
 	service := platform.New(runner, journal.New(pool))
 	t.Cleanup(service.Close)
 	auth := chat.StaticBearerTokens{"token": "alice", "other": "bob"}
-	api := httptest.NewServer(chat.NewHandler(auth, service, pool))
+	api := httptest.NewServer(chat.NewHandler(auth, service, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	body := aguitypes.RunAgentInput{ThreadID: "external-email@example.test", RunID: "external-1", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "remember Kyoto"}}}
 	payload, _ := json.Marshal(body)
@@ -94,7 +94,7 @@ func TestPersistenceDisconnectAndReplacement(t *testing.T) {
 	api.Close()
 	replacement := platform.New(fixtureRunner(t, model), journal.New(pool))
 	t.Cleanup(replacement.Close)
-	api2 := httptest.NewServer(chat.NewHandler(auth, replacement, pool))
+	api2 := httptest.NewServer(chat.NewHandler(auth, replacement, pool, []string{"Authorization", "Cookie"}))
 	defer api2.Close()
 	retry := postAGUI(t, api2.URL, body, "token", "fresh-secret", "")
 	if !strings.Contains(retry.Body, "remembered Kyoto") || calls.Load() != 1 {
@@ -311,7 +311,7 @@ func TestReplayHTTPReconnectCursor(t *testing.T) {
 	}))
 	p := platform.New(runner, journal.New(pool))
 	defer p.Close()
-	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, p, pool))
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, p, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	input := aguitypes.RunAgentInput{ThreadID: "external", RunID: "run", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "hi"}}}
 	first := postAGUI(t, api.URL, input, "token", "", "")

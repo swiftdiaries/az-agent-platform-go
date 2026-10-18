@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 )
 
@@ -33,19 +34,13 @@ type Bound struct {
 	byName  map[string]tool.FuncTool
 }
 
-func (c *Client) Bind(ctx context.Context, server definitions.MCPServer, allowed []string, source http.Header) (*Bound, error) {
+func (c *Client) Bind(ctx context.Context, server definitions.MCPServer, allowed []string, cred credential.Credential) (*Bound, error) {
 	if len(allowed) == 0 {
 		return nil, fmt.Errorf("empty tool allowlist")
 	}
-	forwarded := make(http.Header)
-	for _, name := range server.ForwardHeaders {
-		for _, value := range source.Values(name) {
-			forwarded.Add(name, value)
-		}
-	}
 	httpClient := &http.Client{
 		Transport: &headerTransport{
-			base: http.DefaultTransport, headers: forwarded, callIDHeader: server.CallIDHeader, lifetime: ctx,
+			base: http.DefaultTransport, credential: cred, callIDHeader: server.CallIDHeader, lifetime: ctx,
 		},
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -116,7 +111,7 @@ type callIDKey struct{}
 type headerTransport struct {
 	lifetime     context.Context
 	base         http.RoundTripper
-	headers      http.Header
+	credential   credential.Credential
 	callIDHeader string
 }
 
@@ -129,12 +124,7 @@ func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	release := func() { stop(); cancel() }
 	clone := req.Clone(ctx)
 	clone.Header = req.Header.Clone()
-	for name, values := range t.headers {
-		clone.Header.Del(name)
-		for _, value := range values {
-			clone.Header.Add(name, value)
-		}
-	}
+	t.credential.Apply(clone)
 	if t.callIDHeader != "" {
 		if callID, _ := req.Context().Value(callIDKey{}).(string); callID != "" {
 			clone.Header.Set(t.callIDHeader, callID)

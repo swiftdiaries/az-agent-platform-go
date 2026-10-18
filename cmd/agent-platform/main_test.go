@@ -100,6 +100,28 @@ func TestLoadConfigBuildsExplicitKeycloakMapping(t *testing.T) {
 	}
 }
 
+func TestLoadConfigParsesCredentialHeaders(t *testing.T) {
+	values := validEnvironment()
+	values["AGENT_PLATFORM_CREDENTIAL_HEADERS"] = " cookie, Authorization "
+	loaded, err := loadConfig(missingValue(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"Cookie", "Authorization"}; !reflect.DeepEqual(loaded.credentialHeaders, want) {
+		t.Fatalf("credential headers = %v, want %v", loaded.credentialHeaders, want)
+	}
+	loaded, err = loadConfig(missingValue(validEnvironment()))
+	if err != nil || len(loaded.credentialHeaders) != 0 {
+		t.Fatalf("unset credential headers = %v/%v", loaded.credentialHeaders, err)
+	}
+	for _, bad := range []string{"Host", "a,,b"} {
+		values["AGENT_PLATFORM_CREDENTIAL_HEADERS"] = bad
+		if _, err := loadConfig(missingValue(values)); err == nil {
+			t.Errorf("invalid credential headers %q accepted", bad)
+		}
+	}
+}
+
 func TestLoadConfigRejectsMalformedTelemetrySecretHeaders(t *testing.T) {
 	values := validEnvironment()
 	values["OTEL_EXPORTER_OTLP_HEADERS"] = "not-a-header"

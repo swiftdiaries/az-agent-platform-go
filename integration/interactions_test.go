@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/microsoft/agent-framework-go/message"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
@@ -83,7 +84,7 @@ func TestHITLDurableWaitReply(t *testing.T) {
 	p := platform.New(runner, store)
 	defer p.Close()
 	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "comm", Principal: "alice", Text: "ask"}
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: c}); err != nil {
+	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	s := awaitState(t, p, c.ThreadID, c.RunID, journal.RunAwaitingInput)
@@ -104,7 +105,7 @@ func TestHITLDurableWaitReply(t *testing.T) {
 	steer := c
 	steer.RunID = "steer"
 	steer.CommunicationID = "steer"
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: steer}); !errors.Is(err, journal.ErrBusy) {
+	if _, err := p.Submit(t.Context(), steer, credential.Credential{}); !errors.Is(err, journal.ErrBusy) {
 		t.Fatal("waiting steering must conflict", err)
 	}
 	p.Close()
@@ -113,28 +114,28 @@ func TestHITLDurableWaitReply(t *testing.T) {
 	reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: wait.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
 	bad := reply
 	bad.Principal = "mallory"
-	if _, err := p2.Submit(t.Context(), platform.Submission{Command: bad}); !errors.Is(err, journal.ErrForbidden) {
+	if _, err := p2.Submit(t.Context(), bad, credential.Credential{}); !errors.Is(err, journal.ErrForbidden) {
 		t.Fatal("foreign reply", err)
 	}
 	bad = reply
 	bad.ReplyKind = "approval"
-	if _, err := p2.Submit(t.Context(), platform.Submission{Command: bad}); !errors.Is(err, journal.ErrState) {
+	if _, err := p2.Submit(t.Context(), bad, credential.Credential{}); !errors.Is(err, journal.ErrState) {
 		t.Fatal("wrong kind", err)
 	}
-	if _, err := p2.Submit(t.Context(), platform.Submission{Command: reply}); err != nil {
+	if _, err := p2.Submit(t.Context(), reply, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	completed := awaitState(t, p2, c.ThreadID, reply.RunID, journal.RunCompleted)
 	if completed.Answer != "resumed" {
 		t.Fatal(completed)
 	}
-	if _, err := p2.Submit(t.Context(), platform.Submission{Command: reply}); err != nil {
+	if _, err := p2.Submit(t.Context(), reply, credential.Credential{}); err != nil {
 		t.Fatal("duplicate receipt", err)
 	}
 	bad = reply
 	bad.RunID = "another"
 	bad.CommunicationID = "another"
-	if _, err := p2.Submit(t.Context(), platform.Submission{Command: bad}); !errors.Is(err, journal.ErrConflict) {
+	if _, err := p2.Submit(t.Context(), bad, credential.Credential{}); !errors.Is(err, journal.ErrConflict) {
 		t.Fatal("interaction consumed twice", err)
 	}
 	var n int
@@ -276,7 +277,7 @@ func TestHITLSeparateProcessAfterWaitAndReplyCommit(t *testing.T) {
 			return agentruntime.ModelResponse{ToolCall: questionCall("process-call")}, nil
 		})), store)
 		defer p.Close()
-		if _, err := p.Submit(t.Context(), platform.Submission{Command: platform.Command{ThreadID: "process", RunID: "wait", CommunicationID: "wait", Principal: "alice", Text: "ask"}}); err != nil {
+		if _, err := p.Submit(t.Context(), platform.Command{ThreadID: "process", RunID: "wait", CommunicationID: "wait", Principal: "alice", Text: "ask"}, credential.Credential{}); err != nil {
 			t.Fatal(err)
 		}
 		awaitState(t, p, "process", "wait", journal.RunAwaitingInput)
@@ -334,7 +335,7 @@ func TestHITLSeparateProcessAfterWaitAndReplyCommit(t *testing.T) {
 	})), journal.New(pool))
 	defer p.Close()
 	c := platform.Command{ThreadID: reply.ThreadID, RunID: reply.RunID, CommunicationID: reply.CommunicationID, Principal: reply.Principal, InteractionID: reply.InteractionID, ReplyKind: reply.ReplyKind, ReplyJSON: reply.ReplyJSON}
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: c}); err != nil {
+	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	awaitState(t, p, "process", "reply", journal.RunCompleted)
@@ -382,7 +383,7 @@ func TestReplyChatProjectionAndOutstandingOrdering(t *testing.T) {
 	}))
 	p := platform.New(runner, journal.New(pool))
 	defer p.Close()
-	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, p, pool))
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, p, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	first := postJSONAGUI(t, api.URL, `{"threadId":"external-thread","runId":"external-wait","messages":[{"id":"user","role":"user","content":"ask"}],"tools":[],"context":[],"state":{},"forwardedProps":{}}`, "token", "", "")
 	if first.StatusCode != 200 || !strings.Contains(first.Body, "interaction.requested") {
@@ -447,7 +448,7 @@ func TestHITLCompletedToolNotReplayed(t *testing.T) {
 	})
 	p := platform.New(policyRunner(t, backend.URL, "read_only", model), journal.New(pool))
 	c := platform.Command{ThreadID: "replay", RunID: "replay", CommunicationID: "replay", Principal: "alice", Text: "go"}
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: c}); err != nil {
+	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	s := awaitState(t, p, c.ThreadID, c.RunID, journal.RunAwaitingInput)
@@ -456,7 +457,7 @@ func TestHITLCompletedToolNotReplayed(t *testing.T) {
 	p2 := platform.New(policyRunner(t, backend.URL, "read_only", model), journal.New(pool))
 	defer p2.Close()
 	reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: i.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
-	if _, err := p2.Submit(t.Context(), platform.Submission{Command: reply}); err != nil {
+	if _, err := p2.Submit(t.Context(), reply, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	awaitState(t, p2, c.ThreadID, reply.RunID, journal.RunCompleted)

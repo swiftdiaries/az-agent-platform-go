@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
@@ -137,7 +138,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	pool := database(t)
 	service := platform.New(runner, journal.New(pool))
 	t.Cleanup(service.Close)
-	handler := chat.NewHandler(chat.StaticBearerTokens{"alice-token": "alice", "bob-token": "bob"}, service, pool)
+	handler := chat.NewHandler(chat.StaticBearerTokens{"alice-token": "alice", "bob-token": "bob"}, service, pool, []string{"Authorization", "Cookie"})
 	api := httptest.NewServer(handler)
 	t.Cleanup(api.Close)
 
@@ -356,7 +357,7 @@ func toolNames(tools []agentruntime.ModelTool) []string {
 }
 
 func TestAuthRejectsMissingCredentials(t *testing.T) {
-	handler := chat.NewHandler(chat.StaticBearerTokens{"good": "alice"}, nil, nil)
+	handler := chat.NewHandler(chat.StaticBearerTokens{"good": "alice"}, nil, nil, nil)
 	api := httptest.NewServer(handler)
 	t.Cleanup(api.Close)
 	res := postAGUI(t, api.URL, aguitypes.RunAgentInput{ThreadID: "t", RunID: "r"}, "", "", "")
@@ -383,7 +384,7 @@ func TestToolBindingFailsClosed(t *testing.T) {
 			}
 			endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{Stateless: false}))
 			t.Cleanup(endpoint.Close)
-			_, err := platformmcp.NewClient().Bind(t.Context(), definitions.MCPServer{ID: "s", Endpoint: endpoint.URL}, test.allowed, nil)
+			_, err := platformmcp.NewClient().Bind(t.Context(), definitions.MCPServer{ID: "s", Endpoint: endpoint.URL}, test.allowed, credential.Credential{})
 			if err == nil {
 				t.Fatal("Bind accepted unsafe tool registry")
 			}
@@ -411,8 +412,8 @@ func TestToolBindingDoesNotForwardCredentialsAcrossRedirect(t *testing.T) {
 	headers.Set("Authorization", "Bearer redirect-secret")
 	headers.Set("Cookie", "session=redirect-secret")
 	_, err := platformmcp.NewClient().Bind(t.Context(), definitions.MCPServer{
-		ID: "redirect", Endpoint: redirect.URL, ForwardHeaders: []string{"Authorization", "Cookie"},
-	}, []string{"lookup_destination"}, headers)
+		ID: "redirect", Endpoint: redirect.URL,
+	}, []string{"lookup_destination"}, credential.FromRequest(&http.Request{Header: headers}, []string{"Authorization", "Cookie"}))
 	if err == nil {
 		t.Fatal("Bind followed an MCP redirect")
 	}
@@ -448,13 +449,13 @@ func statefulSessionID(observations []transportObservation, cookie, authorizatio
 
 func TestJourneyConfigFailsClosed(t *testing.T) {
 	cases := map[string]string{
-		"empty tools":       `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[],"tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":[]}}]}`,
-		"missing tools":     `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[],"tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s"}}]}`,
+		"empty tools":       `{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":[]}}]}`,
+		"missing tools":     `{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s"}}]}`,
 		"unknown field":     `{"extra":true,"mcp_servers":[],"journeys":[]}`,
-		"duplicate journey": `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[],"tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}},{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}}]}`,
-		"escaping prompt":   `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[],"tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"../p.md","mcp":{"server":"s","tools":["t"]}}]}`,
-		"missing prompt":    `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[],"tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"missing.md","mcp":{"server":"s","tools":["t"]}}]}`,
-		"undeclared tool":   `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":[],"tools":["registered"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["registred"]}}]}`,
+		"duplicate journey": `{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}},{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["t"]}}]}`,
+		"escaping prompt":   `{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"../p.md","mcp":{"server":"s","tools":["t"]}}]}`,
+		"missing prompt":    `{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["t"]}],"journeys":[{"id":"j","description":"x","system_prompt":"missing.md","mcp":{"server":"s","tools":["t"]}}]}`,
+		"undeclared tool":   `{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["registered"]}],"journeys":[{"id":"j","description":"x","system_prompt":"p.md","mcp":{"server":"s","tools":["registred"]}}]}`,
 	}
 	for name, config := range cases {
 		t.Run(name, func(t *testing.T) {

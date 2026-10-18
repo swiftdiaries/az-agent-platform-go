@@ -17,6 +17,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/provider/foundry"
@@ -33,6 +34,8 @@ const (
 	envPort          = "AGENT_PLATFORM_PORT"
 	envShutdownGrace = "AGENT_PLATFORM_SHUTDOWN_GRACE"
 	envModelProvider = "AZ_AGENT_MODEL_PROVIDER"
+	// envCredentialHeaders optionally names the inbound headers forwarded to MCP.
+	envCredentialHeaders = "AGENT_PLATFORM_CREDENTIAL_HEADERS"
 )
 
 type config struct {
@@ -47,6 +50,7 @@ type config struct {
 	modelProvider     string
 	litellm           litellm.Config
 	telemetry         telemetry.Config
+	credentialHeaders []string
 }
 
 func main() {
@@ -105,6 +109,7 @@ func run(ctx context.Context, lookup func(string) string) error {
 	}
 	app, err := service.New(service.Dependencies{
 		Pool: pool, Registry: registry, Authenticator: authenticator, Model: model,
+		CredentialHeaders: config.credentialHeaders,
 	})
 	if err != nil {
 		return errors.New("service initialization failed")
@@ -214,12 +219,16 @@ func loadConfig(lookup func(string) string) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	credentialHeaders, err := credential.ParseHeaderNames(lookup(envCredentialHeaders))
+	if err != nil {
+		return config{}, errors.New("invalid credential header configuration")
+	}
 	return config{
 		databaseURL: databaseURL, definitionPath: definitionPath,
 		retainedConfigs: splitValues(lookup(envRetained)), port: port, grace: grace, keycloak: keycloak,
 		foundryEndpoint: foundryEndpoint, foundryDeployment: foundryDeployment,
 		modelProvider: modelProvider, litellm: litellmConfig,
-		telemetry: telemetryConfig,
+		telemetry: telemetryConfig, credentialHeaders: credentialHeaders,
 	}, nil
 }
 

@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
@@ -112,7 +113,7 @@ func TestToolCallLostAfterEffectNoRetry(t *testing.T) {
 	p := platform.New(policyRunner(t, backend.URL, "effectful", model), journal.New(pool))
 	defer p.Close()
 	c := platform.Command{ThreadID: "effect-thread", RunID: "effect-run", CommunicationID: "effect-comm", Principal: "alice", Text: "change"}
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: c}); err != nil {
+	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	s := awaitState(t, p, c.ThreadID, c.RunID, journal.RunAwaitingInput)
@@ -126,7 +127,7 @@ func TestToolCallLostAfterEffectNoRetry(t *testing.T) {
 		t.Fatal("missing approval")
 	}
 	reply := platform.Command{ThreadID: c.ThreadID, RunID: "approve", CommunicationID: "approve", Principal: "alice", InteractionID: i.ID, ReplyKind: "approval", ReplyJSON: fmt.Sprintf(`{"decision":"approve","binding":%q}`, i.Call.Binding)}
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: reply}); err != nil {
+	if _, err := p.Submit(t.Context(), reply, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	awaitState(t, p, c.ThreadID, reply.RunID, journal.RunFailed)
@@ -141,7 +142,7 @@ func TestToolCallLostAfterEffectNoRetry(t *testing.T) {
 	later := c
 	later.RunID = "later"
 	later.CommunicationID = "later"
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: later}); err != nil {
+	if _, err := p.Submit(t.Context(), later, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	awaitState(t, p, c.ThreadID, later.RunID, journal.RunFailed)
@@ -272,7 +273,7 @@ func TestToolCallVerifiedRetryStableID(t *testing.T) {
 			p := platform.New(policyRunner(t, backend.URL, class, model), journal.New(pool))
 			defer p.Close()
 			c := platform.Command{ThreadID: "retry-thread", RunID: "retry", CommunicationID: "retry", Principal: "alice", Text: "go"}
-			if _, err := p.Submit(t.Context(), platform.Submission{Command: c}); err != nil {
+			if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 				t.Fatal(err)
 			}
 			run := c.RunID
@@ -283,7 +284,7 @@ func TestToolCallVerifiedRetryStableID(t *testing.T) {
 					t.Fatal("missing approval")
 				}
 				reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: i.ID, ReplyKind: "approval", ReplyJSON: fmt.Sprintf(`{"decision":"approve","binding":%q}`, i.Call.Binding)}
-				if _, err := p.Submit(t.Context(), platform.Submission{Command: reply}); err != nil {
+				if _, err := p.Submit(t.Context(), reply, credential.Credential{}); err != nil {
 					t.Fatal(err)
 				}
 				run = reply.RunID
@@ -320,7 +321,7 @@ func TestToolCallPredispatchPersistenceFailure(t *testing.T) {
 	})), journal.New(pool))
 	defer p.Close()
 	c := platform.Command{ThreadID: "pre", RunID: "pre", CommunicationID: "pre", Principal: "alice", Text: "go"}
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: c}); err != nil {
+	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	awaitState(t, p, c.ThreadID, c.RunID, journal.RunFailed)
@@ -349,7 +350,7 @@ func TestToolCallCompletionPersistenceFailurePublishesUnknownBeforeRunFailure(t 
 	}))
 	p := platform.New(runner, journal.New(pool))
 	defer p.Close()
-	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, p, pool))
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, p, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	response := postJSONAGUI(t, api.URL, `{"threadId":"completion-thread","runId":"completion-run","messages":[{"id":"user","role":"user","content":"go"}],"tools":[],"context":[],"state":{},"forwardedProps":{}}`, "token", "", "")
 	unknownAt := strings.Index(response.Body, "tool.outcome_unknown")
@@ -406,7 +407,7 @@ func TestToolCallZeroOneMultipleAndDelayed(t *testing.T) {
 			p := platform.New(policyRunner(t, backend.URL, "read_only", model), journal.New(pool))
 			defer p.Close()
 			c := platform.Command{ThreadID: "multi", RunID: "multi", CommunicationID: "multi", Principal: "alice", Text: "go"}
-			if _, err := p.Submit(t.Context(), platform.Submission{Command: c}); err != nil {
+			if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 				t.Fatal(err)
 			}
 			<-entered
@@ -451,7 +452,7 @@ func TestApprovalFreshCredentialsAndRejectedReplies(t *testing.T) {
 			})), journal.New(pool))
 			defer p.Close()
 			c := platform.Command{ThreadID: "approval", RunID: "approval", CommunicationID: "approval", Principal: "alice", Text: "change"}
-			if _, err := p.Submit(t.Context(), platform.Submission{Command: c, Headers: http.Header{"Authorization": {"old-live-auth"}}}); err != nil {
+			if _, err := p.Submit(t.Context(), c, liveCredential("old-live-auth")); err != nil {
 				t.Fatal(err)
 			}
 			s := awaitState(t, p, c.ThreadID, c.RunID, journal.RunAwaitingInput)
@@ -462,7 +463,7 @@ func TestApprovalFreshCredentialsAndRejectedReplies(t *testing.T) {
 			reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: i.ID, ReplyKind: "approval"}
 			for _, bad := range []string{`{"decision":"approve","binding":"forged"}`, `{"answers":{"free":{"custom":"approve"}}}`, fmt.Sprintf(`{"decision":"approve","binding":%q,"arguments":{}}`, i.Call.Binding)} {
 				reply.ReplyJSON = bad
-				if _, err := p.Submit(t.Context(), platform.Submission{Command: reply}); !errors.Is(err, journal.ErrState) {
+				if _, err := p.Submit(t.Context(), reply, credential.Credential{}); !errors.Is(err, journal.ErrState) {
 					t.Fatal("invalid approval accepted", err)
 				}
 			}
@@ -471,12 +472,12 @@ func TestApprovalFreshCredentialsAndRejectedReplies(t *testing.T) {
 					t.Fatal(err)
 				}
 				reply.ReplyJSON = fmt.Sprintf(`{"decision":"approve","binding":%q}`, i.Call.Binding)
-				if _, err := p.Submit(t.Context(), platform.Submission{Command: reply}); !errors.Is(err, journal.ErrConflict) {
+				if _, err := p.Submit(t.Context(), reply, credential.Credential{}); !errors.Is(err, journal.ErrConflict) {
 					t.Fatal(err)
 				}
 			} else {
 				reply.ReplyJSON = fmt.Sprintf(`{"decision":%q,"binding":%q}`, decision, i.Call.Binding)
-				if _, err := p.Submit(t.Context(), platform.Submission{Command: reply, Headers: http.Header{"Authorization": {"fresh-live-auth"}}}); err != nil {
+				if _, err := p.Submit(t.Context(), reply, liveCredential("fresh-live-auth")); err != nil {
 					t.Fatal(err)
 				}
 				awaitState(t, p, c.ThreadID, reply.RunID, journal.RunCompleted)
@@ -557,7 +558,7 @@ func TestBusinessErrorChangedActionRequiresNewApproval(t *testing.T) {
 	})), journal.New(pool))
 	defer p.Close()
 	c := platform.Command{ThreadID: "repair", RunID: "repair", CommunicationID: "repair", Principal: "alice", Text: "go"}
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: c}); err != nil {
+	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	s := awaitState(t, p, c.ThreadID, c.RunID, journal.RunAwaitingInput)
@@ -566,7 +567,7 @@ func TestBusinessErrorChangedActionRequiresNewApproval(t *testing.T) {
 		return platform.Command{ThreadID: c.ThreadID, RunID: id, CommunicationID: id, Principal: "alice", InteractionID: wait.ID, ReplyKind: "approval", ReplyJSON: fmt.Sprintf(`{"decision":"approve","binding":%q}`, wait.Call.Binding)}
 	}
 	reply := approve("reply1", i)
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: reply}); err != nil {
+	if _, err := p.Submit(t.Context(), reply, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	s = awaitState(t, p, c.ThreadID, reply.RunID, journal.RunAwaitingInput)
@@ -581,11 +582,11 @@ func TestBusinessErrorChangedActionRequiresNewApproval(t *testing.T) {
 	}
 	bad := approve("reply2", next)
 	bad.ReplyJSON = reply.ReplyJSON
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: bad}); !errors.Is(err, journal.ErrState) {
+	if _, err := p.Submit(t.Context(), bad, credential.Credential{}); !errors.Is(err, journal.ErrState) {
 		t.Fatal("old approval applied to changed arguments", err)
 	}
 	reply = approve("reply2", next)
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: reply}); err != nil {
+	if _, err := p.Submit(t.Context(), reply, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	awaitState(t, p, c.ThreadID, reply.RunID, journal.RunFailed)
@@ -624,7 +625,7 @@ func TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted(t *testing.T) {
 	})), journal.New(ownerPool))
 	defer p.Close()
 	c := platform.Command{ThreadID: "loss", RunID: "loss", CommunicationID: "loss", Principal: "alice", Text: "go"}
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: c}); err != nil {
+	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	<-entered
@@ -665,7 +666,7 @@ func TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted(t *testing.T) {
 		return agentruntime.ModelResponse{}, nil
 	})), journal.New(pool))
 	defer observer.Close()
-	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, observer, pool))
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, observer, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	for _, cursor := range []int64{0, snapshot.Watermark} {
 		req, _ := http.NewRequest(http.MethodGet, api.URL+"?threadId=external-loss-thread&runId=external-loss-run", nil)
@@ -697,7 +698,7 @@ func TestToolCallPartialProviderFailureIsNotVisible(t *testing.T) {
 	})), journal.New(pool))
 	defer p.Close()
 	c := platform.Command{ThreadID: "partial", RunID: "partial", CommunicationID: "partial", Principal: "alice", Text: "go"}
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: c}); err != nil {
+	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	s := awaitState(t, p, c.ThreadID, c.RunID, journal.RunFailed)
@@ -713,4 +714,9 @@ func TestToolCallPartialProviderFailureIsNotVisible(t *testing.T) {
 			t.Fatal("private partial answer emitted")
 		}
 	}
+}
+
+// liveCredential builds the Credential Chat would forward for an Authorization header.
+func liveCredential(authorization string) credential.Credential {
+	return credential.FromRequest(&http.Request{Header: http.Header{"Authorization": {authorization}}}, []string{"Authorization"})
 }

@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
-	"net/http"
 
 	"github.com/microsoft/agent-framework-go/agent"
 	"github.com/microsoft/agent-framework-go/message"
@@ -17,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
@@ -103,7 +103,7 @@ type RunInput struct {
 	Text             string
 	TargetJourney    string
 	DefinitionDigest string
-	Headers          http.Header
+	Credential       credential.Credential
 }
 
 type RunOutput struct {
@@ -165,7 +165,7 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 	if err := input.Store.Check(ctx, input.Owner); err != nil {
 		return RunOutput{}, err
 	}
-	bound, err := r.mcp.Bind(ctx, server, journey.MCP.Tools, input.Headers)
+	bound, err := r.mcp.Bind(ctx, server, journey.MCP.Tools, input.Credential)
 	if err != nil {
 		return RunOutput{}, err
 	}

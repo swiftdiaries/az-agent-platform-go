@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
@@ -377,7 +378,7 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 	})
 	service := platform.New(agentruntime.NewRunner(registry, platformmcp.NewClient(), model), store)
 	command := platform.Command{ThreadID: "retained", RunID: "wait", CommunicationID: "wait", Principal: "alice", Text: "ask", TargetJourney: "planner"}
-	if _, err := service.Submit(t.Context(), platform.Submission{Command: command}); err != nil {
+	if _, err := service.Submit(t.Context(), command, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	waiting := awaitState(t, service, "retained", "wait", journal.RunAwaitingInput)
@@ -398,12 +399,12 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 	replacement := platform.New(agentruntime.NewRunner(registry, platformmcp.NewClient(), model), store)
 	t.Cleanup(replacement.Close)
 	reply := platform.Command{ThreadID: "retained", RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: interaction.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
-	if _, err := replacement.Submit(t.Context(), platform.Submission{Command: reply}); err != nil {
+	if _, err := replacement.Submit(t.Context(), reply, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	awaitState(t, replacement, "retained", "reply", journal.RunCompleted)
 	newCommand := platform.Command{ThreadID: "fresh", RunID: "fresh", CommunicationID: "fresh", Principal: "alice", Text: "plan", TargetJourney: "planner"}
-	if _, err := replacement.Submit(t.Context(), platform.Submission{Command: newCommand}); err != nil {
+	if _, err := replacement.Submit(t.Context(), newCommand, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	awaitState(t, replacement, "fresh", "fresh", journal.RunCompleted)

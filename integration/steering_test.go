@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
@@ -235,7 +236,7 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 	for range 3 {
 		service := platform.New(runner, journal.New(pool))
 		t.Cleanup(service.Close)
-		api := httptest.NewServer(chat.NewHandler(auth, service, pool))
+		api := httptest.NewServer(chat.NewHandler(auth, service, pool, []string{"Authorization", "Cookie"}))
 		defer api.Close()
 		apis = append(apis, api)
 	}
@@ -346,7 +347,7 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 	}
 	freshService := platform.New(runner, journal.New(pool))
 	defer freshService.Close()
-	freshAPI := httptest.NewServer(chat.NewHandler(auth, freshService, pool))
+	freshAPI := httptest.NewServer(chat.NewHandler(auth, freshService, pool, []string{"Authorization", "Cookie"}))
 	defer freshAPI.Close()
 	for _, run := range []string{"run-b", "run-b2"} {
 		data := reconnectChat(t, freshAPI.URL, "external-thread", run, "token")
@@ -380,7 +381,7 @@ func TestSteeringInclusionFailureStopsDispatch(t *testing.T) {
 	}))
 	service := platform.New(runner, journal.New(pool))
 	defer service.Close()
-	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, service, pool))
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, service, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	body := aguitypes.RunAgentInput{ThreadID: "external", RunID: "run", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "hello"}}}
 	response := postAGUI(t, api.URL, body, "token", "", "")
@@ -448,7 +449,7 @@ func TestSteeringFinalDrainUsesLiveOwner(t *testing.T) {
 	b := platform.New(runner, journal.New(pool))
 	defer b.Close()
 	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "initial", Principal: "alice", Text: "initial"}
-	if _, err := a.Submit(ctx, platform.Submission{Command: c}); err != nil {
+	if _, err := a.Submit(ctx, c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -459,7 +460,7 @@ func TestSteeringFinalDrainUsesLiveOwner(t *testing.T) {
 	c.RunID = "late"
 	c.CommunicationID = "late"
 	c.Text = "late correction"
-	if _, err := b.Submit(ctx, platform.Submission{Command: c}); err != nil {
+	if _, err := b.Submit(ctx, c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	close(release)
@@ -512,7 +513,7 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 		}
 	}()
 	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "initial", Principal: "alice", Text: "initial"}
-	if _, err := a.Submit(ctx, platform.Submission{Command: c}); err != nil {
+	if _, err := a.Submit(ctx, c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -524,7 +525,7 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 	c.RunID = "pending"
 	c.CommunicationID = "pending"
 	c.Text = "pending correction"
-	if _, err := b.Submit(ctx, platform.Submission{Command: c}); err != nil {
+	if _, err := b.Submit(ctx, c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `CREATE FUNCTION reject_renewal() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'database owner renewal unavailable'; END $$; CREATE TRIGGER reject_renewal BEFORE UPDATE OF lease_until ON agent_runs FOR EACH ROW EXECUTE FUNCTION reject_renewal()`); err != nil {
@@ -745,9 +746,9 @@ func TestSteeringTerminalCommandCorrelationAcrossReplicas(t *testing.T) {
 			defer owner.Close()
 			peer := platform.New(runner, journal.New(pool))
 			defer peer.Close()
-			a := httptest.NewServer(chat.NewHandler(auth, owner, pool))
+			a := httptest.NewServer(chat.NewHandler(auth, owner, pool, []string{"Authorization", "Cookie"}))
 			defer a.Close()
-			b := httptest.NewServer(chat.NewHandler(auth, peer, pool))
+			b := httptest.NewServer(chat.NewHandler(auth, peer, pool, []string{"Authorization", "Cookie"}))
 			defer b.Close()
 			defer func() {
 				select {
@@ -810,7 +811,7 @@ func TestSteeringTerminalCommandCorrelationAcrossReplicas(t *testing.T) {
 			// New Platform and Chat instances restore only durable identities and outcomes.
 			fresh := platform.New(runner, journal.New(pool))
 			defer fresh.Close()
-			c := httptest.NewServer(chat.NewHandler(auth, fresh, pool))
+			c := httptest.NewServer(chat.NewHandler(auth, fresh, pool, []string{"Authorization", "Cookie"}))
 			defer c.Close()
 			for _, run := range []string{"correction-one", "correction-two"} {
 				data := reconnectChat(t, c.URL, "external-thread", run, "token")

@@ -22,6 +22,10 @@ type Dependencies struct {
 	Registry      *definitions.Registry
 	Authenticator chat.Authenticator
 	Model         agentruntime.Model
+	// CredentialHeaders names the inbound request headers (configured through
+	// AGENT_PLATFORM_CREDENTIAL_HEADERS) that Chat copies into a run's
+	// Credential. Empty means no credential is forwarded.
+	CredentialHeaders []string
 }
 
 type Service struct {
@@ -48,7 +52,7 @@ func New(deps Dependencies) (*Service, error) {
 		}
 		w.WriteHeader(http.StatusOK)
 	})
-	mux.Handle("/", chat.NewHandler(deps.Authenticator, service.platform, deps.Pool))
+	mux.Handle("/", chat.NewHandler(deps.Authenticator, service.platform, deps.Pool, deps.CredentialHeaders))
 	service.handler = mux
 	return service, nil
 }

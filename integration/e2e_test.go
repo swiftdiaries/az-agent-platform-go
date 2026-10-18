@@ -1,8 +1,11 @@
 package integration_test
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
@@ -10,6 +13,10 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/mcptest"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/modeltest"
+	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // stage gates subtest k on the e2eReachedStage progress ratchet.
@@ -128,6 +135,152 @@ func TestE2EConversationAgent(t *testing.T) {
 	t.Run("S1", func(t *testing.T) {
 		stage(t, 1, "H1")
 		// A sentinel credential never appears in any DB text/jsonb column, events, slog output or spans, while MCP still receives it.
+		const (
+			thread        = "e2e-s1"
+			run           = "e2e-s1-run"
+			answer        = "Kyoto is available for your trip"
+			s1Sentinel    = "azap-s1-sentinel-9c41e7"
+			s1DecoyValue  = "azap-s1-decoy-3b82d5"
+			decoyHeader   = "X-Azap-Decoy"
+			sessionCookie = "azap_session="
+		)
+		needles := []string{s1Sentinel, s1DecoyValue}
+
+		// Capture before any replica starts so nothing is missed.
+		slogJSON, slogText := captureSlog(t)
+		recorder := captureSpans(t)
+
+		pool := database(t)
+		endpoint := mcptest.New(t, mcptest.Options{Name: "e2e", Version: "vN"}, mcptest.Catalog{Tools: []mcptest.Tool{
+			{Name: "lookup", OperationKey: "travel.lookup", Result: "Kyoto is available"},
+		}})
+		registry := acceptanceRegistry(t, endpoint.URL(), "read_only")
+		model := modeltest.New(
+			modeltest.Call("lookup", map[string]any{"destination": "Kyoto"}),
+			modeltest.Text(answer),
+		)
+		a, b, c := threeReplicas(t, pool, registry, model)
+
+		// collected is every platform-side response surface that must stay clean.
+		collected := map[string]string{}
+		collectHeaders := func(name string, response *http.Response) {
+			var sb strings.Builder
+			for key, values := range response.Header {
+				fmt.Fprintf(&sb, "%s: %s\n", key, strings.Join(values, ", "))
+			}
+			collected[name+" response headers"] = sb.String()
+		}
+
+		postResponse := acceptancePostWithHeaders(t, a.url, aguitypes.RunAgentInput{
+			ThreadID: thread, RunID: run,
+			Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan a trip to Kyoto"}},
+		}, http.Header{
+			"Cookie":    {sessionCookie + s1Sentinel},
+			decoyHeader: {s1DecoyValue},
+		})
+		collectHeaders("POST on A", postResponse)
+		body := e2eReadBody(t, "POST on A", postResponse)
+		if !strings.Contains(body, answer) || !strings.Contains(body, "RUN_FINISHED") {
+			t.Fatalf("POST on A lacks final answer or RUN_FINISHED: %s", body)
+		}
+		collected["POST on A body"] = body
+
+		for name, replica := range map[string]acceptanceReplica{"B": b, "C": c} {
+			response := acceptanceReconnect(t, replica.url, thread, run)
+			collectHeaders("reconnect on "+name, response)
+			replay := e2eReadBody(t, "reconnect on "+name, response)
+			if !strings.Contains(replay, answer) || !strings.Contains(replay, "RUN_FINISHED") {
+				t.Fatalf("reconnect on %s lacks final answer or RUN_FINISHED: %s", name, replay)
+			}
+			collected["reconnect on "+name+" body"] = replay
+		}
+
+		snapshot, err := journal.New(pool).Snapshot(t.Context(), acceptanceThread(t, pool, thread), "alice")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(snapshot.Runs) != 1 || snapshot.Runs[0].State != journal.RunCompleted {
+			t.Fatalf("durable runs = %#v, want one completed run", snapshot.Runs)
+		}
+
+		// MCP still receives the credential: every JSON-RPC request carries the
+		// Cookie, exactly one tools/call for lookup, and the decoy never arrives.
+		lookups, rpcRequests := 0, 0
+		for _, request := range endpoint.Requests() {
+			if got := request.Header.Get(decoyHeader); got != "" || strings.Contains(fmt.Sprint(request.Header), s1DecoyValue) {
+				t.Fatalf("MCP %s request carried the non-configured decoy header: %v", request.RPCMethod, request.Header)
+			}
+			if request.RPCMethod == "" {
+				continue
+			}
+			rpcRequests++
+			if !strings.Contains(request.Header.Get("Cookie"), s1Sentinel) {
+				t.Errorf("MCP %s request did not carry the Cookie credential; Cookie = %q", request.RPCMethod, request.Header.Get("Cookie"))
+			}
+			if request.RPCMethod == "tools/call" && request.Tool == "lookup" {
+				lookups++
+			}
+		}
+		if rpcRequests == 0 {
+			t.Fatal("MCP endpoint recorded no JSON-RPC requests")
+		}
+		if lookups != 1 {
+			t.Fatalf("MCP tools/call lookup requests = %d, want 1", lookups)
+		}
+
+		// The credential must never reach the model.
+		if got := model.Count(); got != 2 {
+			t.Fatalf("model requests = %d, want 2", got)
+		}
+		for i, request := range model.Requests() {
+			collected[fmt.Sprintf("model request %d (%%+v)", i)] = fmt.Sprintf("%+v", request)
+			request.OnDispatch = nil
+			if encoded, err := json.Marshal(request); err == nil {
+				collected[fmt.Sprintf("model request %d (json)", i)] = string(encoded)
+			}
+		}
+
+		// Leak scans, after the run completed and the reconnects returned.
+		for name, text := range collected {
+			for _, needle := range needles {
+				if strings.Contains(text, needle) {
+					t.Errorf("%q leaked into %s", needle, name)
+				}
+			}
+		}
+		for name, text := range map[string]string{"slog JSON": slogJSON.String(), "slog text": slogText.String()} {
+			if text == "" {
+				t.Errorf("%s capture is empty", name)
+			}
+			for _, needle := range needles {
+				if strings.Contains(text, needle) {
+					t.Errorf("%q leaked into %s output", needle, name)
+				}
+			}
+		}
+		waitForEndedSpans(t, recorder, "chat.accept", "mcp.call")
+		if hits := sentinelSpanHits(recorder.Ended(), needles...); len(hits) > 0 {
+			t.Errorf("sentinel leaked into spans: %v", hits)
+		}
+		requireNoSentinelInDB(t, pool, needles...)
+
+		// Positive controls: the scanners do detect a planted sentinel.
+		if _, err := pool.Exec(t.Context(), `CREATE TABLE s1_scan_probe (v jsonb)`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(t.Context(), `INSERT INTO s1_scan_probe (v) VALUES ($1::jsonb)`, `{"note":"`+s1Sentinel+`"}`); err != nil {
+			t.Fatal(err)
+		}
+		if hits, _ := sentinelDBHits(t, pool, s1Sentinel); !slices.Contains(hits, "s1_scan_probe.v") {
+			t.Fatalf("DB scan control did not find the planted sentinel; hits = %v", hits)
+		}
+		probeRecorder := tracetest.NewSpanRecorder()
+		probeProvider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(probeRecorder))
+		_, probeSpan := probeProvider.Tracer("s1-control").Start(t.Context(), "probe", trace.WithAttributes(attribute.String("k", s1Sentinel)))
+		probeSpan.End()
+		if hits := sentinelSpanHits(probeRecorder.Ended(), s1Sentinel); len(hits) != 1 {
+			t.Fatalf("span scan control hits = %v, want 1", hits)
+		}
 	})
 	t.Run("S2", func(t *testing.T) {
 		stage(t, 2, "H2")

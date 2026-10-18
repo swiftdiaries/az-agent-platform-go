@@ -8,10 +8,10 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"log/slog"
-	"net/http"
 	"sync"
 	"time"
 
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
@@ -44,10 +44,6 @@ func (c Command) durable() journal.Command {
 	return journal.Command{ThreadID: c.ThreadID, RunID: c.RunID, CommunicationID: c.CommunicationID, Principal: c.Principal, Text: c.Text, TargetJourney: c.TargetJourney, InteractionID: c.InteractionID, ReplyKind: c.ReplyKind, ReplyJSON: c.ReplyJSON}
 }
 
-type Submission struct {
-	Command Command
-	Headers http.Header
-}
 type Receipt = journal.Receipt
 type Event = journal.Event
 type Snapshot = journal.Snapshot
@@ -133,8 +129,7 @@ func (p *Platform) Ready(ctx context.Context) (bool, error) {
 	}
 	return p.runner.Ready(ctx, p.store)
 }
-func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, error) {
-	c := submission.Command
+func (p *Platform) Submit(ctx context.Context, c Command, cred credential.Credential) (Receipt, error) {
 	ctx, span := otel.Tracer("az-agent-platform/platform").Start(ctx, "agent.start_turn")
 	span.SetAttributes(attribute.String("thread.id", c.ThreadID), attribute.String("run.id", c.RunID), attribute.String("communication.id", c.CommunicationID))
 	defer span.End()
@@ -190,7 +185,6 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 		if err != nil {
 			return Receipt{}, err
 		}
-		headers := submission.Headers.Clone()
 		transferred = true
 		go func() {
 			defer p.runs.Done()
@@ -200,7 +194,7 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 			defer cancel()
 			stop := context.AfterFunc(p.ctx, cancel)
 			defer stop()
-			p.execute(runCtx, owner, c, agentruntime.RunInput{ThreadID: c.ThreadID, RunID: c.RunID, Principal: c.Principal, Text: c.Text, TargetJourney: target, Headers: headers})
+			p.execute(runCtx, owner, c, agentruntime.RunInput{ThreadID: c.ThreadID, RunID: c.RunID, Principal: c.Principal, Text: c.Text, TargetJourney: target, Credential: cred})
 		}()
 	}
 	return receipt, nil

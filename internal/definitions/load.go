@@ -23,12 +23,11 @@ const (
 )
 
 type MCPServer struct {
-	ID             string                `json:"id"`
-	Endpoint       string                `json:"endpoint"`
-	ForwardHeaders []string              `json:"forward_headers"`
-	CallIDHeader   string                `json:"call_id_header"`
-	Tools          []string              `json:"tools"`
-	Policies       map[string]ToolPolicy `json:"policies,omitempty"`
+	ID           string                `json:"id"`
+	Endpoint     string                `json:"endpoint"`
+	CallIDHeader string                `json:"call_id_header"`
+	Tools        []string              `json:"tools"`
+	Policies     map[string]ToolPolicy `json:"policies,omitempty"`
 }
 
 // ToolPolicy is reviewed integration configuration; MCP annotations grant no permission.
@@ -166,15 +165,6 @@ func loadOne(path string) (*Registry, error) {
 			return nil, fmt.Errorf("MCP server %q: %w", server.ID, err)
 		}
 		server.Endpoint = endpoint
-		seenHeaders := make(map[string]bool)
-		for i, name := range server.ForwardHeaders {
-			canonical := textproto.CanonicalMIMEHeaderKey(name)
-			if canonical == "" || strings.ContainsAny(name, "\r\n:") || seenHeaders[canonical] {
-				return nil, fmt.Errorf("MCP server %q has invalid or duplicate forwarded header %q", server.ID, name)
-			}
-			seenHeaders[canonical] = true
-			server.ForwardHeaders[i] = canonical
-		}
 		if server.CallIDHeader != "" {
 			server.CallIDHeader = textproto.CanonicalMIMEHeaderKey(server.CallIDHeader)
 			if server.CallIDHeader == "" {

@@ -3,7 +3,6 @@
     {
       "id": "java-monolith",
       "endpoint": "${TEST_JAVA_MCP_ENDPOINT}",
-      "forward_headers": ["Cookie", "Authorization"],
       "call_id_header": "X-Platform-Call-ID",
       "tools": ["lookup_destination", "lookup_shift", "request_shift_swap"],
       "policies": {

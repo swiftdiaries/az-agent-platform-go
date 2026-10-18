@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/telemetry"
@@ -91,7 +92,7 @@ func TestTelemetryMCPTraceAndCallIDAreCorrelatedWithoutContent(t *testing.T) {
 		Endpoint:     backend.URL,
 		Tools:        []string{"lookup_destination"},
 		CallIDHeader: "X-Platform-Call-ID",
-	}, []string{"lookup_destination"}, nil)
+	}, []string{"lookup_destination"}, credential.Credential{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -203,7 +203,6 @@ func cloneRouting(in Routing) Routing {
 
 func cloneServer(in MCPServer) MCPServer {
 	out := in
-	out.ForwardHeaders = append([]string(nil), in.ForwardHeaders...)
 	out.Tools = append([]string(nil), in.Tools...)
 	out.Policies = clonePolicies(in.Policies)
 	return out

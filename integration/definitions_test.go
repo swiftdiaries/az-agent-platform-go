@@ -34,7 +34,7 @@ func writeDefinitionBundle(t *testing.T, root, prompt string) string {
 	if err := os.WriteFile(filepath.Join(root, "skills/planner/guide.md"), []byte("Prefer direct routes.\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	config := `{"mcp_servers":[{"id":"s","endpoint":"http://example","forward_headers":["Authorization"],"tools":["lookup"],"policies":{"lookup":{"class":"read_only"}}}],"skill_packages":[{"name":"planner","root":"skills/planner","supporting_files":["guide.md"],"allow_supporting_files":true}],"journeys":[{"id":"planner","description":"Plan a trip","system_prompt":"prompts/planner.md","mcp":{"server":"s","tools":["lookup"]},"skills":["planner"]}]}`
+	config := `{"mcp_servers":[{"id":"s","endpoint":"http://example","tools":["lookup"],"policies":{"lookup":{"class":"read_only"}}}],"skill_packages":[{"name":"planner","root":"skills/planner","supporting_files":["guide.md"],"allow_supporting_files":true}],"journeys":[{"id":"planner","description":"Plan a trip","system_prompt":"prompts/planner.md","mcp":{"server":"s","tools":["lookup"]},"skills":["planner"]}]}`
 	path := filepath.Join(root, "journeys.yaml")
 	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
 		t.Fatal(err)

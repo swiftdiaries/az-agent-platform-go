@@ -54,10 +54,11 @@ func TestServiceDrainRejectsNewAdmissionAndInterruptsExpiredOwner(t *testing.T) 
 		return agentruntime.ModelResponse{}, ctx.Err()
 	})
 	app, err := service.New(service.Dependencies{
-		Pool:          pool,
-		Registry:      registry,
-		Authenticator: chat.StaticBearerTokens{"token": "alice"},
-		Model:         model,
+		Pool:              pool,
+		Registry:          registry,
+		Authenticator:     chat.StaticBearerTokens{"token": "alice"},
+		Model:             model,
+		CredentialHeaders: []string{"Authorization"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -171,6 +172,7 @@ func TestServiceShutdownBoundsBlockedAdmissionAndClaim(t *testing.T) {
 				Model: modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 					return agentruntime.ModelResponse{}, nil
 				}),
+				CredentialHeaders: []string{"Authorization"},
 			})
 			if err != nil {
 				t.Fatal(err)
