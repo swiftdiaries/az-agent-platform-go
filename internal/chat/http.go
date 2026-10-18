@@ -223,6 +223,16 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case "run.completed":
 			emit(events.NewRunFinishedEvent(input.ThreadID, input.RunID), sequence)
 			return true
+		case "run.limit_exceeded":
+			var detail struct {
+				RetryAfterSeconds int64 `json:"retry_after_seconds"`
+			}
+			_ = json.Unmarshal(e.Detail, &detail)
+			if !emit(events.NewCustomEvent("limit_exceeded", events.WithValue(map[string]any{"kind": e.Reason, "retryAfterSeconds": detail.RetryAfterSeconds})), sequence) {
+				return true
+			}
+			emit(events.NewRunErrorEvent("run limit exceeded", events.WithErrorCode("limit_exceeded"), events.WithRunID(input.RunID)), 0)
+			return true
 		case "run.failed", "auth_required", "run.interrupted", "run.dependency_unavailable":
 			code := "internal_error"
 			if e.Type == "run.interrupted" {
@@ -283,6 +293,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case platform.RunDependencyUnavailable:
 		terminal(platform.Event{Type: "run.dependency_unavailable"}, 0)
+		return
+	case platform.RunLimitExceeded:
+		emit(events.NewRunErrorEvent("run limit exceeded", events.WithErrorCode("limit_exceeded"), events.WithRunID(input.RunID)), 0)
 		return
 	}
 

@@ -126,7 +126,7 @@ func activateStep(journey string) func(agentruntime.ModelRequest) agentruntime.M
 // the run succeeds, finishes it. A failure is returned as is (the run is not finished).
 func converse(t *testing.T, store *journal.Store, runner *agentruntime.Runner, thread, run, text, target string) (agentruntime.RunOutput, error) {
 	t.Helper()
-	command := journal.Command{ThreadID: thread, RunID: run, CommunicationID: run, Principal: "alice", Text: text, TargetJourney: target}
+	command := journal.Command{ThreadID: thread, RunID: run, CommunicationID: run, Principal: "alice", Tenant: testTenant, Text: text, TargetJourney: target}
 	if _, _, err := store.Admit(t.Context(), command); err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	command := journal.Command{ThreadID: "old-thread", RunID: "old-run", CommunicationID: "old-command", Principal: "alice", Text: "plan", TargetJourney: "planner"}
+	command := journal.Command{ThreadID: "old-thread", RunID: "old-run", CommunicationID: "old-command", Principal: "alice", Tenant: testTenant, Text: "plan", TargetJourney: "planner"}
 	if _, _, err := store.Admit(ctx, command); err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +252,7 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 	}
 	requireSet("old session", oldDigest, "old prompt")
 
-	continued := journal.Command{ThreadID: "old-thread", RunID: "old-next", CommunicationID: "old-next", Principal: "alice", Text: "again", TargetJourney: "planner"}
+	continued := journal.Command{ThreadID: "old-thread", RunID: "old-next", CommunicationID: "old-next", Principal: "alice", Tenant: testTenant, Text: "again", TargetJourney: "planner"}
 	if _, _, err := store.Admit(ctx, continued); err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +265,7 @@ func TestVersionActivationPreservesPinnedSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireSet("completed session", oldDigest, "old prompt")
-	newCommand := journal.Command{ThreadID: "new-thread", RunID: "new-run", CommunicationID: "new-command", Principal: "alice", Text: "plan", TargetJourney: "planner"}
+	newCommand := journal.Command{ThreadID: "new-thread", RunID: "new-run", CommunicationID: "new-command", Principal: "alice", Tenant: testTenant, Text: "plan", TargetJourney: "planner"}
 	if _, _, err := store.Admit(ctx, newCommand); err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +341,7 @@ func TestCrossJourneyActivationCannotMutateCurrentOrPin(t *testing.T) {
 	if ready, err := store.DefinitionsReady(ctx, registry.Serves); err != nil || ready {
 		t.Fatalf("unserved current readiness = %v, %v", ready, err)
 	}
-	command := journal.Command{ThreadID: "mismatched-current", RunID: "mismatched-current", CommunicationID: "mismatched-current", Principal: "alice", Text: "plan"}
+	command := journal.Command{ThreadID: "mismatched-current", RunID: "mismatched-current", CommunicationID: "mismatched-current", Principal: "alice", Tenant: testTenant, Text: "plan"}
 	if _, _, err := store.Admit(ctx, command); err != nil {
 		t.Fatal(err)
 	}
@@ -596,12 +596,12 @@ func TestDeclarativeJourneyActivation(t *testing.T) {
 			t.Fatalf("unknown target = %v", err)
 		}
 		// Even a caller that skips Binding cannot run an unknown target.
-		command := journal.Command{ThreadID: "unknown-direct", RunID: "unknown-2", CommunicationID: "unknown-2", Principal: "alice", Text: "plan"}
+		command := journal.Command{ThreadID: "unknown-direct", RunID: "unknown-2", CommunicationID: "unknown-2", Principal: "alice", Tenant: testTenant, Text: "plan"}
 		if _, _, err := store.Admit(t.Context(), command); err != nil {
 			t.Fatal(err)
 		}
 		owner := claimForTest(t, store, command, false)
-		input := scoped(t, runner, agentruntime.RunInput{Store: store, Owner: owner, ThreadID: command.ThreadID, RunID: command.RunID, Principal: "alice", Text: command.Text})
+		input := scoped(t, runner, agentruntime.RunInput{Store: store, Owner: owner, ThreadID: command.ThreadID, RunID: command.RunID, Principal: "alice", Tenant: testTenant, Text: command.Text})
 		_, digest, err := runner.Binding(t.Context(), input)
 		if err != nil {
 			t.Fatal(err)
@@ -642,7 +642,7 @@ func TestDeclarativeJourneyActivation(t *testing.T) {
 func TestResolveDefinitionRejectsOwnerExpiredWhileWaitingForRollout(t *testing.T) {
 	pool := database(t)
 	store := journal.New(pool)
-	command := journal.Command{ThreadID: "definition-owner", RunID: "definition-owner", CommunicationID: "definition-owner", Principal: "alice", Text: "plan"}
+	command := journal.Command{ThreadID: "definition-owner", RunID: "definition-owner", CommunicationID: "definition-owner", Principal: "alice", Tenant: testTenant, Text: "plan"}
 	if _, _, err := store.Admit(t.Context(), command); err != nil {
 		t.Fatal(err)
 	}

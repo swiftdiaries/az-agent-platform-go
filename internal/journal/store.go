@@ -32,6 +32,9 @@ const (
 	// RunDependencyUnavailable is terminal: a required dependency (tenant
 	// directory, settings source or MCP endpoint) could not be used.
 	RunDependencyUnavailable RunState = "dependency_unavailable"
+	// RunLimitExceeded is terminal: a cost gateway rejected the run for a
+	// budget or rate limit. Only FinishLimitExceeded may set it.
+	RunLimitExceeded RunState = "limit_exceeded"
 )
 
 type Command struct{ ThreadID, RunID, CommunicationID, Principal, Tenant, Text, TargetJourney, InteractionID, ReplyKind, ReplyJSON string }

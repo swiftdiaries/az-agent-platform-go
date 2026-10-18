@@ -375,7 +375,7 @@ func TestJourneyDefinitionTargetsAndMaterializesContext(t *testing.T) {
 	store := journal.New(database(t))
 	run := func(id, text, target string) {
 		t.Helper()
-		command := journal.Command{ThreadID: "thread", RunID: id, CommunicationID: id, Principal: "alice", Text: text, TargetJourney: target}
+		command := journal.Command{ThreadID: "thread", RunID: id, CommunicationID: id, Principal: "alice", Tenant: testTenant, Text: text, TargetJourney: target}
 		if _, _, err := store.Admit(t.Context(), command); err != nil {
 			t.Fatal(err)
 		}
@@ -391,7 +391,7 @@ func TestJourneyDefinitionTargetsAndMaterializesContext(t *testing.T) {
 			t.Fatal(err)
 		}
 		if id == "vacation" {
-			steering := journal.Command{ThreadID: "thread", RunID: "vacation-correction", CommunicationID: "vacation-correction", Principal: "alice", Text: "Kyoto instead", TargetJourney: target}
+			steering := journal.Command{ThreadID: "thread", RunID: "vacation-correction", CommunicationID: "vacation-correction", Principal: "alice", Tenant: testTenant, Text: "Kyoto instead", TargetJourney: target}
 			if receipt, fresh, err := store.Admit(t.Context(), steering); err != nil || fresh || receipt.ExecutionRunID != id {
 				t.Fatalf("steering admission = %#v, %v, %v", receipt, fresh, err)
 			}
@@ -462,7 +462,7 @@ func TestJourneyDefinitionTargetsAndMaterializesContext(t *testing.T) {
 			t.Fatalf("shift run history lacks %q in order: %#v", want, requests[1].Messages)
 		}
 	}
-	command := journal.Command{ThreadID: "new", RunID: "new", CommunicationID: "new", Principal: "alice", Text: "swap", TargetJourney: "vacation-planner"}
+	command := journal.Command{ThreadID: "new", RunID: "new", CommunicationID: "new", Principal: "alice", Tenant: testTenant, Text: "swap", TargetJourney: "vacation-planner"}
 	if _, _, err := store.Admit(t.Context(), command); err != nil {
 		t.Fatal(err)
 	}

@@ -15,11 +15,14 @@ import (
 	"time"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/mcptest"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/modeltest"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/provider/litellm"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/settings"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/tenantdir"
@@ -1339,6 +1342,201 @@ func TestE2EConversationAgent(t *testing.T) {
 	t.Run("S7", func(t *testing.T) {
 		stage(t, 7, "H6")
 		// The real litellm provider against a scripted Responses stub gets attribution headers without credentials, maps 429 budget_exceeded and Admit denials to limit_exceeded, and agent_usage matches reported tokens.
+		const (
+			threadOK, threadBudget, threadDeny = "e2e-s7-ok", "e2e-s7-budget", "e2e-s7-deny"
+			runOK, runBudget, runDeny          = "e2e-s7-ok-run", "e2e-s7-budget-run", "e2e-s7-deny-run"
+			s7Sentinel                         = "azap-s7-sentinel-4d27b1"
+			s7Model                            = "stub-model"
+		)
+		first := modeltest.Usage{InputTokens: 120, OutputTokens: 30, CachedTokens: 40}
+		second := modeltest.Usage{InputTokens: 200, OutputTokens: 45, CachedTokens: 64}
+
+		pool := database(t)
+		endpoint := mcptest.New(t, mcptest.Options{Name: "e2e-s7", Version: "vN"}, mcptest.Catalog{Tools: []mcptest.Tool{
+			{Name: "lookup", OperationKey: "travel.lookup", Result: "Kyoto is available"},
+		}})
+		stub := modeltest.NewResponsesServer(
+			modeltest.RespondCall("s7-call", "travel_lookup", json.RawMessage(`{"destination":"Kyoto"}`)).WithUsage(first),
+			modeltest.RespondText("Kyoto is available for your trip").WithUsage(second),
+			modeltest.RespondBudgetExceeded(30*time.Second),
+		)
+		t.Cleanup(stub.Close)
+		provider, err := litellm.New(litellm.Config{BaseURL: stub.URL(), APIKey: "stub-key", Model: s7Model})
+		if err != nil {
+			t.Fatal(err)
+		}
+		headers, err := cost.NewHeaders(cost.DefaultHeaderNames())
+		if err != nil {
+			t.Fatal(err)
+		}
+		gate := cost.NewScripted(headers)
+		tenancy := testTenancy(t, endpoint.URL())
+		tenancy.Cost = gate
+		a, b, c := threeReplicas(t, pool, acceptanceSet(t, "read_only"), provider, tenancy)
+
+		post := func(replica acceptanceReplica, thread, run, cookie string) string {
+			t.Helper()
+			return e2eReadBody(t, run, acceptancePostWithHeaders(t, replica.url, aguitypes.RunAgentInput{
+				ThreadID: thread, RunID: run,
+				Messages:       []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan a trip to Kyoto"}},
+				ForwardedProps: map[string]any{"journeyId": "planner"},
+			}, http.Header{"Cookie": {"azap_session=" + cookie}}))
+		}
+		store := journal.New(pool)
+
+		// 1. A run with a tool round: two model calls, two usage rows.
+		body := post(a, threadOK, runOK, s7Sentinel)
+		if !strings.Contains(body, "Kyoto is available for your trip") || !strings.Contains(body, "RUN_FINISHED") {
+			t.Fatalf("run 1 lacks final answer or RUN_FINISHED: %s", body)
+		}
+		internalOK := acceptanceThread(t, pool, threadOK)
+		idOK := e2eInternalRun(t, pool, internalOK, runOK)
+		if got := e2eRunState(t, pool, internalOK, idOK); got != string(journal.RunCompleted) {
+			t.Fatalf("run 1 state = %q, want completed", got)
+		}
+		if got := endpoint.Count("tools/call"); got != 1 {
+			t.Fatalf("MCP tools/call count after run 1 = %d, want 1", got)
+		}
+		rows := e2eUsageRows(t, pool, internalOK, idOK)
+		want := []e2eUsageRow{
+			{seq: 1, model: s7Model, input: first.InputTokens, output: first.OutputTokens, cached: first.CachedTokens, tenant: testTenant, principal: testPrincipal},
+			{seq: 2, model: s7Model, input: second.InputTokens, output: second.OutputTokens, cached: second.CachedTokens, tenant: testTenant, principal: testPrincipal},
+		}
+		if !slices.Equal(rows, want) {
+			t.Fatalf("agent_usage rows for run 1 = %+v, want %+v", rows, want)
+		}
+		report, err := cost.Usage(t.Context(), store, cost.Scope{Tenant: testTenant}, cost.Window{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantTotal := cost.ModelUsage{Calls: 2, Input: first.InputTokens + second.InputTokens, Output: first.OutputTokens + second.OutputTokens, Cached: first.CachedTokens + second.CachedTokens}
+		wantModel := wantTotal
+		wantModel.Model = s7Model
+		if report.Total != wantTotal || len(report.Models) != 1 || report.Models[0] != wantModel {
+			t.Fatalf("cost.Usage report = %+v, want total %+v and one model %+v", report, wantTotal, wantModel)
+		}
+
+		// 2. Attribution headers on every stub request; the credential sentinel reaches MCP but never the stub.
+		if got := stub.Count(); got != 2 {
+			t.Fatalf("stub requests after run 1 = %d, want 2", got)
+		}
+		for i, request := range stub.Requests() {
+			for name, wantValue := range map[string]string{
+				"X-Agent-Tenant":       testTenant,
+				"X-Agent-Principal":    testPrincipal,
+				"X-Agent-Conversation": internalOK,
+				"X-Agent-Run":          idOK,
+			} {
+				if got := request.Header.Get(name); got != wantValue {
+					t.Errorf("stub request %d %s = %q, want %q", i, name, got, wantValue)
+				}
+			}
+			if got := request.Header.Get("Authorization"); got != "Bearer stub-key" {
+				t.Errorf("stub request %d Authorization changed: got %q", i, got)
+			}
+			if strings.Contains(fmt.Sprint(request.Header), s7Sentinel) || strings.Contains(string(request.Body), s7Sentinel) {
+				t.Errorf("credential sentinel leaked into stub request %d", i)
+			}
+		}
+		sentToMCP := 0
+		for _, request := range endpoint.Requests() {
+			if request.RPCMethod != "" && strings.Contains(request.Header.Get("Cookie"), s7Sentinel) {
+				sentToMCP++
+			}
+		}
+		if sentToMCP == 0 {
+			t.Error("the MCP endpoint never received the credential sentinel")
+		}
+
+		// 3. The stub answers 429 budget_exceeded with Retry-After 30: terminal, one request, no retry.
+		body = post(b, threadBudget, runBudget, s7Sentinel)
+		e2eRequireLimitExceeded(t, "budget run", body)
+		if !strings.Contains(body, `"retryAfterSeconds":30`) {
+			t.Errorf("budget run SSE lacks the limit_exceeded event with retryAfterSeconds 30: %s", body)
+		}
+		internalBudget := acceptanceThread(t, pool, threadBudget)
+		idBudget := e2eInternalRun(t, pool, internalBudget, runBudget)
+		if got := e2eRunState(t, pool, internalBudget, idBudget); got != string(journal.RunLimitExceeded) {
+			t.Errorf("budget run state = %q, want limit_exceeded", got)
+		}
+		var reason, kind, retry string
+		if err := pool.QueryRow(t.Context(), `SELECT reason, detail->>'kind', detail->>'retry_after_seconds' FROM agent_events WHERE thread_id=$1 AND run_id=$2 AND kind='run.limit_exceeded'`,
+			internalBudget, idBudget).Scan(&reason, &kind, &retry); err != nil {
+			t.Fatalf("budget run has no run.limit_exceeded event: %v", err)
+		}
+		if reason != "budget" || kind != "budget" || retry != "30" {
+			t.Errorf("run.limit_exceeded reason/kind/retry_after_seconds = %q/%q/%q, want budget/budget/30", reason, kind, retry)
+		}
+		if got := e2eStubRequestsFor(stub, idBudget); got != 1 {
+			t.Errorf("stub requests for the budget run = %d, want exactly 1 (no retry)", got)
+		}
+		if got := stub.Count(); got != 3 {
+			t.Errorf("stub requests in total = %d, want 3", got)
+		}
+		if got := e2eOutcomeUnknown(t, pool, internalBudget, idBudget); got != 0 {
+			t.Errorf("budget run has %d outcome_unknown operations/attempts, want 0", got)
+		}
+		if rows := e2eUsageRows(t, pool, internalBudget, idBudget); len(rows) != 0 {
+			t.Errorf("budget run has agent_usage rows %+v, want none", rows)
+		}
+
+		// 4. A scripted Admit denial (every run but the two above, i.e. only this one): the run ends limit_exceeded before any model or MCP request.
+		gate.SetAdmit(func(attribution cost.Attribution, _ settings.Cost) (cost.Decision, error) {
+			if attribution.Run != idOK && attribution.Run != idBudget {
+				return cost.Deny(cost.LimitBudget, 0), nil
+			}
+			return cost.Allow(), nil
+		})
+		t.Cleanup(func() { gate.SetAdmit(nil) })
+		stubBefore, mcpBefore := stub.Count(), len(endpoint.Requests())
+		body = post(c, threadDeny, runDeny, s7Sentinel)
+		gate.SetAdmit(nil)
+		e2eRequireLimitExceeded(t, "denied run", body)
+		internalDeny := acceptanceThread(t, pool, threadDeny)
+		idDeny := e2eInternalRun(t, pool, internalDeny, runDeny)
+		if got := e2eRunState(t, pool, internalDeny, idDeny); got != string(journal.RunLimitExceeded) {
+			t.Errorf("denied run state = %q, want limit_exceeded", got)
+		}
+		if got := stub.Count(); got != stubBefore {
+			t.Errorf("stub requests after the denied run = %d, want unchanged at %d", got, stubBefore)
+		}
+		if got := len(endpoint.Requests()); got != mcpBefore {
+			t.Errorf("MCP requests after the denied run = %d, want unchanged at %d", got, mcpBefore)
+		}
+		if got := e2eStubRequestsFor(stub, idDeny); got != 0 {
+			t.Errorf("stub requests for the denied run = %d, want 0", got)
+		}
+		if got := e2eOutcomeUnknown(t, pool, internalDeny, idDeny); got != 0 {
+			t.Errorf("denied run has %d outcome_unknown operations/attempts, want 0", got)
+		}
+		if rows := e2eUsageRows(t, pool, internalDeny, idDeny); len(rows) != 0 {
+			t.Errorf("denied run has agent_usage rows %+v, want none", rows)
+		}
+		var admitted bool
+		for _, attribution := range gate.Admits() {
+			if attribution.Run == idDeny {
+				admitted = true
+				if attribution.Tenant != testTenant || attribution.Principal != testPrincipal || attribution.Conversation != internalDeny {
+					t.Errorf("Admit attribution for the denied run = %+v", attribution)
+				}
+			}
+		}
+		if !admitted {
+			t.Error("the gate never saw Admit for the denied run")
+		}
+		for _, attribution := range gate.Accesses() {
+			if attribution.Run == idDeny {
+				t.Error("Access was requested for the denied run, want Admit only")
+			}
+		}
+		// Usage totals are unchanged by the two limit_exceeded runs.
+		after, err := cost.Usage(t.Context(), store, cost.Scope{Tenant: testTenant}, cost.Window{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.Total != wantTotal {
+			t.Errorf("usage total after limit_exceeded runs = %+v, want %+v", after.Total, wantTotal)
+		}
 	})
 	t.Run("S8", func(t *testing.T) {
 		stage(t, 8, "H7")
@@ -1468,4 +1666,86 @@ func e2eContiguous(ids []int64) bool {
 		}
 	}
 	return true
+}
+
+// e2eUsageRow is one agent_usage row without its timestamp.
+type e2eUsageRow struct {
+	seq                   int
+	model                 string
+	input, output, cached int64
+	tenant, principal     string
+}
+
+// e2eUsageRows returns the run's agent_usage rows ordered by seq.
+func e2eUsageRows(t *testing.T, pool *pgxpool.Pool, thread, run string) []e2eUsageRow {
+	t.Helper()
+	rows, err := pool.Query(t.Context(), `SELECT seq, model, input_tokens, output_tokens, cached_tokens, tenant, principal FROM agent_usage WHERE thread_id=$1 AND run_id=$2 ORDER BY seq`, thread, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []e2eUsageRow
+	for rows.Next() {
+		var r e2eUsageRow
+		if err := rows.Scan(&r.seq, &r.model, &r.input, &r.output, &r.cached, &r.tenant, &r.principal); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// e2eRunState is the durable agent_runs.state of a run.
+func e2eRunState(t *testing.T, pool *pgxpool.Pool, thread, run string) string {
+	t.Helper()
+	var state string
+	if err := pool.QueryRow(t.Context(), `SELECT state FROM agent_runs WHERE thread_id=$1 AND id=$2`, thread, run).Scan(&state); err != nil {
+		t.Fatalf("run %s: %v", run, err)
+	}
+	return state
+}
+
+// e2eOutcomeUnknown counts the run's operations and attempts recorded as outcome_unknown.
+func e2eOutcomeUnknown(t *testing.T, pool *pgxpool.Pool, thread, run string) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(t.Context(), `SELECT
+		(SELECT count(*) FROM agent_operations WHERE thread_id=$1 AND run_id=$2 AND outcome='outcome_unknown')
+		+ (SELECT count(*) FROM agent_attempts a JOIN agent_operations o ON o.call_id=a.call_id WHERE o.thread_id=$1 AND o.run_id=$2 AND a.outcome='outcome_unknown')`,
+		thread, run).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// e2eStubRequestsFor counts the stub requests attributed to run by X-Agent-Run.
+func e2eStubRequestsFor(stub *modeltest.ResponsesServer, run string) int {
+	n := 0
+	for _, request := range stub.Requests() {
+		if request.Header.Get("X-Agent-Run") == run {
+			n++
+		}
+	}
+	return n
+}
+
+// e2eRequireLimitExceeded requires a RUN_ERROR with code limit_exceeded and no RUN_FINISHED.
+func e2eRequireLimitExceeded(t *testing.T, name, body string) {
+	t.Helper()
+	if !strings.Contains(body, "RUN_ERROR") || !strings.Contains(body, `"code":"limit_exceeded"`) || strings.Contains(body, "RUN_FINISHED") {
+		t.Fatalf("%s: expected RUN_ERROR code limit_exceeded and no RUN_FINISHED: %s", name, body)
+	}
+}
+
+// e2eInternalRun is the internal run ID (agent_runs.id) of a chat run's external ID.
+func e2eInternalRun(t *testing.T, pool *pgxpool.Pool, thread, external string) string {
+	t.Helper()
+	var id string
+	if err := pool.QueryRow(t.Context(), `SELECT id FROM chat_runs WHERE thread_id=$1 AND external_id=$2`, thread, external).Scan(&id); err != nil {
+		t.Fatalf("internal id of run %s: %v", external, err)
+	}
+	return id
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
@@ -37,6 +38,9 @@ type Dependencies struct {
 	// Settings resolves per-tenant and per-user settings
 	// (AGENT_PLATFORM_SETTINGS). Required.
 	Settings settings.Source
+	// CostGate is the cost enforcement and attribution seam
+	// (AGENT_PLATFORM_COST_GATE). Nil admits everything and decorates nothing.
+	CostGate cost.Gate
 }
 
 type Service struct {
@@ -51,7 +55,7 @@ func New(deps Dependencies) (*Service, error) {
 	if deps.Pool == nil || deps.Definitions == nil || deps.Authenticator == nil || deps.Model == nil || deps.Directory == nil || deps.Settings == nil {
 		return nil, errors.New("service dependencies are required")
 	}
-	runner := agentruntime.NewRunner(deps.Definitions, deps.Model, agentruntime.Tenancy{Directory: deps.Directory, Endpoints: deps.Endpoints, Settings: deps.Settings})
+	runner := agentruntime.NewRunner(deps.Definitions, deps.Model, agentruntime.Tenancy{Directory: deps.Directory, Endpoints: deps.Endpoints, Settings: deps.Settings, Cost: deps.CostGate})
 	service := &Service{platform: platform.New(runner, journal.New(deps.Pool))}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })

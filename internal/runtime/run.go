@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
@@ -61,6 +62,9 @@ type ModelRequest struct {
 	// A provider must call it at most once, after constructing the exact request
 	// and immediately before its transport sends it.
 	OnDispatch func(context.Context) error
+	// Access decorates every HTTP request the provider sends for this round
+	// (attribution headers). The zero value applies nothing.
+	Access cost.Access
 }
 
 // RequestProvenance records the digests of the material behind one request.
@@ -85,6 +89,8 @@ type ModelResponse struct {
 	Text      string
 	ToolCalls []ToolCall
 	ToolCall  *ToolCall
+	// Usage is the token usage the provider reported for this completion.
+	Usage cost.Tokens
 }
 
 type Model interface {
@@ -102,6 +108,8 @@ type Tenancy struct {
 	Directory tenantdir.Directory
 	Endpoints tenantdir.Allowlist
 	Settings  settings.Source
+	// Cost admits runs and decorates provider requests. Nil is cost.Open{}.
+	Cost cost.Gate
 }
 
 // ErrDependencyUnavailable marks a tenant directory, allowlist, settings or MCP
@@ -137,6 +145,9 @@ type RunInput struct {
 	ProductVersion string
 	Endpoint       tenantdir.Endpoint
 	Settings       settings.Settings
+	// Attribution and Access are filled from Admit once per run, before Run.
+	Attribution cost.Attribution
+	Access      cost.Access
 }
 
 type RunOutput struct {
@@ -174,6 +185,29 @@ func (r *Runner) Scope(ctx context.Context, in RunInput) (RunScope, error) {
 		return RunScope{}, err
 	}
 	return RunScope{Entry: entry, Endpoint: endpoint, Settings: resolved}, nil
+}
+
+// Admit asks the cost gate whether the run may start and builds the request
+// decoration for its provider calls. A denial is the *cost.LimitError; a gate
+// failure is ErrDependencyUnavailable. Neither error text carries attribution.
+func (r *Runner) Admit(ctx context.Context, in RunInput) (cost.Attribution, cost.Access, error) {
+	var gate cost.Gate = cost.Open{}
+	if r.tenancy.Cost != nil {
+		gate = r.tenancy.Cost
+	}
+	a := cost.Attribution{Tenant: in.Tenant, Principal: in.Principal, Conversation: in.ThreadID, Run: in.RunID, Journey: in.TargetJourney}
+	decision, err := gate.Admit(ctx, a, in.Settings.Cost)
+	if err != nil {
+		return cost.Attribution{}, cost.Access{}, unavailable(ctx, err)
+	}
+	if err := decision.Err(); err != nil {
+		return cost.Attribution{}, cost.Access{}, err
+	}
+	access, err := gate.Access(ctx, a, in.Settings.Cost)
+	if err != nil {
+		return cost.Attribution{}, cost.Access{}, unavailable(ctx, err)
+	}
+	return a, access, nil
 }
 
 // unavailable fails closed, except that the caller's own cancellation stays a
@@ -321,7 +355,7 @@ func unavailableJourney(resolution catalog.Resolution) error {
 	return fmt.Errorf("%w: %s", ErrJourneyUnavailable, strings.Join(reasons, ", "))
 }
 
-func modelRun(parent context.Context, model Model, callBase string, before func(context.Context, *ModelRequest) error, observed func(context.Context) error) agent.RunFunc {
+func modelRun(parent context.Context, model Model, callBase string, before func(context.Context, *ModelRequest) error, observed func(context.Context) error, access cost.Access, usage func(context.Context, cost.Tokens) error) agent.RunFunc {
 	return func(ctx context.Context, messages []*message.Message, options ...agent.Option) iter.Seq2[*agent.ResponseUpdate, error] {
 		return func(yield func(*agent.ResponseUpdate, error) bool) {
 			ctx = trace.ContextWithSpanContext(ctx, trace.SpanContextFromContext(parent))
@@ -361,6 +395,7 @@ func modelRun(parent context.Context, model Model, callBase string, before func(
 				return
 			}
 			observedOnce := false
+			request.Access = access
 			request.OnDispatch = func(context.Context) error {
 				if observedOnce {
 					return nil
@@ -382,6 +417,10 @@ func modelRun(parent context.Context, model Model, callBase string, before func(
 			// Test and local models have no HTTP transport callback. Their successful
 			// completion is the observable request boundary.
 			if err := request.OnDispatch(ctx); err != nil {
+				yield(nil, err)
+				return
+			}
+			if err := usage(ctx, response.Usage); err != nil {
 				yield(nil, err)
 				return
 			}

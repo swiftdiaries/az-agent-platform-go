@@ -17,6 +17,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
@@ -44,6 +45,10 @@ const (
 	envMCPEndpoints = "AGENT_PLATFORM_MCP_ENDPOINTS"
 	// envSettings is the path of the settings YAML file.
 	envSettings = "AGENT_PLATFORM_SETTINGS"
+	// envCostGate selects the cost enforcement adapter: open (default) or headers.
+	envCostGate = "AGENT_PLATFORM_COST_GATE"
+	// envCostHeaders names the attribution headers the headers gate sends.
+	envCostHeaders = "AGENT_PLATFORM_COST_HEADERS"
 )
 
 type config struct {
@@ -59,6 +64,7 @@ type config struct {
 	litellm           litellm.Config
 	telemetry         telemetry.Config
 	credentialHeaders []string
+	costGate          cost.Gate
 
 	tenantDirectoryPath string
 	settingsPath        string
@@ -125,8 +131,8 @@ func run(ctx context.Context, lookup func(string) string) error {
 	}
 	app, err := service.New(service.Dependencies{
 		Pool: pool, Definitions: defs, Authenticator: authenticator, Model: model,
-		CredentialHeaders: config.credentialHeaders,
-		Directory:         directory, Endpoints: endpoints, Settings: settingsSource,
+		CredentialHeaders: config.credentialHeaders, CostGate: config.costGate,
+		Directory: directory, Endpoints: endpoints, Settings: settingsSource,
 	})
 	if err != nil {
 		return errors.New("service initialization failed")
@@ -254,6 +260,10 @@ func loadConfig(lookup func(string) string) (config, error) {
 	if err != nil {
 		return config{}, errors.New("invalid credential header configuration")
 	}
+	costGate, err := cost.New(strings.TrimSpace(lookup(envCostGate)), lookup(envCostHeaders))
+	if err != nil {
+		return config{}, errors.New("invalid cost gate configuration")
+	}
 	tenantDirectoryPath, err := require(envTenantDirectory)
 	if err != nil {
 		return config{}, err
@@ -276,7 +286,7 @@ func loadConfig(lookup func(string) string) (config, error) {
 		retainedConfigs: splitValues(lookup(envRetained)), port: port, grace: grace, keycloak: keycloak,
 		foundryEndpoint: foundryEndpoint, foundryDeployment: foundryDeployment,
 		modelProvider: modelProvider, litellm: litellmConfig,
-		telemetry: telemetryConfig, credentialHeaders: credentialHeaders,
+		telemetry: telemetryConfig, credentialHeaders: credentialHeaders, costGate: costGate,
 	}, nil
 }
 

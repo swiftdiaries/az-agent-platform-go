@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/provider/litellm"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/settings"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/telemetry"
@@ -268,4 +271,88 @@ func mapsClone(values map[string]string) map[string]string {
 		clone[key] = value
 	}
 	return clone
+}
+
+func TestCostGateDefaultsToOpen(t *testing.T) {
+	loaded, err := loadConfig(missingValue(validEnvironment()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loaded.costGate.(cost.Open); !ok {
+		t.Fatalf("default gate = %T, want cost.Open", loaded.costGate)
+	}
+	values := validEnvironment()
+	values["AGENT_PLATFORM_COST_GATE"] = " open "
+	if loaded, err = loadConfig(missingValue(values)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loaded.costGate.(cost.Open); !ok {
+		t.Fatalf("open gate = %T, want cost.Open", loaded.costGate)
+	}
+}
+
+func costGateAccess(t *testing.T, gate cost.Gate) http.Header {
+	t.Helper()
+	access, err := gate.Access(context.Background(), cost.Attribution{Tenant: "t1", Principal: "p1", Conversation: "c1", Run: "r1", Journey: "j1"}, settings.Cost{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://model.invalid/responses", nil)
+	access.Apply(req)
+	return req.Header
+}
+
+func TestCostGateHeadersUsesDefaultNames(t *testing.T) {
+	values := validEnvironment()
+	values["AGENT_PLATFORM_COST_GATE"] = "headers"
+	loaded, err := loadConfig(missingValue(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loaded.costGate.(*cost.Headers); !ok {
+		t.Fatalf("gate = %T, want *cost.Headers", loaded.costGate)
+	}
+	h := costGateAccess(t, loaded.costGate)
+	if h.Get("X-Agent-Tenant") != "t1" || h.Get("X-Agent-Run") != "r1" || h.Get("X-Agent-Conversation") != "c1" {
+		t.Fatalf("headers = %v", h)
+	}
+}
+
+func TestCostGateHeadersCustomSpec(t *testing.T) {
+	values := validEnvironment()
+	values["AGENT_PLATFORM_COST_GATE"] = "headers"
+	values["AGENT_PLATFORM_COST_HEADERS"] = "tenant=X-Org,run=X-Req"
+	loaded, err := loadConfig(missingValue(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := costGateAccess(t, loaded.costGate)
+	if h.Get("X-Org") != "t1" || h.Get("X-Req") != "r1" || h.Get("X-Agent-Tenant") != "" {
+		t.Fatalf("headers = %v", h)
+	}
+}
+
+func TestCostGateRejectsInvalidWithoutEchoingTheValue(t *testing.T) {
+	cases := []map[string]string{
+		{"AGENT_PLATFORM_COST_GATE": "secret-kind-value"},
+		{"AGENT_PLATFORM_COST_GATE": "scripted"},
+		{"AGENT_PLATFORM_COST_GATE": "headers", "AGENT_PLATFORM_COST_HEADERS": "tenant=Authorization"},
+		{"AGENT_PLATFORM_COST_GATE": "headers", "AGENT_PLATFORM_COST_HEADERS": "bogus-key-value=X-A"},
+		{"AGENT_PLATFORM_COST_GATE": "headers", "AGENT_PLATFORM_COST_HEADERS": "tenant=bad header"},
+	}
+	for _, c := range cases {
+		values := validEnvironment()
+		for k, v := range c {
+			values[k] = v
+		}
+		_, err := loadConfig(missingValue(values))
+		if err == nil {
+			t.Fatalf("%v accepted", c)
+		}
+		for _, v := range c {
+			if strings.Contains(err.Error(), v) {
+				t.Errorf("error %q echoes %q", err, v)
+			}
+		}
+	}
 }

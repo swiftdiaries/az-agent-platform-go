@@ -9,14 +9,14 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
 var _ agentruntime.Model = (*Model)(nil)
 
-// Usage is the token usage a Step reports. runtime.ModelResponse has no usage
-// field yet; for now it is only recorded (see Model.Calls). Hop H6 will copy it
-// into the response.
+// Usage is the token usage a Step reports. A successful Complete copies it into
+// runtime.ModelResponse.Usage (with an empty Model) and records it in Model.Calls.
 type Usage struct {
 	InputTokens, OutputTokens, CachedTokens int64
 }
@@ -164,6 +164,9 @@ func (m *Model) Complete(ctx context.Context, req agentruntime.ModelRequest) (ag
 		}
 	}
 
+	if err == nil && haveStep {
+		resp.Usage = cost.Tokens{Input: step.usage.InputTokens, Output: step.usage.OutputTokens, Cached: step.usage.CachedTokens}
+	}
 	m.mu.Lock()
 	m.records[index].Response = resp
 	m.records[index].Err = err

@@ -133,8 +133,8 @@ func startAcceptanceReplica(t *testing.T, pool *pgxpool.Pool, set *definitions.S
 	t.Helper()
 	app, err := service.New(service.Dependencies{
 		Pool: pool, Definitions: set, Authenticator: acceptanceTokens, Model: model,
-		CredentialHeaders: acceptanceCredentialHeaders,
-		Directory:         tenancy.Directory, Endpoints: tenancy.Endpoints, Settings: tenancy.Settings,
+		CredentialHeaders: acceptanceCredentialHeaders, CostGate: tenancy.Cost,
+		Directory: tenancy.Directory, Endpoints: tenancy.Endpoints, Settings: tenancy.Settings,
 	})
 	if err != nil {
 		t.Fatal(err)

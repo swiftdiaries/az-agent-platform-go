@@ -75,10 +75,16 @@ func (s *Store) Start(ctx context.Context, o Owner, journey, digest string) (jso
 // Finish atomically stores provider history and terminal lifecycle events. External
 // calls never occur in this transaction. Admission shares this conversation lock.
 func (s *Store) Finish(ctx context.Context, o Owner, state RunState, history json.RawMessage, answer, callID, tool string) error {
-	c := o.Command
 	if state != RunCompleted && state != RunFailed && state != RunAuthRequired && state != RunDependencyUnavailable {
 		return ErrState
 	}
+	return s.finish(ctx, o, state, history, answer, callID, tool, nil)
+}
+
+// finish is the shared terminal transaction; terminal, when set, replaces the
+// run's default terminal event.
+func (s *Store) finish(ctx context.Context, o Owner, state RunState, history json.RawMessage, answer, callID, tool string, terminal *Event) error {
+	c := o.Command
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := lockOwner(ctx, tx, o); err != nil {
 			return err
@@ -126,6 +132,11 @@ func (s *Store) Finish(ctx context.Context, o Owner, state RunState, history jso
 		if state == RunAuthRequired {
 			kind = "auth_required"
 		}
-		return appendEvent(ctx, tx, c.ThreadID, Event{RunID: c.RunID, Type: kind})
+		e := Event{RunID: c.RunID, Type: kind}
+		if terminal != nil {
+			e = *terminal
+			e.RunID = c.RunID
+		}
+		return appendEvent(ctx, tx, c.ThreadID, e)
 	})
 }

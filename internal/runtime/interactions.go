@@ -12,6 +12,7 @@ import (
 	"github.com/microsoft/agent-framework-go/message"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journeys"
@@ -275,8 +276,12 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation
 			return in.Store.Check(ctx, in.Owner)
 		}
 		observed := func(ctx context.Context) error { return in.Store.Included(ctx, in.Owner, pending) }
+		recordUsage := func(ctx context.Context, t cost.Tokens) error {
+			_, err := in.Store.RecordUsage(ctx, in.Owner, journal.Usage{Model: t.Model, Input: t.Input, Output: t.Output, Cached: t.Cached, JourneyID: in.Attribution.Journey})
+			return err
+		}
 		return agent.New(
-			agent.ProviderConfig{ProviderName: "configured-model", Run: modelRun(ctx, r.model, stableCallID(in.ThreadID, in.RunID), before, observed)},
+			agent.ProviderConfig{ProviderName: "configured-model", Run: modelRun(ctx, r.model, stableCallID(in.ThreadID, in.RunID), before, observed, in.Access, recordUsage)},
 			agent.Config{ID: "conversation", Name: "conversation", Description: "Conversation agent", Tools: tools, RunOptions: []agent.Option{agent.WithInstructions(instructions)}},
 		)
 	}

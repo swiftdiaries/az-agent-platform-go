@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
@@ -36,6 +37,7 @@ const (
 	RunAuthRequired  = journal.RunAuthRequired
 
 	RunDependencyUnavailable = journal.RunDependencyUnavailable
+	RunLimitExceeded         = journal.RunLimitExceeded
 )
 
 type Command struct {
@@ -234,6 +236,10 @@ func (p *Platform) execute(ctx context.Context, owner journal.Owner, c Command, 
 	if err == nil {
 		// Resolved once per run; the ErrPending follow-up loop reuses it.
 		in.ProductVersion, in.Endpoint, in.Settings = scope.Entry.ProductVersion, scope.Endpoint, scope.Settings
+		// Admitted once per run; a denial sends nothing to MCP or the model.
+		in.Attribution, in.Access, err = p.runner.Admit(ctx, in)
+	}
+	if err == nil {
 		journey, digest, err = p.runner.Binding(ctx, in)
 	}
 	if err == nil {
@@ -250,6 +256,14 @@ func (p *Platform) execute(ctx context.Context, owner journal.Owner, c Command, 
 			return
 		}
 		if ctx.Err() != nil || errors.Is(err, journal.ErrOwnership) {
+			return
+		}
+		var limit *cost.LimitError
+		if errors.As(err, &limit) {
+			finishErr := p.store.FinishLimitExceeded(ctx, owner, output.History, string(limit.Kind), limit.RetryAfter)
+			if finishErr != nil {
+				slog.ErrorContext(ctx, "run completion commit failed", "run.id", c.RunID)
+			}
 			return
 		}
 		state := RunCompleted

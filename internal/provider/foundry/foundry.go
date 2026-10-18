@@ -6,10 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/microsoft/agent-framework-go/agent"
@@ -21,6 +23,7 @@ import (
 	"github.com/openai/openai-go/v3/option"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
@@ -100,7 +103,7 @@ func (a *Adapter) Complete(ctx context.Context, request runtime.ModelRequest) (r
 	}
 	clientCopy := *client
 	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	clientCopy.Transport = &dispatchTransport{base: client.Transport, onDispatch: request.OnDispatch}
+	clientCopy.Transport = &dispatchTransport{base: client.Transport, onDispatch: request.OnDispatch, access: request.Access}
 	model := foundryprovider.NewAgent(
 		a.config.ProjectEndpoint,
 		a.config.Credential,
@@ -122,7 +125,13 @@ func (a *Adapter) Complete(ctx context.Context, request runtime.ModelRequest) (r
 	if err != nil {
 		return runtime.ModelResponse{}, sanitize(err)
 	}
-	result := runtime.ModelResponse{Text: response.String()}
+	usage := response.Usage()
+	result := runtime.ModelResponse{Text: response.String(), Usage: cost.Tokens{
+		Model:  a.config.Deployment,
+		Input:  usage.InputTokenCount,
+		Output: usage.OutputTokenCount,
+		Cached: usage.CachedInputTokenCount,
+	}}
 	for content := range response.Contents() {
 		if call, ok := content.(*message.FunctionCallContent); ok {
 			result.ToolCalls = append(result.ToolCalls, runtime.ToolCall{
@@ -138,15 +147,41 @@ func sanitize(err error) error {
 		return err
 	}
 	var apiError *openai.Error
-	if errors.As(err, &apiError) && (apiError.StatusCode == http.StatusUnauthorized || apiError.StatusCode == http.StatusForbidden) {
+	if errors.As(err, &apiError) {
+		if limit, ok := limitError(apiError); ok {
+			return limit
+		}
+	}
+	if apiError != nil && (apiError.StatusCode == http.StatusUnauthorized || apiError.StatusCode == http.StatusForbidden) {
 		return fmt.Errorf("Foundry authentication failed: %w", catalog.ErrAuthRequired)
 	}
 	return errors.New("Foundry model request failed")
 }
 
+// limitError classifies a 429 as an enforcement rejection. It reads only the
+// status, the Retry-After headers and the body's error code, and never copies
+// header or body text into the returned error.
+func limitError(apiErr *openai.Error) (*cost.LimitError, bool) {
+	if apiErr.StatusCode != http.StatusTooManyRequests {
+		return nil, false
+	}
+	body := []byte(apiErr.RawJSON())
+	var header http.Header
+	if apiErr.Response != nil {
+		header = apiErr.Response.Header
+		if apiErr.Response.Body != nil {
+			if data, err := io.ReadAll(io.LimitReader(apiErr.Response.Body, 1<<16)); err == nil && len(data) > 0 {
+				body = data
+			}
+		}
+	}
+	return cost.ClassifyLimit(apiErr.StatusCode, header, body, time.Now())
+}
+
 type dispatchTransport struct {
 	base       http.RoundTripper
 	onDispatch func(context.Context) error
+	access     cost.Access
 	once       sync.Once
 	err        error
 }
@@ -158,6 +193,9 @@ func (t *dispatchTransport) RoundTrip(request *http.Request) (*http.Response, er
 			return nil, t.err
 		}
 	}
+	// Clone so the caller's request is not mutated; Access decorates the last hop.
+	request = request.Clone(request.Context())
+	t.access.Apply(request)
 	if t.base != nil {
 		return t.base.RoundTrip(request)
 	}
