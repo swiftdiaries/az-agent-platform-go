@@ -9,8 +9,8 @@ import (
 
 // ActiveJourneys returns the conversation's active set (least recently used first) and the journeys pinned
 // now. Fenced (lockOwner). pinned = DISTINCT non-empty journey_id of approval interactions of this thread that
-// are state='pending', or state='consumed' AND continuation_run_id=this run AND reply decision 'approve' AND no
-// agent_operations row exists for the interaction's call ID (artifact->'call'->>'callId'). Sorted ascending.
+// are state='pending', or state='consumed' AND continuation_run_id=this run AND marker='decided' (not yet
+// dispatched, denied or superseded). Sorted ascending.
 func (s *Store) ActiveJourneys(ctx context.Context, o Owner) (active, pinned []string, err error) {
 	c := o.Command
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
@@ -26,8 +26,7 @@ func (s *Store) ActiveJourneys(ctx context.Context, o Owner) (active, pinned []s
 		}
 		rows, err := tx.Query(ctx, `SELECT i.journey_id FROM agent_interactions i
 WHERE i.thread_id=$1 AND i.kind='approval' AND COALESCE(i.journey_id,'')<>'' AND (
-  i.state='pending' OR (i.state='consumed' AND i.continuation_run_id=$2 AND i.reply->>'decision'='approve'
-    AND NOT EXISTS (SELECT 1 FROM agent_operations o WHERE o.call_id=i.artifact->'call'->>'callId')))
+  i.state='pending' OR (i.state='consumed' AND i.continuation_run_id=$2 AND i.marker='decided'))
 GROUP BY i.journey_id ORDER BY i.journey_id COLLATE "C"`, c.ThreadID, c.RunID)
 		if err != nil {
 			return err

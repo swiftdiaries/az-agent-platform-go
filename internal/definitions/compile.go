@@ -202,6 +202,9 @@ func Compile(path string) (*Set, error) {
 		set.order = append(set.order, journey.ID)
 		digests = append(digests, journey.Digest)
 	}
+	if err := checkPolicyConflicts(set); err != nil {
+		return nil, err
+	}
 	if set.digest, err = setDigest(catalog, conversationPrompt, digests); err != nil {
 		return nil, err
 	}
@@ -453,6 +456,98 @@ func enumerateBundle(dir, rel string, files *[]string) error {
 			*files = append(*files, relName)
 		default:
 			return errors.New("skill bundle contains an unsupported file type")
+		}
+	}
+	return nil
+}
+
+// effectivePolicy is the static (class, requires-approval) pair of an
+// operation key within one journey.
+type effectivePolicy struct {
+	class    Class
+	approval bool
+}
+
+func policyClassRank(c Class) int {
+	switch c {
+	case ClassReadOnly:
+		return 0
+	case ClassIdempotent:
+		return 1
+	}
+	return 2
+}
+
+// journeyPolicies merges the op selectors of a journey per key the way
+// catalog resolution does: strictest class, approval OR-ed.
+func journeyPolicies(j Journey) map[string]effectivePolicy {
+	out := map[string]effectivePolicy{}
+	for _, s := range j.Tools {
+		for _, key := range s.Ops {
+			next := effectivePolicy{class: s.Class, approval: s.ApprovalRequired}
+			if next.class == "" {
+				next.class = ClassEffectful
+			}
+			if prev, ok := out[key]; ok {
+				next.approval = next.approval || prev.approval
+				if policyClassRank(prev.class) > policyClassRank(next.class) {
+					next.class = prev.class
+				}
+			}
+			out[key] = next
+		}
+	}
+	for key, p := range out {
+		p.approval = p.approval || p.class != ClassReadOnly
+		out[key] = p
+	}
+	return out
+}
+
+// checkPolicyConflicts rejects one operation key, or one alias, carrying
+// different effective policies in different journeys. Tag selectors are
+// checked at bind time.
+func checkPolicyConflicts(set *Set) error {
+	ids := append([]string(nil), set.order...)
+	sort.Strings(ids)
+	byKey := map[string]map[string]effectivePolicy{}
+	byAlias := map[string]map[string]effectivePolicy{}
+	for _, id := range ids {
+		for key, p := range journeyPolicies(set.journeys[id]) {
+			if byKey[key] == nil {
+				byKey[key] = map[string]effectivePolicy{}
+			}
+			byKey[key][id] = p
+			if alias, ok := AliasFor(key); ok {
+				if byAlias[alias] == nil {
+					byAlias[alias] = map[string]effectivePolicy{}
+				}
+				byAlias[alias][id] = p
+			}
+		}
+	}
+	for _, group := range []struct {
+		kind string
+		m    map[string]map[string]effectivePolicy
+	}{{"operation", byKey}, {"alias", byAlias}} {
+		names := make([]string, 0, len(group.m))
+		for name := range group.m {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			var first string
+			for _, id := range ids {
+				p, ok := group.m[name][id]
+				if !ok {
+					continue
+				}
+				if first == "" {
+					first = id
+				} else if p != group.m[name][first] {
+					return fmt.Errorf("definitions: %s %q has conflicting policies in journeys %s, %s", group.kind, name, first, id)
+				}
+			}
 		}
 	}
 	return nil

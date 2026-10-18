@@ -436,29 +436,23 @@ func TestCatalogDigestCanonical(t *testing.T) {
 // migration still rewrites stored rows that carry it.
 const legacyDedupPolicy = "deduplicated"
 
-// policyOp builds an operation whose binding matches its arguments.
-func policyOp(t *testing.T, callID, policy string) Operation {
+// policyOp builds an operation on journey "j" whose binding matches its arguments and the owner's run state.
+func policyOp(t *testing.T, s *Store, o Owner, callID, policy string) Operation {
 	t.Helper()
-	binding, err := ActionBinding("lookup_alias", json.RawMessage(`{"city":"A"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return Operation{CallID: callID, Name: "lookup_alias", OperationKey: "lookup.destination", Arguments: `{"city":"A"}`, Binding: binding, Policy: policy, RequiresApproval: policy == "idempotent" || policy == "effectful"}
+	op := Operation{CallID: callID, Name: "lookup_alias", OperationKey: "lookup.destination", NameDigest: NameDigest("lookup destination"),
+		SchemaDigest: mustSchemaDigest(`{"type":"object"}`), Arguments: `{"city":"A"}`, Policy: policy, RequiresApproval: policy == "idempotent" || policy == "effectful", JourneyID: "j"}
+	return rebind(t, s, o, op)
 }
 
-// approve inserts a consumed approval for op on the owner's run.
+// approve inserts a consumed, decided approval for op on the owner's run.
 func approve(t *testing.T, s *Store, o Owner, op Operation, id string) {
 	t.Helper()
-	ctx := context.Background()
-	if _, err := s.Start(ctx, o, "j", strings.Repeat("d", 64)); err != nil && !errors.Is(err, ErrDefinition) {
-		t.Fatal(err)
-	}
 	artifact, err := json.Marshal(Interaction{ID: id, Kind: "approval", Call: ProposedCall{CallID: op.CallID, ProviderCallID: "p", Name: op.Name, Arguments: json.RawMessage(op.Arguments), Binding: op.Binding}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	reply, _ := json.Marshal(Reply{Decision: "approve", Binding: op.Binding})
-	mustExec(t, s.pool, "INSERT INTO agent_interactions(id,thread_id,run_id,journey_id,definition_digest,kind,artifact,checkpoint,history,expires_at,state,continuation_run_id,reply) VALUES($1,$2,$3,'j',$4,'approval',$5,'{}','[]',clock_timestamp()+interval '1 hour','consumed',$3,$6)", id, o.Command.ThreadID, o.Command.RunID, strings.Repeat("d", 64), artifact, reply)
+	mustExec(t, s.pool, "INSERT INTO agent_interactions(id,thread_id,run_id,journey_id,definition_digest,kind,artifact,checkpoint,history,expires_at,state,continuation_run_id,reply,marker) VALUES($1,$2,$3,'j',$4,'approval',$5,'{}','[]',clock_timestamp()+interval '1 hour','consumed',$3,$6,'decided')", id, o.Command.ThreadID, o.Command.RunID, strings.Repeat("d", 64), artifact, reply)
 }
 
 func storedOp(t *testing.T, s *Store, callID string) (alias, key, policy string, requires bool) {
@@ -473,8 +467,9 @@ func TestBeginAttemptPolicyReadOnly(t *testing.T) {
 	ctx := context.Background()
 	s := scopedStore(t)
 	o := admitClaim(t, s, testCommand())
+	startScoped(t, s, o, "j")
 
-	plain := policyOp(t, "k1", "read_only")
+	plain := policyOp(t, s, o, "k1", "read_only")
 	if err := s.BeginAttempt(ctx, o, plain, 1, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -485,7 +480,7 @@ func TestBeginAttemptPolicyReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	gated := policyOp(t, "k2", "read_only")
+	gated := policyOp(t, s, o, "k2", "read_only")
 	gated.RequiresApproval = true
 	if err := s.BeginAttempt(ctx, o, gated, 1, ""); !errors.Is(err, ErrState) {
 		t.Fatalf("read_only with RequiresApproval and no approval: %v", err)
@@ -510,7 +505,8 @@ func TestBeginAttemptPolicyIdempotentRetry(t *testing.T) {
 	ctx := context.Background()
 	s := scopedStore(t)
 	o := admitClaim(t, s, testCommand())
-	op := policyOp(t, "k1", "idempotent")
+	startScoped(t, s, o, "j")
+	op := policyOp(t, s, o, "k1", "idempotent")
 	if err := s.BeginAttempt(ctx, o, op, 1, ""); !errors.Is(err, ErrState) {
 		t.Fatalf("no approval: %v", err)
 	}
@@ -537,7 +533,7 @@ func TestBeginAttemptPolicyIdempotentRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	again := policyOp(t, "k2", "idempotent")
+	again := policyOp(t, s, o, "k2", "idempotent")
 	if err := s.BeginAttempt(ctx, o, again, 1, ""); !errors.Is(err, ErrState) {
 		t.Fatalf("idempotent without approval: %v", err)
 	}
@@ -554,9 +550,10 @@ func TestBeginAttemptPolicyEffectfulAndUnknown(t *testing.T) {
 	ctx := context.Background()
 	s := scopedStore(t)
 	o := admitClaim(t, s, testCommand())
+	startScoped(t, s, o, "j")
 
 	// A non-read_only operation without RequiresApproval is rejected, approval or not.
-	noFlag := policyOp(t, "k0", "effectful")
+	noFlag := policyOp(t, s, o, "k0", "effectful")
 	noFlag.RequiresApproval = false
 	approve(t, s, o, noFlag, "a0")
 	if err := s.BeginAttempt(ctx, o, noFlag, 1, "a0"); !errors.Is(err, ErrState) {
@@ -567,7 +564,7 @@ func TestBeginAttemptPolicyEffectfulAndUnknown(t *testing.T) {
 		t.Fatalf("idempotent without RequiresApproval: %v", err)
 	}
 
-	eff := policyOp(t, "k1", "effectful")
+	eff := policyOp(t, s, o, "k1", "effectful")
 	if err := s.BeginAttempt(ctx, o, eff, 1, ""); !errors.Is(err, ErrState) {
 		t.Fatalf("effectful without approval: %v", err)
 	}
@@ -584,7 +581,7 @@ func TestBeginAttemptPolicyEffectfulAndUnknown(t *testing.T) {
 
 	// The legacy alias is no longer accepted.
 	for _, policy := range []string{"", "bogus", "Read_Only", legacyDedupPolicy} {
-		op := policyOp(t, "k-"+policy, policy)
+		op := policyOp(t, s, o, "k-"+policy, policy)
 		if err := s.BeginAttempt(ctx, o, op, 1, ""); !errors.Is(err, ErrState) {
 			t.Fatalf("policy %q: %v", policy, err)
 		}

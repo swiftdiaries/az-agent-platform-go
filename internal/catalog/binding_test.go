@@ -514,3 +514,65 @@ func TestOpenUnavailableJourney(t *testing.T) {
 		t.Fatalf("Call of unavailable alias = %v", err)
 	}
 }
+
+// compileTagSet writes one journey per spec, each with a single tag selector
+// of the given class, so policies are known only after resolution.
+func compileTagSet(t *testing.T, specs map[string][2]string) *definitions.Set {
+	t.Helper()
+	dir := t.TempDir()
+	var b strings.Builder
+	fmt.Fprintf(&b, "catalog:\n  operation_meta_key: %s\n  call_id_header: %s\njourneys:\n", mcptest.DefaultMetaKey, callIDHeader)
+	for _, id := range []string{"tagA", "tagB", "plain"} {
+		spec, ok := specs[id]
+		if !ok {
+			continue
+		}
+		skillDir := filepath.Join(dir, "skills", id)
+		if err := os.MkdirAll(skillDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		skill := fmt.Sprintf("---\nname: %s\ndescription: skill %s\n---\nBody.\n", id, id)
+		if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skill), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&b, "  - id: %s\n    skill: skills/%s\n    tools:\n      - tags: [%s]\n        class: %s\n", id, id, spec[0], spec[1])
+	}
+	path := filepath.Join(dir, "journeys.yaml")
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	set, err := definitions.Compile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return set
+}
+
+func TestOpenPolicyConflict(t *testing.T) {
+	e := newEnv(t, mcptest.Options{},
+		mcptest.Tool{Name: "travel/book", OperationKey: "travel.book", Tags: []string{"shared"}},
+		mcptest.Tool{Name: "travel/lookup", OperationKey: "travel.lookup", Tags: []string{"solo"}},
+	)
+	e.set = compileTagSet(t, map[string][2]string{
+		"tagA":  {"shared", "effectful"},
+		"tagB":  {"shared", "idempotent"},
+		"plain": {"solo", "read_only"},
+	})
+	b := e.open(t, e.claim(t, "r1"), Options{})
+	for _, id := range []string{"tagA", "tagB"} {
+		res, ok := b.Resolution(id)
+		if !ok || res.Available() || len(res.Unavailable) != 1 ||
+			res.Unavailable[0] != (Unavailable{ReasonPolicyConflict, "travel.book"}) {
+			t.Fatalf("%s resolution = %+v ok=%v", id, res, ok)
+		}
+		if got := b.Tools(id); len(got) != 0 {
+			t.Fatalf("Tools(%s) = %v", id, got)
+		}
+	}
+	if res, ok := b.Resolution("plain"); !ok || !res.Available() {
+		t.Fatalf("plain resolution = %+v", res)
+	}
+	if _, ok := b.Tool("plain", "travel_lookup"); !ok {
+		t.Fatal("plain journey lost its tool")
+	}
+}

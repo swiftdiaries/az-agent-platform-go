@@ -20,12 +20,13 @@ type Snapshot struct {
 type Reason string
 
 const (
-	ReasonMissing      Reason = "missing_operation"
-	ReasonAmbiguous    Reason = "ambiguous_operation"
-	ReasonCollision    Reason = "alias_collision"
-	ReasonInvalidAlias Reason = "invalid_alias"
-	ReasonMaxTools     Reason = "max_tools_exceeded"
-	ReasonVersion      Reason = "product_version_out_of_range"
+	ReasonMissing        Reason = "missing_operation"
+	ReasonAmbiguous      Reason = "ambiguous_operation"
+	ReasonCollision      Reason = "alias_collision"
+	ReasonInvalidAlias   Reason = "invalid_alias"
+	ReasonMaxTools       Reason = "max_tools_exceeded"
+	ReasonVersion        Reason = "product_version_out_of_range"
+	ReasonPolicyConflict Reason = "policy_conflict"
 )
 
 // Unavailable is one reason a journey cannot be served. Operation is an
@@ -240,4 +241,67 @@ func hasAllTags(meta map[string]any, want []string) bool {
 		}
 	}
 	return true
+}
+
+type policy struct {
+	class    definitions.Class
+	approval bool
+}
+
+// CheckPolicies marks unavailable every available resolution that shares an
+// operation key or an alias with another available resolution under a
+// different (Class, RequiresApproval). It is pure: it returns a new slice,
+// preserves input order, and leaves unavailable resolutions unchanged.
+func CheckPolicies(rs []Resolution) []Resolution {
+	keyPolicies := map[string]map[policy]bool{}
+	aliasPolicies := map[string]map[policy]bool{}
+	note := func(m map[string]map[policy]bool, name string, p policy) {
+		if m[name] == nil {
+			m[name] = map[policy]bool{}
+		}
+		m[name][p] = true
+	}
+	for _, r := range rs {
+		if !r.Available() {
+			continue
+		}
+		for _, t := range r.Tools {
+			p := policy{t.Class, t.RequiresApproval}
+			note(keyPolicies, t.OperationKey, p)
+			note(aliasPolicies, t.Alias, p)
+		}
+	}
+
+	out := make([]Resolution, len(rs))
+	for i, r := range rs {
+		out[i] = r
+		if !r.Available() {
+			continue
+		}
+		seen := map[string]bool{}
+		var conflicts []string
+		for _, t := range r.Tools {
+			name := ""
+			switch {
+			case len(keyPolicies[t.OperationKey]) > 1:
+				name = t.OperationKey
+			case len(aliasPolicies[t.Alias]) > 1:
+				name = t.Alias
+			}
+			if name != "" && !seen[name] {
+				seen[name] = true
+				conflicts = append(conflicts, name)
+			}
+		}
+		if len(conflicts) == 0 {
+			continue
+		}
+		sort.Strings(conflicts)
+		out[i].Tools = nil
+		out[i].Unavailable = make([]Unavailable, len(conflicts))
+		for j, name := range conflicts {
+			out[i].Unavailable[j] = Unavailable{ReasonPolicyConflict, name}
+		}
+	}
+	return out
 }

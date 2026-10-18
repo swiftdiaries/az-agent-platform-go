@@ -83,6 +83,52 @@ func (c *conversation) owner(alias string) (string, bool) {
 	}, alias)
 }
 
+// callBinding is the v2 binding of one proposed call and the fields it was computed from.
+type callBinding struct {
+	journeyID, operationKey, nameDigest, schemaDigest, binding string
+}
+
+// bindCall computes the binding of a call. An alias call passes its owning journey and
+// resolved tool; a clarification passes "" and the question tool's operation.
+func (c *conversation) bindCall(in RunInput, journeyID, operationKey, remoteName string, schema json.RawMessage, arguments string) (callBinding, error) {
+	schemaDigest, err := journal.SchemaDigest(schema)
+	if err != nil {
+		return callBinding{}, err
+	}
+	b := callBinding{journeyID: journeyID, operationKey: operationKey, nameDigest: journal.NameDigest(remoteName), schemaDigest: schemaDigest}
+	b.binding, err = journal.BindCall(journal.CallBinding{
+		JourneyID: journeyID, OperationKey: operationKey, NameDigest: b.nameDigest, SchemaDigest: schemaDigest,
+		Arguments: json.RawMessage(arguments), ProductVersion: in.ProductVersion, Principal: in.Principal,
+		Conversation: in.ThreadID, DefinitionSet: c.set.Digest(),
+	})
+	return b, err
+}
+
+func (c *conversation) bindTool(in RunInput, journeyID string, t catalog.Tool, arguments string) (callBinding, error) {
+	return c.bindCall(in, journeyID, t.OperationKey, t.RemoteName, t.InputSchema, arguments)
+}
+
+func (c *conversation) bindClarification(in RunInput, arguments string) (callBinding, error) {
+	schema, err := json.Marshal(questionTool{}.Schema())
+	if err != nil {
+		return callBinding{}, err
+	}
+	return c.bindCall(in, "", toolRequestUserInput, toolRequestUserInput, schema, arguments)
+}
+
+// interaction builds the interaction that carries a call and its binding.
+func (b callBinding) interaction(kind, callID string, call *message.FunctionCallContent) journal.Interaction {
+	return journal.Interaction{
+		ID: "interaction_" + rand.Text(), Kind: kind, JourneyID: b.journeyID, OperationKey: b.operationKey,
+		NameDigest: b.nameDigest, SchemaDigest: b.schemaDigest,
+		Call: journal.ProposedCall{CallID: callID, ProviderCallID: call.CallID, Name: call.Name, Arguments: json.RawMessage(call.Arguments), Binding: b.binding},
+	}
+}
+
+func (b callBinding) operation(callID, name, arguments string, t catalog.Tool) journal.Operation {
+	return journal.Operation{CallID: callID, Name: name, OperationKey: b.operationKey, NameDigest: b.nameDigest, SchemaDigest: b.schemaDigest, Arguments: arguments, Binding: b.binding, Policy: string(t.Class), RequiresApproval: t.RequiresApproval, JourneyID: b.journeyID}
+}
+
 // activate processes one activate_journey call. Only a failure of the fenced journal
 // ends the run; every refusal is a result for the model.
 func (c *conversation) activate(ctx context.Context, in RunInput, arguments string) (any, error) {
@@ -290,11 +336,105 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation
 		}
 		return response, err
 	}
-	var calls []*message.FunctionCallContent
-	if approved != nil {
-		calls = []*message.FunctionCallContent{{CallID: approved.Call.ProviderCallID, Name: approved.Call.Name, Arguments: string(approved.Call.Arguments)}}
-	}
 	callNumber := 0
+	nextCallID := func() string {
+		callNumber++
+		return stableCallID(in.ThreadID, fmt.Sprintf("%s/%d/%d", in.RunID, in.Iteration, callNumber))
+	}
+	// wait checkpoints one interaction with the history so far and ends the run waiting.
+	// journal.ErrPending (steering arrived) is returned unchanged.
+	wait := func(i journal.Interaction) (RunOutput, error) {
+		checkpoint, err := json.Marshal(struct {
+			Mode    string `json:"mode"`
+			Repairs int    `json:"repairs"`
+		}{"product_resume_in_place", repairBudget})
+		if err != nil {
+			return RunOutput{}, err
+		}
+		serialized, err := json.Marshal(history)
+		if err != nil {
+			return RunOutput{}, err
+		}
+		if err := in.Store.Wait(ctx, in.Owner, i, checkpoint, serialized); err != nil {
+			return RunOutput{}, err
+		}
+		return RunOutput{JourneyID: in.TargetJourney, History: serialized, Waiting: true}, nil
+	}
+	// settle records a dispatch result, spending the repair budget on a business rejection.
+	settle := func(providerCallID string, result any) error {
+		if failure, ok := result.(map[string]any); ok && failure["error"] == "business_rejected" {
+			if repairBudget == 0 {
+				return fmt.Errorf("business repair budget exhausted")
+			}
+			repairBudget--
+		}
+		history = append(history, resultMessage(providerCallID, result))
+		return nil
+	}
+	if approved != nil {
+		call := &message.FunctionCallContent{CallID: approved.Call.ProviderCallID, Name: approved.Call.Name, Arguments: string(approved.Call.Arguments)}
+		// supersededWait opens a new approval for the same action, bound to the same
+		// journey and the current definitions; the provider call stays open.
+		supersededWait := func(t catalog.Tool) (RunOutput, bool, error) {
+			b, err := conv.bindTool(in, approved.JourneyID, t, call.Arguments)
+			if err != nil {
+				return RunOutput{}, false, err
+			}
+			out, err := wait(b.interaction("approval", nextCallID(), call))
+			if errors.Is(err, journal.ErrPending) {
+				history = append(history, resultMessage(call.CallID, map[string]string{"error": "superseded_by_steering"}))
+				return RunOutput{}, false, nil
+			}
+			return out, err == nil, err
+		}
+		// The approval is only valid for the journey it was granted under, resolved now.
+		tool, resolves := catalog.Tool{}, false
+		if conv.isAvailable(approved.JourneyID) {
+			tool, resolves = conv.cat.Tool(approved.JourneyID, call.Name)
+		}
+		var out RunOutput
+		var waiting bool
+		switch {
+		case !resolves:
+			if err := in.Store.Supersede(ctx, in.Owner, approved.ID); err != nil {
+				return RunOutput{}, err
+			}
+			history = append(history, resultMessage(call.CallID, map[string]string{"error": "approval_superseded", "message": "the approved action is no longer available"}))
+		default:
+			b, err := conv.bindTool(in, approved.JourneyID, tool, call.Arguments)
+			if err != nil {
+				return RunOutput{}, err
+			}
+			if b.binding != approved.Call.Binding {
+				if err := in.Store.Supersede(ctx, in.Owner, approved.ID); err != nil {
+					return RunOutput{}, err
+				}
+				if out, waiting, err = supersededWait(tool); err != nil || waiting {
+					return out, err
+				}
+				break
+			}
+			callNumber++
+			op := b.operation(approved.Call.CallID, call.Name, call.Arguments, tool)
+			// The approval is consumed (and marked dispatched) even if the policy no longer requires one.
+			op.RequiresApproval = true
+			result, err := guardedCall(ctx, in, conv.cat, op, approved.ID)
+			if errors.Is(err, journal.ErrSuperseded) {
+				if out, waiting, err = supersededWait(tool); err != nil || waiting {
+					return out, err
+				}
+				break
+			}
+			if err != nil {
+				return RunOutput{}, err
+			}
+			if err := settle(call.CallID, result); err != nil {
+				return RunOutput{}, err
+			}
+		}
+		approved = nil
+	}
+	var calls []*message.FunctionCallContent
 	for round := 0; round < 16; round++ {
 		if len(calls) == 0 {
 			response, err := invoke()
@@ -344,28 +484,24 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation
 				history = append(history, resultMessage(call.CallID, map[string]string{"error": "tool_not_active"}))
 				continue
 			}
-			binding, err := journal.ActionBinding(call.Name, []byte(call.Arguments))
-			if err != nil {
-				return RunOutput{}, err
-			}
-			callID := stableCallID(in.ThreadID, fmt.Sprintf("%s/%d/%d", in.RunID, in.Iteration, callNumber))
+			callID := nextCallID()
 			var resolved catalog.Tool
+			var b callBinding
+			var err error
 			if step.Kind == callAlias {
 				var allowed bool
 				resolved, allowed = conv.cat.Tool(step.Journey, call.Name)
 				if !allowed {
 					return RunOutput{}, fmt.Errorf("tool is not allowed")
 				}
+				b, err = conv.bindTool(in, step.Journey, resolved, call.Arguments)
+			} else if step.Kind == callAsk {
+				b, err = conv.bindClarification(in, call.Arguments)
 			}
-			approvalID := ""
-			if approved != nil && approved.Call.ProviderCallID == call.CallID {
-				if approved.Call.Binding != binding {
-					return RunOutput{}, journal.ErrState
-				}
-				callID = approved.Call.CallID
-				approvalID = approved.ID
+			if err != nil {
+				return RunOutput{}, err
 			}
-			if step.Kind == callAsk || (resolved.RequiresApproval && approvalID == "") {
+			if step.Kind == callAsk || resolved.RequiresApproval {
 				// Close siblings explicitly before checkpointing one externally answerable
 				// request; they may be proposed again after this wait, never auto-dispatched.
 				for _, sibling := range plan[index+1:] {
@@ -375,7 +511,7 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation
 
 				// A clarification is not owned by a journey; an approval belongs to the
 				// journey that owns the tool.
-				i := journal.Interaction{ID: "interaction_" + rand.Text(), Kind: "approval", JourneyID: step.Journey, Call: journal.ProposedCall{CallID: callID, ProviderCallID: call.CallID, Name: call.Name, Arguments: json.RawMessage(call.Arguments), Binding: binding}}
+				i := b.interaction("approval", callID, call)
 				if step.Kind == callAsk {
 					i.Kind = "clarification"
 					var args struct {
@@ -386,41 +522,21 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation
 					}
 					i.Questions = args.Questions
 				}
-				checkpoint, err := json.Marshal(struct {
-					Mode    string `json:"mode"`
-					Repairs int    `json:"repairs"`
-				}{"product_resume_in_place", repairBudget})
-				if err != nil {
-					return RunOutput{}, err
-				}
-				serialized, err := json.Marshal(history)
-				if err != nil {
-					return RunOutput{}, err
-				}
-				err = in.Store.Wait(ctx, in.Owner, i, checkpoint, serialized)
+				out, err := wait(i)
 				if errors.Is(err, journal.ErrPending) {
 					m := resultMessage(call.CallID, map[string]string{"error": "superseded_by_steering"})
 					history = append(history, m)
 					break
 				}
-				if err != nil {
-					return RunOutput{}, err
-				}
-				return RunOutput{JourneyID: in.TargetJourney, History: serialized, Waiting: true}, nil
+				return out, err
 			}
-			result, err := guardedCall(ctx, in, conv.cat, journal.Operation{CallID: callID, Name: call.Name, OperationKey: resolved.OperationKey, Arguments: call.Arguments, Binding: binding, Policy: string(resolved.Class), RequiresApproval: resolved.RequiresApproval, JourneyID: step.Journey}, approvalID)
+			result, err := guardedCall(ctx, in, conv.cat, b.operation(callID, call.Name, call.Arguments, resolved), "")
 			if err != nil {
 				return RunOutput{}, err
 			}
-			if failure, ok := result.(map[string]any); ok && failure["error"] == "business_rejected" {
-				if repairBudget == 0 {
-					return RunOutput{}, fmt.Errorf("business repair budget exhausted")
-				}
-				repairBudget--
+			if err := settle(call.CallID, result); err != nil {
+				return RunOutput{}, err
 			}
-			m := resultMessage(call.CallID, result)
-			history = append(history, m)
-			approved = nil
 		}
 		calls = nil
 	}

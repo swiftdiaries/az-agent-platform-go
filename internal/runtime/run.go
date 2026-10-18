@@ -282,7 +282,10 @@ func (r *Runner) converse(ctx context.Context, input RunInput, set *definitions.
 	if _, err := active.Fit(limit, pinned); err != nil {
 		return RunOutput{}, err
 	}
-	if input.TargetJourney != "" {
+	// A continuation resumes interactions bound to journeys that may have since become
+	// unavailable; its target is simply not activated, and the approval guard decides.
+	continuation := input.Owner.Command.InteractionID != ""
+	if input.TargetJourney != "" && !(continuation && !isAvailable(input.TargetJourney)) {
 		if !isAvailable(input.TargetJourney) {
 			resolution, _ := cat.Resolution(input.TargetJourney)
 			return RunOutput{}, unavailableJourney(resolution)

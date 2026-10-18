@@ -171,9 +171,13 @@ func open(ctx context.Context, session *mcp.ClientSession, scope Scope, store *j
 		session: session, byAlias: map[string]Tool{}, digest: digest, productVersion: scope.ProductVersion,
 		serverName: serverName, serverVersion: serverVersion,
 	}
-	for _, journey := range set.Journeys() {
-		res := Resolve(journey, snapshot, cfg.OperationMetaKey)
-		b.resolutions = append(b.resolutions, res)
+	journeys := set.Journeys()
+	resolved := make([]Resolution, len(journeys))
+	for i, journey := range journeys {
+		resolved[i] = Resolve(journey, snapshot, cfg.OperationMetaKey)
+	}
+	b.resolutions = CheckPolicies(resolved)
+	for _, res := range b.resolutions {
 		if !res.Available() {
 			continue
 		}

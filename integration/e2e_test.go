@@ -1158,6 +1158,183 @@ func TestE2EConversationAgent(t *testing.T) {
 	t.Run("S6", func(t *testing.T) {
 		stage(t, 6, "H5")
 		// Approval wait, tenant moved to vN+1, approve: superseded plus a new interaction, then dispatched exactly once on vN+1; clarification replies survive the flip.
+		const (
+			threadApproval, threadClarify = "e2e-s6-approval", "e2e-s6-clarify"
+			token                         = "token"
+		)
+		pool := database(t)
+		set := e2eJourneySet(t)
+		vN := mcptest.New(t, mcptest.Options{Name: "e2e-s6-vN", Version: "vN"}, e2eCatalog(func(o e2eOp) string { return o.remoteA }))
+		vN1 := mcptest.New(t, mcptest.Options{Name: "e2e-s6-vN1", Version: "vN+1"}, e2eCatalog(func(o e2eOp) string { return o.remoteB }))
+		allow, err := tenantdir.NewAllowlist(map[string]string{"java-vn": vN.URL(), "java-vn1": vN1.URL()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		source, err := settings.NewMutable(settings.Document{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		onVN := tenantdir.Entry{ProductVersion: "vN", EndpointID: "java-vn"}
+		onVN1 := tenantdir.Entry{ProductVersion: "vN+1", EndpointID: "java-vn1"}
+		directory := tenantdir.NewMutable(map[string]tenantdir.Entry{"tenant-a": onVN})
+		tenancy := agentruntime.Tenancy{Directory: directory, Endpoints: allow, Settings: source}
+
+		// Model script; the comment on each step is its global request index.
+		model := modeltest.New(
+			// Approval thread, run 1 (on vN).
+			modeltest.Call("activate_journey", map[string]any{"journey": "booking"}), // 0
+			modeltest.Call("book_reserve", struct{}{}),                               // 1: effectful, waits for approval
+			// Approval thread, run 3: the new approval is granted on vN+1. Runs 2 (supersede) makes no model request.
+			modeltest.Text("booked"), // 2
+			// Clarification thread.
+			modeltest.Func(func(_ context.Context, _ agentruntime.ModelRequest) (agentruntime.ModelResponse, error) { // 3
+				return agentruntime.ModelResponse{ToolCalls: []agentruntime.ToolCall{{
+					CallID: "s6-clarify", Name: "request_user_input",
+					Arguments: json.RawMessage(`{"questions":[{"id":"seat","header":"Seat","question":"Which seat?","options":[{"label":"Aisle","description":"Aisle seat"},{"label":"Window","description":"Window seat"}]}]}`),
+				}}}, nil
+			}),
+			modeltest.Text("clarified"), // 4
+		)
+		a, b, c := threeReplicas(t, pool, set, model, tenancy)
+
+		post := func(replica acceptanceReplica, thread, run string, input aguitypes.RunAgentInput) string {
+			t.Helper()
+			input.ThreadID, input.RunID = thread, run
+			return e2eReadBody(t, run, acceptancePostWithHeaders(t, replica.url, input, http.Header{"Authorization": {"Bearer " + token}}))
+		}
+		type pendingInteraction struct{ id, callID, binding string }
+		pending := func(thread string) pendingInteraction {
+			t.Helper()
+			var p pendingInteraction
+			if err := pool.QueryRow(t.Context(), `SELECT id, artifact->'call'->>'callId', COALESCE(artifact->'call'->>'binding','') FROM agent_interactions WHERE thread_id=$1 AND state='pending'`,
+				acceptanceThreadFor(t, pool, testPrincipal, thread)).Scan(&p.id, &p.callID, &p.binding); err != nil {
+				t.Fatalf("no pending interaction on %s: %v", thread, err)
+			}
+			return p
+		}
+		marker := func(id string) (m *string, state, product string) {
+			t.Helper()
+			var p *string
+			if err := pool.QueryRow(t.Context(), `SELECT marker, state, COALESCE(product_version,'') FROM agent_interactions WHERE id=$1`, id).Scan(&m, &state, &p); err != nil {
+				t.Fatal(err)
+			}
+			if p != nil {
+				product = *p
+			}
+			return m, state, product
+		}
+		requireMarker := func(label, id, want, wantState string) {
+			t.Helper()
+			m, state, _ := marker(id)
+			if m == nil || *m != want || state != wantState {
+				t.Errorf("%s: interaction %s marker/state = %v/%s, want %s/%s", label, id, m, state, want, wantState)
+			}
+		}
+		approve := func(replica acceptanceReplica, thread, run string, p pendingInteraction) string {
+			t.Helper()
+			return post(replica, thread, run, aguitypes.RunAgentInput{ForwardedProps: map[string]any{"interactionReply": map[string]any{
+				"interactionId": p.id, "kind": "approval",
+				"answer": map[string]any{"decision": "approve", "binding": p.binding},
+			}}})
+		}
+
+		// Run 1: the approval wait opens on vN; nothing is dispatched.
+		body := post(a, threadApproval, "e2e-s6-run1", aguitypes.RunAgentInput{Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "book"}}})
+		if !strings.Contains(body, "interaction.requested") {
+			t.Fatalf("run 1 lacks the approval request: %s", body)
+		}
+		old := pending(threadApproval)
+		if m, _, product := marker(old.id); m == nil || *m != "requested" || product != "vN" {
+			t.Fatalf("old approval marker/product_version = %v/%s, want requested/vN", m, product)
+		}
+		if vN.Calls("book/reserve") != 0 || vN1.Calls("book reserve") != 0 {
+			t.Fatalf("MCP calls before approval: vN %d, vN+1 %d, want 0, 0", vN.Calls("book/reserve"), vN1.Calls("book reserve"))
+		}
+
+		// The tenant moves to vN+1 while the approval is pending.
+		directory.Set("tenant-a", onVN1)
+
+		// Run 2 (another replica): approving the old interaction supersedes it and opens a new approval; zero MCP calls.
+		body = approve(b, threadApproval, "e2e-s6-run2", old)
+		if !strings.Contains(body, "interaction.requested") || strings.Contains(body, "RUN_ERROR") {
+			t.Fatalf("run 2 did not wait on a new approval: %s", body)
+		}
+		requireMarker("old approval after flip", old.id, "superseded", "consumed")
+		fresh := pending(threadApproval)
+		if fresh.id == old.id || fresh.callID == old.callID || fresh.binding == old.binding || fresh.binding == "" {
+			t.Errorf("new approval %#v must differ from the old %#v in id, call id and binding", fresh, old)
+		}
+		if m, _, product := marker(fresh.id); m == nil || *m != "requested" || product != "vN+1" {
+			t.Errorf("new approval marker/product_version = %v/%s, want requested/vN+1", m, product)
+		}
+		var superseded int
+		if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM agent_events WHERE thread_id=$1 AND kind='interaction.superseded'`, acceptanceThreadFor(t, pool, testPrincipal, threadApproval)).Scan(&superseded); err != nil || superseded != 1 {
+			t.Errorf("interaction.superseded events = %d (%v), want 1", superseded, err)
+		}
+		if vN.Calls("book/reserve") != 0 || vN1.Calls("book reserve") != 0 {
+			t.Errorf("MCP calls after supersede: vN %d, vN+1 %d, want 0, 0", vN.Calls("book/reserve"), vN1.Calls("book reserve"))
+		}
+		if got := model.Count(); got != 2 {
+			t.Errorf("model requests after supersede = %d, want 2 (the supersede run asks the model nothing)", got)
+		}
+
+		// Run 3 (third replica): approving the new interaction dispatches exactly once on vN+1.
+		body = approve(c, threadApproval, "e2e-s6-run3", fresh)
+		if !strings.Contains(body, "RUN_FINISHED") || !strings.Contains(body, "booked") {
+			t.Fatalf("run 3 did not finish with the answer: %s", body)
+		}
+		if vN1.Calls("book reserve") != 1 || vN.Calls("book/reserve") != 0 {
+			t.Errorf("MCP calls after approval: vN+1 book reserve %d, vN book/reserve %d, want 1, 0", vN1.Calls("book reserve"), vN.Calls("book/reserve"))
+		}
+		requireMarker("new approval", fresh.id, "dispatched", "consumed")
+		requireMarker("old approval stays superseded", old.id, "superseded", "consumed")
+
+		// Clarification thread: opened on vN, answered after the flip to vN+1.
+		directory.Set("tenant-a", onVN)
+		body = post(a, threadClarify, "e2e-s6-clarify1", aguitypes.RunAgentInput{Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "seat?"}}})
+		if !strings.Contains(body, "interaction.requested") {
+			t.Fatalf("clarification run lacks the question: %s", body)
+		}
+		question := pending(threadClarify)
+		var artifact struct {
+			Kind      string `json:"kind"`
+			Questions []struct {
+				Header  string `json:"header"`
+				Options []struct{ Label, Description string }
+			} `json:"questions"`
+		}
+		var raw []byte
+		if err := pool.QueryRow(t.Context(), `SELECT artifact FROM agent_interactions WHERE id=$1`, question.id).Scan(&raw); err != nil || json.Unmarshal(raw, &artifact) != nil {
+			t.Fatalf("clarification artifact %s: %v", raw, err)
+		}
+		if len(artifact.Questions) != 1 || len(artifact.Questions[0].Header) > 12 || len(artifact.Questions[0].Options) < 2 || len(artifact.Questions[0].Options) > 3 {
+			t.Fatalf("clarification questions = %s, want 1 question, header <= 12 chars, 2-3 options", raw)
+		}
+		for _, option := range artifact.Questions[0].Options {
+			if option.Label == "" || option.Description == "" {
+				t.Errorf("clarification option %#v lacks label or description", option)
+			}
+		}
+		if m, state, _ := marker(question.id); m != nil || state != "pending" {
+			t.Errorf("clarification marker/state = %v/%s, want NULL/pending", m, state)
+		}
+		directory.Set("tenant-a", onVN1)
+		body = post(b, threadClarify, "e2e-s6-clarify2", aguitypes.RunAgentInput{ForwardedProps: map[string]any{"interactionReply": map[string]any{
+			"interactionId": question.id, "kind": "clarification",
+			"answer": map[string]any{"answers": map[string]any{"seat": map[string]any{"option": "Window"}}},
+		}}})
+		if !strings.Contains(body, "RUN_FINISHED") || !strings.Contains(body, "clarified") {
+			t.Fatalf("clarification reply did not finish with the answer: %s", body)
+		}
+		if got := model.Count(); got != 5 {
+			t.Fatalf("model requests = %d, want 5", got)
+		}
+		if got := e2eResult(t, model.Requests()[4], "s6-clarify"); !strings.Contains(got, "Window") {
+			t.Errorf("request 4 result for s6-clarify = %s, want it to carry the answer Window", got)
+		}
+		if m, state, _ := marker(question.id); m != nil || state != "consumed" {
+			t.Errorf("answered clarification marker/state = %v/%s, want NULL/consumed", m, state)
+		}
 	})
 	t.Run("S7", func(t *testing.T) {
 		stage(t, 7, "H6")

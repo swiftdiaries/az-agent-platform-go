@@ -1,8 +1,12 @@
 package journal
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -44,12 +48,21 @@ const (
 	seedCheckpoint = `{"mode":"product_resume_in_place","repairs":1}`
 )
 
+// mustBinding is the legacy (v1) approval binding the pre-000011 code computed: sha256(name \x00 json(arguments)),
+// with json.Number preserved. ActionBinding is gone; migrated rows still carry this form.
 func mustBinding(name string, arguments json.RawMessage) string {
-	b, err := ActionBinding(name, arguments)
+	d := json.NewDecoder(bytes.NewReader(arguments))
+	d.UseNumber()
+	var value map[string]any
+	if err := d.Decode(&value); err != nil {
+		panic(err)
+	}
+	data, err := json.Marshal(value)
 	if err != nil {
 		panic(err)
 	}
-	return b
+	sum := sha256.Sum256(append([]byte(name+"\x00"), data...))
+	return hex.EncodeToString(sum[:])
 }
 
 // seedApprovalInteraction is the artifact stored for interaction-approval.
@@ -346,8 +359,8 @@ func TestMigration000010(t *testing.T) {
 		if n := count(t, "SELECT count(*) FROM agent_interactions WHERE id=$1 AND journey_id='A' AND state='pending'", seedApprovalInteractionID); n != 1 {
 			t.Fatalf("interaction changed: %d", n)
 		}
-		if n := count(t, "SELECT count(*) FROM agent_schema_migrations"); n != 10 {
-			t.Fatalf("migrations = %d, want 10", n)
+		if n := count(t, "SELECT count(*) FROM agent_schema_migrations"); n != len(migrationNames) {
+			t.Fatalf("migrations = %d, want %d", n, len(migrationNames))
 		}
 	})
 
@@ -387,7 +400,7 @@ func TestMigration000010(t *testing.T) {
 		}
 	})
 	t.Run("a NULL interaction journey is accepted", func(t *testing.T) {
-		mustExec(t, pool, "INSERT INTO agent_interactions(id,thread_id,run_id,journey_id,definition_digest,kind,artifact,checkpoint,history,expires_at) VALUES('inull','plain','rd',NULL,$1,'approval','{}','{}','[]',clock_timestamp()+interval '1 day')", seedDigestA)
+		mustExec(t, pool, "INSERT INTO agent_interactions(id,thread_id,run_id,journey_id,definition_digest,kind,artifact,checkpoint,history,expires_at,marker) VALUES('inull','plain','rd',NULL,$1,'approval','{}','{}','[]',clock_timestamp()+interval '1 day','requested')", seedDigestA)
 		if n := count(t, "SELECT count(*) FROM agent_interactions WHERE id='inull' AND journey_id IS NULL"); n != 1 {
 			t.Fatalf("NULL-journey interaction = %d", n)
 		}
@@ -400,6 +413,182 @@ func TestMigration000010(t *testing.T) {
 	t.Run("Migrate again is a no-op", func(t *testing.T) {
 		if err := Migrate(ctx, pool); err != nil {
 			t.Fatalf("second Migrate: %v", err)
+		}
+	})
+}
+
+// seedPre000011 extends a v10 database (the v8 seed migrated through 000010) with decided,
+// dispatched, denied and expired approvals on thread "m", then leaves it at v10.
+func seedPre000011(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	seedPre000009(t, ctx, pool)
+	if err := migrateTo(ctx, pool, 10); err != nil {
+		t.Fatal(err)
+	}
+	artifact := func(call string) string {
+		in := seedApprovalInteraction()
+		in.ID, in.Call.CallID, in.Call.ProviderCallID = "i-"+call, call, "prov-"+call
+		data, err := json.Marshal(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	continuation := Command{ThreadID: "m", RunID: "m-c1", CommunicationID: "m-c1", Principal: seedPrincipal,
+		InteractionID: "i-undispatched", ReplyKind: "approval", ReplyJSON: `{"decision":"approve","binding":"` + seedApprovalBinding + `"}`}
+	payload, err := json.Marshal(continuation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approve := `{"decision":"approve","binding":"` + seedApprovalBinding + `"}`
+	deny := `{"decision":"deny","binding":"` + seedApprovalBinding + `"}`
+	interaction := func(call, run, state, continuationRun string, reply any) []any {
+		return []any{"i-" + call, run, state, artifact(call), continuationRun, reply}
+	}
+	rows := [][]any{
+		interaction("undispatched", "m-r1", "consumed", "m-c1", approve),
+		interaction("dispatched", "m-r2", "consumed", "m-c2", approve),
+		interaction("denied", "m-r3", "consumed", "m-c3", deny),
+		interaction("expired", "m-r4", "expired", "", nil),
+	}
+	err = pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		exec := func(sql string, args ...any) error {
+			if _, err := tx.Exec(ctx, sql, args...); err != nil {
+				return fmt.Errorf("%s: %w", sql, err)
+			}
+			return nil
+		}
+		if err := exec("INSERT INTO agent_conversations(id,principal) VALUES('m',$1)", seedPrincipal); err != nil {
+			return err
+		}
+		for _, r := range []string{"m-r1", "m-r2", "m-r3", "m-r4"} {
+			if err := exec("INSERT INTO agent_commands(thread_id,communication_id,run_id,payload,execution_run_id) VALUES('m',$1,$2,$3::jsonb,$2)", "cm-"+r, r, seedPayload("m", r, "cm-"+r)); err != nil {
+				return err
+			}
+		}
+		if err := exec("INSERT INTO agent_commands(thread_id,communication_id,run_id,payload,execution_run_id) VALUES('m','m-c1','m-c1',$1::jsonb,'m-c1')", string(payload)); err != nil {
+			return err
+		}
+		if err := exec("INSERT INTO agent_runs(id,thread_id,state,journey_id,definition_digest) VALUES('m-r1','m','completed','A',$1),('m-r2','m','completed','A',$1),('m-r3','m','completed','A',$1),('m-r4','m','failed','A',$1),('m-c1','m','pending','A',$1)", seedDigestA); err != nil {
+			return err
+		}
+		for _, r := range rows {
+			if err := exec("INSERT INTO agent_interactions(id,thread_id,run_id,journey_id,definition_digest,kind,artifact,checkpoint,history,expires_at,state,continuation_run_id,reply) VALUES($1,'m',$2,'A',$6,'approval',$4::jsonb,$7::jsonb,$8::jsonb,CASE WHEN $3='expired' THEN clock_timestamp()-interval '1 day' ELSE clock_timestamp()+interval '1 day' END,$3,NULLIF($5,''),$9::jsonb)",
+				r[0], r[1], r[2], r[3], r[4], seedDigestA, seedCheckpoint, seedHistoryAp, r[5]); err != nil {
+				return err
+			}
+		}
+		return exec("INSERT INTO agent_operations(call_id,thread_id,run_id,alias,operation_key,arguments,binding,policy,requires_approval,outcome) VALUES('dispatched','m','m-r2','book','','{}','b','effectful',true,'completed')")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMigration000011(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.Database(t)
+	seedPre000011(t, ctx, pool)
+	if err := migrateTo(ctx, pool, 11); err != nil {
+		t.Fatal(err)
+	}
+	if len(migrationNames) != 11 {
+		t.Fatalf("migrationNames = %d, want 11 (extend this test)", len(migrationNames))
+	}
+
+	t.Run("markers are backfilled", func(t *testing.T) {
+		want := map[string]string{
+			seedApprovalInteractionID: "requested", // the pre-000009 pending approval
+			"i-undispatched":          "decided",
+			"i-dispatched":            "dispatched",
+			"i-denied":                "denied",
+			"i-expired":               "denied",
+			seedClarifyInteractionID:  "<null>", // a pending clarification keeps no marker
+		}
+		for id, marker := range want {
+			var got *string
+			if err := pool.QueryRow(ctx, "SELECT marker FROM agent_interactions WHERE id=$1", id).Scan(&got); err != nil {
+				t.Fatalf("%s: %v", id, err)
+			}
+			g := "<null>"
+			if got != nil {
+				g = *got
+			}
+			if g != marker {
+				t.Errorf("marker of %s = %q, want %q", id, g, marker)
+			}
+		}
+		var n int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_interactions WHERE operation_key IS NOT NULL OR name_digest IS NOT NULL OR schema_digest IS NOT NULL OR product_version IS NOT NULL OR catalog_digest IS NOT NULL OR active_journeys IS NOT NULL").Scan(&n); err != nil || n != 0 {
+			t.Fatalf("legacy rows with v2 columns = %d %v", n, err)
+		}
+	})
+
+	t.Run("constraints", func(t *testing.T) {
+		mustFail(t, pool, "UPDATE agent_interactions SET marker='bogus' WHERE id='i-denied'")
+		mustFail(t, pool, "UPDATE agent_interactions SET marker=NULL WHERE id='i-denied'")
+		mustFail(t, pool, "UPDATE agent_interactions SET marker='requested' WHERE id=$1", seedClarifyInteractionID)
+		mustExec(t, pool, "UPDATE agent_interactions SET marker='superseded' WHERE id='i-denied'")
+		mustExec(t, pool, "UPDATE agent_interactions SET marker='denied' WHERE id='i-denied'")
+	})
+
+	s := New(pool)
+	e := strings.Repeat("e", 64)
+	continued := func(t *testing.T, c Command) Owner {
+		t.Helper()
+		o, err := s.Claim(ctx, c, "o1", LeaseDuration)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Start(ctx, o, "A", e); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.RecordRunScope(ctx, o, RunScope{ProductVersion: testProductVersion, EndpointID: "e1", Settings: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+		return o
+	}
+	superseded := func(t *testing.T, o Owner, interaction, call string) {
+		t.Helper()
+		op := approvedOp(t, s, o, call, "A")
+		if err := s.BeginAttempt(ctx, o, op, 1, interaction); !errors.Is(err, ErrSuperseded) {
+			t.Fatalf("BeginAttempt = %v, want ErrSuperseded", err)
+		}
+		if m := markerOf(t, s, interaction); m != "superseded" {
+			t.Fatalf("marker = %q", m)
+		}
+		if n := operationRows(t, s, call); n != 0 {
+			t.Fatalf("agent_operations rows for %s = %d", call, n)
+		}
+	}
+
+	t.Run("a replied legacy pending approval is superseded, never dispatched", func(t *testing.T) {
+		c := Command{ThreadID: "approval", RunID: "approval-reply", CommunicationID: "approval-reply", Principal: seedPrincipal,
+			InteractionID: seedApprovalInteractionID, ReplyKind: "approval", ReplyJSON: `{"decision":"approve","binding":"` + seedApprovalBinding + `"}`}
+		if _, fresh, err := s.Admit(ctx, c); err != nil || !fresh {
+			t.Fatalf("Admit: fresh=%v err=%v", fresh, err)
+		}
+		if m := markerOf(t, s, seedApprovalInteractionID); m != "decided" {
+			t.Fatalf("marker after approve = %q", m)
+		}
+		o := continued(t, c)
+		superseded(t, o, seedApprovalInteractionID, seedApprovalCallID)
+	})
+
+	t.Run("a consumed-approve legacy approval that never dispatched is superseded", func(t *testing.T) {
+		c := Command{ThreadID: "m", RunID: "m-c1", CommunicationID: "m-c1", Principal: seedPrincipal,
+			InteractionID: "i-undispatched", ReplyKind: "approval", ReplyJSON: `{"decision":"approve","binding":"` + seedApprovalBinding + `"}`}
+		o := continued(t, c)
+		cont, err := s.Continuation(ctx, o)
+		if err != nil || cont == nil || cont.Marker != "decided" {
+			t.Fatalf("Continuation = %+v %v", cont, err)
+		}
+		superseded(t, o, "i-undispatched", "undispatched")
+	})
+
+	t.Run("Migrate again is a no-op", func(t *testing.T) {
+		if err := Migrate(ctx, pool); err != nil {
+			t.Fatal(err)
 		}
 	})
 }

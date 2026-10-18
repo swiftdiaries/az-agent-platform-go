@@ -680,3 +680,66 @@ func TestCompileRejectsRemovedKeys(t *testing.T) {
 		})
 	}
 }
+
+func policyConflictYAML(first, second string) string {
+	return "catalog:\n  operation_meta_key: op\njourneys:\n" +
+		"  - id: zeta\n    skill: skills/planner\n    tools:\n" + first +
+		"  - id: alpha\n    skill: skills/planner\n    tools:\n" + second
+}
+
+func TestCompilePolicyConflict(t *testing.T) {
+	cases := []struct {
+		name, first, second, want string
+	}{
+		{
+			name:   "key conflict by class",
+			first:  "      - op: lookup\n        class: read_only\n",
+			second: "      - op: lookup\n",
+			want:   `definitions: operation "lookup" has conflicting policies in journeys alpha, zeta`,
+		},
+		{
+			name:   "key conflict by approval required",
+			first:  "      - op: lookup\n        class: read_only\n",
+			second: "      - op: lookup\n        class: read_only\n        approval: required\n",
+			want:   `definitions: operation "lookup" has conflicting policies in journeys alpha, zeta`,
+		},
+		{
+			name:   "key conflict through op alternatives",
+			first:  "      - op: [other, lookup]\n        class: read_only\n",
+			second: "      - op: lookup\n",
+			want:   `definitions: operation "lookup" has conflicting policies in journeys alpha, zeta`,
+		},
+		{
+			name:   "alias conflict between two keys",
+			first:  "      - op: a.b\n        class: read_only\n",
+			second: "      - op: a_b\n",
+			want:   `definitions: alias "a_b" has conflicting policies in journeys alpha, zeta`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeCompileTree(t, policyConflictYAML(tc.first, tc.second), nil)
+			_, err := Compile(path)
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("Compile error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestCompilePolicyConflictAcceptsEqualPolicies(t *testing.T) {
+	cases := []struct{ name, first, second string }{
+		{"same policy", "      - op: lookup\n        class: read_only\n", "      - op: lookup\n        class: read_only\n"},
+		{"unset class equals effectful", "      - op: lookup\n", "      - op: lookup\n        class: effectful\n"},
+		{"alias with equal policies", "      - op: a.b\n", "      - op: a_b\n        class: effectful\n"},
+		{"tag selectors are not checked", "      - tags: [x]\n        class: read_only\n", "      - tags: [x]\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeCompileTree(t, policyConflictYAML(tc.first, tc.second), nil)
+			if _, err := Compile(path); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

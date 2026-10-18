@@ -207,6 +207,8 @@ type harness struct {
 	cat     *fakeCatalog
 	model   *scriptedModel
 	runner  *Runner
+	// version is the product version recorded on each run's scope.
+	version string
 }
 
 func newHarness(t *testing.T) *harness {
@@ -216,7 +218,7 @@ func newHarness(t *testing.T) *harness {
 	if err := journal.Migrate(ctx, pool); err != nil {
 		t.Fatal(err)
 	}
-	h := &harness{t: t, pool: pool, store: journal.New(pool), set: compileHarnessSet(t), cat: harnessCatalog(), model: &scriptedModel{}}
+	h := &harness{t: t, pool: pool, store: journal.New(pool), set: compileHarnessSet(t), cat: harnessCatalog(), model: &scriptedModel{}, version: "v1"}
 	h.command = journal.Command{ThreadID: "thread", RunID: "run", CommunicationID: "m1", Principal: "p", Tenant: "tenant", Text: "hello"}
 	if _, fresh, err := h.store.Admit(ctx, h.command); err != nil || !fresh {
 		t.Fatalf("Admit: %v %v", fresh, err)
@@ -243,21 +245,27 @@ func (h *harness) runWith(target string, limit, iteration int) (RunOutput, error
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	in := RunInput{Store: h.store, Owner: h.owner, Iteration: iteration, History: history, ThreadID: h.command.ThreadID, RunID: h.command.RunID, Text: h.command.Text, TargetJourney: target, DefinitionDigest: h.set.Digest()}
+	if err := h.store.RecordRunScope(ctx, h.owner, journal.RunScope{ProductVersion: h.version, EndpointID: "endpoint", Settings: json.RawMessage(`{}`)}); err != nil {
+		h.t.Fatal(err)
+	}
+	in := RunInput{Store: h.store, Owner: h.owner, Iteration: iteration, History: history, ThreadID: h.command.ThreadID, RunID: h.command.RunID, Principal: h.command.Principal, Text: h.command.Text, TargetJourney: target, DefinitionDigest: h.set.Digest(), ProductVersion: h.version}
 	in.Settings.MaxActiveJourneys = limit
 	return h.runner.converse(ctx, in, h.set, h.cat)
 }
 
 // approvePending approves the thread's pending approval in a new run, as the platform
 // does, and makes that run's owner the harness owner. The approved call is not dispatched.
-func (h *harness) approvePending() {
+func (h *harness) approvePending() { h.approveAs("run-approve", "approve") }
+
+// approveAs is approvePending for a given reply run and communication ID.
+func (h *harness) approveAs(runID, communicationID string) {
 	h.t.Helper()
 	ctx := context.Background()
 	var interactionID, binding string
 	if err := h.pool.QueryRow(ctx, "SELECT id,artifact->'call'->>'binding' FROM agent_interactions WHERE thread_id='thread' AND kind='approval' AND state='pending'").Scan(&interactionID, &binding); err != nil {
 		h.t.Fatal(err)
 	}
-	reply := journal.Command{ThreadID: "thread", RunID: "run-approve", CommunicationID: "approve", Principal: "p", Tenant: "tenant", InteractionID: interactionID, ReplyKind: "approval", ReplyJSON: `{"decision":"approve","binding":"` + binding + `"}`}
+	reply := journal.Command{ThreadID: "thread", RunID: runID, CommunicationID: communicationID, Principal: "p", Tenant: "tenant", InteractionID: interactionID, ReplyKind: "approval", ReplyJSON: `{"decision":"approve","binding":"` + binding + `"}`}
 	if _, fresh, err := h.store.Admit(ctx, reply); err != nil || !fresh {
 		h.t.Fatalf("reply: %v %v", fresh, err)
 	}

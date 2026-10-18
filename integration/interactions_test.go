@@ -13,6 +13,7 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/tenantdir"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -46,20 +47,33 @@ func awaitState(t *testing.T, p *platform.Platform, thread, run string, state jo
 	t.Fatal("state timeout", state)
 	return platform.Snapshot{}
 }
-func TestHITLQuestionShape(t *testing.T) {
-	call := questionCall("provider")
-	binding, err := journal.ActionBinding(call.Name, call.Arguments)
+
+// testClarification builds a v2-bound clarification for the given conversation state.
+func testClarification(t *testing.T, call *agentruntime.ToolCall, thread, principal, version, set string) journal.Interaction {
+	t.Helper()
+	schema, err := journal.SchemaDigest(json.RawMessage(`{"type":"object"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := journal.NameDigest(call.Name)
+	binding, err := journal.BindCall(journal.CallBinding{OperationKey: call.Name, NameDigest: name, SchemaDigest: schema, Arguments: call.Arguments, ProductVersion: version, Principal: principal, Conversation: thread, DefinitionSet: set})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var args struct {
 		Questions []journal.Question `json:"questions"`
 	}
-	if err = json.Unmarshal(call.Arguments, &args); err != nil {
+	if err := json.Unmarshal(call.Arguments, &args); err != nil {
 		t.Fatal(err)
 	}
-	i := journal.Interaction{ID: "wait", Kind: "clarification", Questions: args.Questions, Call: journal.ProposedCall{CallID: "platform", ProviderCallID: call.CallID, Name: call.Name, Arguments: call.Arguments, Binding: binding}}
-	if err = i.Validate(); err != nil {
+	return journal.Interaction{ID: "interaction", Kind: "clarification", Questions: args.Questions, OperationKey: call.Name, NameDigest: name, SchemaDigest: schema,
+		Call: journal.ProposedCall{CallID: "operation", ProviderCallID: call.CallID, Name: call.Name, Arguments: call.Arguments, Binding: binding}}
+}
+
+func TestHITLQuestionShape(t *testing.T) {
+	call := questionCall("provider")
+	i := testClarification(t, call, "thread", "alice", "v1", strings.Repeat("a", 64))
+	if err := i.Validate(); err != nil {
 		t.Fatal(err)
 	}
 	for _, bad := range []journal.Reply{{}, {Decision: "approve"}, {Answers: map[string]journal.Answer{"choice": {Option: "C"}}}, {Answers: map[string]journal.Answer{"choice": {Option: "A", Custom: "both"}}}} {
@@ -155,13 +169,11 @@ func localWait(t *testing.T, pool *pgxpool.Pool) (*journal.Store, journal.Owner,
 	if _, err := s.Start(t.Context(), o, "journey", strings.Repeat("a", 64)); err != nil {
 		t.Fatal(err)
 	}
-	call := questionCall("call")
-	binding, _ := journal.ActionBinding(call.Name, call.Arguments)
-	var args struct {
-		Questions []journal.Question `json:"questions"`
+	if err := s.RecordRunScope(t.Context(), o, journal.RunScope{ProductVersion: "v1", EndpointID: "endpoint", Settings: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
 	}
-	_ = json.Unmarshal(call.Arguments, &args)
-	i := journal.Interaction{ID: "interaction", Kind: "clarification", Questions: args.Questions, Call: journal.ProposedCall{CallID: "operation", ProviderCallID: "call", Name: call.Name, Arguments: call.Arguments, Binding: binding}}
+	i := testClarification(t, questionCall("call"), "thread", "alice", "v1", strings.Repeat("a", 64))
+	i.ID = "interaction"
 	return s, o, i
 }
 func TestReplyWaitTransactionsAndTTL(t *testing.T) {
@@ -470,16 +482,132 @@ func TestHITLCompletedToolNotReplayed(t *testing.T) {
 }
 
 func TestReplyLosslessActionBinding(t *testing.T) {
-	one, err := journal.ActionBinding("write", []byte(`{"n":9007199254740992,"s":"a"}`))
+	bind := func(arguments string) (string, error) {
+		return journal.BindCall(journal.CallBinding{JourneyID: "j", OperationKey: "write", NameDigest: journal.NameDigest("write"), SchemaDigest: strings.Repeat("s", 8), Arguments: json.RawMessage(arguments), ProductVersion: "v1", Principal: "alice", Conversation: "thread", DefinitionSet: strings.Repeat("a", 64)})
+	}
+	one, err := bind(`{"n":9007199254740992,"s":"a"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	same, err := journal.ActionBinding("write", []byte(`{"s":"a", "n":9007199254740992}`))
+	same, err := bind(`{"s":"a", "n":9007199254740992}`)
 	if err != nil || one != same {
 		t.Fatal("non-deterministic canonical binding")
 	}
-	different, err := journal.ActionBinding("write", []byte(`{"n":9007199254740993,"s":"a"}`))
+	different, err := bind(`{"n":9007199254740993,"s":"a"}`)
 	if err != nil || one == different {
 		t.Fatal("large integer rounded in binding")
 	}
+}
+
+// lookupModel proposes one effectful lookup_destination call, then answers.
+func lookupModel() agentruntime.Model {
+	return modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+		if len(r.ToolResults) > 0 {
+			return agentruntime.ModelResponse{Text: "done"}, nil
+		}
+		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "write", Name: lookupAlias, Arguments: json.RawMessage(`{"city":"A"}`)}}, nil
+	})
+}
+
+func waitForApproval(t *testing.T, runner *agentruntime.Runner, pool *pgxpool.Pool, thread string) *journal.Interaction {
+	t.Helper()
+	p := platform.New(runner, journal.New(pool))
+	defer p.Close()
+	c := platform.Command{ThreadID: thread, RunID: "approval", CommunicationID: "approval", Principal: "alice", Tenant: testTenant, Text: "change", TargetJourney: "planner"}
+	if _, err := p.Submit(t.Context(), c, liveCredential("live-auth")); err != nil {
+		t.Fatal(err)
+	}
+	i := awaitState(t, p, c.ThreadID, c.RunID, journal.RunAwaitingInput).Runs[0].Interaction
+	if i == nil {
+		t.Fatal("missing approval")
+	}
+	return i
+}
+
+func approve(t *testing.T, p *platform.Platform, thread string, i *journal.Interaction, run string) {
+	t.Helper()
+	reply := platform.Command{ThreadID: thread, RunID: run, CommunicationID: run, Principal: "alice", Tenant: testTenant, InteractionID: i.ID, ReplyKind: "approval",
+		ReplyJSON: fmt.Sprintf(`{"decision":"approve","binding":%q}`, i.Call.Binding)}
+	if _, err := p.Submit(t.Context(), reply, liveCredential("fresh-live-auth")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestApprovalSupersededOnDefinitionSetChange(t *testing.T) {
+	pool := database(t)
+	mock := newMockMCP(t)
+	backend := httptest.NewServer(mock)
+	defer backend.Close()
+	xPath := writeBundleConfig(t, t.TempDir(), "prompt X\n", lookupAlias, "")
+	yPath := writeBundleConfig(t, t.TempDir(), "prompt Y\n", lookupAlias, "")
+	setX := compileSet(t, xPath)
+	setY := compileSet(t, yPath, xPath)
+	if setX.Digest() == setY.Digest() {
+		t.Fatal("sets must differ")
+	}
+	runnerX := agentruntime.NewRunner(setX, lookupModel(), testTenancy(t, backend.URL))
+	runnerY := agentruntime.NewRunner(setY, lookupModel(), testTenancy(t, backend.URL))
+	i := waitForApproval(t, runnerX, pool, "rollout")
+	// The configuration rolls to Y, and the conversation is re-pinned to it.
+	store := journal.New(pool)
+	if err := store.ActivateDefinition(t.Context(), setX.Digest(), setY.Digest(), setY.Serves); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(t.Context(), "UPDATE agent_conversations SET definition_digest=NULL WHERE id='rollout'"); err != nil {
+		t.Fatal(err)
+	}
+	p := platform.New(runnerY, store)
+	defer p.Close()
+	approve(t, p, "rollout", i, "reply")
+	awaitState(t, p, "rollout", "reply", journal.RunAwaitingInput)
+	var marker string
+	if err := pool.QueryRow(t.Context(), "SELECT marker FROM agent_interactions WHERE id=$1", i.ID).Scan(&marker); err != nil || marker != "superseded" {
+		t.Fatalf("marker = %q/%v", marker, err)
+	}
+	var pending, other int
+	if err := pool.QueryRow(t.Context(), "SELECT count(*) FILTER (WHERE state='pending' AND kind='approval' AND marker='requested' AND id<>$1), count(*) FILTER (WHERE state='pending' AND id=$1) FROM agent_interactions", i.ID).Scan(&pending, &other); err != nil || pending != 1 || other != 0 {
+		t.Fatalf("pending approvals = %d/%d (%v)", pending, other, err)
+	}
+	if calls := mock.calls(); len(calls) != 0 {
+		t.Fatalf("superseded approval dispatched: %v", calls)
+	}
+	requireOperationRows(t, pool, 0)
+}
+
+func TestApprovalSupersededWhenJourneyUnavailable(t *testing.T) {
+	pool := database(t)
+	mock := newMockMCP(t)
+	backend := httptest.NewServer(mock)
+	defer backend.Close()
+	path := writeBundleConfig(t, t.TempDir(), "prompt\n", lookupAlias, "")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ranged := strings.Replace(string(data), "    skill: skills/planner\n", "    skill: skills/planner\n    product_versions: {min: \"2026.2\", max_exclusive: \"2026.3\"}\n", 1)
+	if ranged == string(data) {
+		t.Fatal("product_versions not written")
+	}
+	if err := os.WriteFile(path, []byte(ranged), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tenancy := testTenancy(t, backend.URL)
+	directory := tenancy.Directory.(*tenantdir.Mutable)
+	directory.Set(testTenant, tenantdir.Entry{ProductVersion: "2026.2", EndpointID: testEndpointID})
+	runner := agentruntime.NewRunner(compileSet(t, path), lookupModel(), tenancy)
+	i := waitForApproval(t, runner, pool, "moved")
+	// The tenant moves to a product version that excludes the journey.
+	directory.Set(testTenant, tenantdir.Entry{ProductVersion: "2026.5", EndpointID: testEndpointID})
+	p := platform.New(runner, journal.New(pool))
+	defer p.Close()
+	approve(t, p, "moved", i, "reply")
+	awaitState(t, p, "moved", "reply", journal.RunCompleted)
+	var marker string
+	if err := pool.QueryRow(t.Context(), "SELECT marker FROM agent_interactions WHERE id=$1", i.ID).Scan(&marker); err != nil || marker != "superseded" {
+		t.Fatalf("marker = %q/%v", marker, err)
+	}
+	if calls := mock.calls(); len(calls) != 0 {
+		t.Fatalf("superseded approval dispatched: %v", calls)
+	}
+	requireOperationRows(t, pool, 0)
 }

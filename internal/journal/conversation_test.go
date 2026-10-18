@@ -163,7 +163,10 @@ func TestConversationStartPinsAndSharesHistory(t *testing.T) {
 
 	// Wait writes the conversation history
 	drain(t, s, o2)
-	in := seedClarifyInteraction()
+	if err := s.RecordRunScope(ctx, o2, RunScope{ProductVersion: testProductVersion, EndpointID: "e1", Settings: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	in := boundClarification(t, s, o2, "i-clar", "call-clar", "")
 	if err := s.Wait(ctx, o2, in, json.RawMessage(seedCheckpoint), json.RawMessage(h2)); err != nil {
 		t.Fatal(err)
 	}
@@ -472,17 +475,25 @@ func TestMigrated000009PendingClarificationResumes(t *testing.T) {
 	sameJSON(t, conversationHistory(t, s, "clarify"), newHistory)
 }
 
-func TestMigrated000009PendingApprovalStillDispatches(t *testing.T) {
+// A pre-000009 approval carries a v1 binding and a per-journey definition digest. Its reply is accepted (the
+// reply echoes the stored binding), but it can never match a v2 binding: it is superseded, never dispatched.
+func TestMigrated000009PendingApprovalSuperseded(t *testing.T) {
 	ctx := context.Background()
 	s := migratedStore(t)
 	e := strings.Repeat("e", 64)
 	const newHistory = `[{"role":"user","contents":[{"type":"text","text":"after approval"}]}]`
 
+	if m := markerOf(t, s, seedApprovalInteractionID); m != "requested" {
+		t.Fatalf("migrated pending approval marker = %q", m)
+	}
 	c := Command{ThreadID: "approval", RunID: "approval-reply", CommunicationID: "approval-reply", Principal: "p",
 		InteractionID: seedApprovalInteractionID, ReplyKind: "approval", ReplyJSON: `{"decision":"approve","binding":"` + seedApprovalBinding + `"}`}
 	_, fresh, err := s.Admit(ctx, c)
 	if err != nil || !fresh {
 		t.Fatalf("Admit: fresh=%v err=%v", fresh, err)
+	}
+	if m := markerOf(t, s, seedApprovalInteractionID); m != "decided" {
+		t.Fatalf("marker after approve = %q", m)
 	}
 	o, err := s.Claim(ctx, c, "o1", LeaseDuration)
 	if err != nil {
@@ -496,13 +507,19 @@ func TestMigrated000009PendingApprovalStillDispatches(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	sameJSON(t, string(history), seedHistoryAp)
+	if err := s.RecordRunScope(ctx, o, RunScope{ProductVersion: testProductVersion, EndpointID: "e1", Settings: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
 	cont, err := s.Continuation(ctx, o)
-	if err != nil || cont == nil || cont.Interaction.ID != seedApprovalInteractionID || cont.Reply.Decision != "approve" {
+	if err != nil || cont == nil || cont.Interaction.ID != seedApprovalInteractionID || cont.Reply.Decision != "approve" || cont.Marker != "decided" {
 		t.Fatalf("Continuation: %+v %v", cont, err)
+	}
+	if cont.Interaction.JourneyID != "A" || cont.Interaction.OperationKey != "" {
+		t.Fatalf("legacy columns = %+v", cont.Interaction)
 	}
 	sameJSON(t, string(cont.History), seedHistoryAp)
 
-	op := Operation{CallID: seedApprovalCallID, Name: seedApprovalCallName, Arguments: seedApprovalArguments, Binding: seedApprovalBinding, Policy: "effectful", RequiresApproval: true}
+	op := approvedOp(t, s, o, seedApprovalCallID, "A")
 	// a different call is never silently approved by this interaction
 	other := op
 	other.CallID = "call-other"
@@ -512,18 +529,14 @@ func TestMigrated000009PendingApprovalStillDispatches(t *testing.T) {
 	if err := s.BeginAttempt(ctx, o, other, 1, seedApprovalInteractionID); !errors.Is(err, ErrState) {
 		t.Fatalf("different call under the approval id: %v", err)
 	}
-	if err := s.BeginAttempt(ctx, o, op, 1, seedApprovalInteractionID); err != nil {
-		t.Fatalf("approved BeginAttempt: %v", err)
+	if err := s.BeginAttempt(ctx, o, op, 1, seedApprovalInteractionID); !errors.Is(err, ErrSuperseded) {
+		t.Fatalf("legacy approval BeginAttempt = %v, want ErrSuperseded", err)
 	}
-	var journey *string
-	if err := s.pool.QueryRow(ctx, "SELECT journey_id FROM agent_operations WHERE call_id=$1", seedApprovalCallID).Scan(&journey); err != nil || journey == nil || *journey != "A" {
-		t.Fatalf("operation journey_id = %v %v", journey, err)
-	}
-	if err := s.EndAttempt(ctx, o, op, 1, "completed"); err != nil {
-		t.Fatal(err)
+	if m := markerOf(t, s, seedApprovalInteractionID); m != "superseded" || operationRows(t, s, seedApprovalCallID) != 0 {
+		t.Fatalf("marker = %q, operation rows = %d", m, operationRows(t, s, seedApprovalCallID))
 	}
 	drain(t, s, o)
-	if err := s.Finish(ctx, o, RunCompleted, json.RawMessage(newHistory), "done", seedApprovalCallID, seedApprovalCallName); err != nil {
+	if err := s.Finish(ctx, o, RunCompleted, json.RawMessage(newHistory), "done", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	sameJSON(t, conversationHistory(t, s, "approval"), newHistory)

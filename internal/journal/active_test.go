@@ -11,10 +11,10 @@ import (
 
 var activeDigest = strings.Repeat("d", 64)
 
+// approvalArtifact is an approval with a placeholder binding, for rows inserted directly.
 func approvalArtifact(id, callID, journey string) Interaction {
-	args := json.RawMessage(`{"x":1}`)
 	return Interaction{ID: id, Kind: "approval", JourneyID: journey, Call: ProposedCall{
-		CallID: callID, ProviderCallID: "prov-" + callID, Name: "book", Arguments: args, Binding: mustBinding("book", args),
+		CallID: callID, ProviderCallID: "prov-" + callID, Name: "book", Arguments: json.RawMessage(`{"x":1}`), Binding: "placeholder-binding",
 	}}
 }
 
@@ -42,8 +42,19 @@ func rawInteraction(t *testing.T, s *Store, o Owner, in Interaction, journey, st
 	if reply != "" {
 		rep = reply
 	}
-	mustExec(t, s.pool, "INSERT INTO agent_interactions(id,thread_id,run_id,journey_id,definition_digest,kind,artifact,checkpoint,history,expires_at,state,continuation_run_id,reply) VALUES($1,$2,$3,$4,$5,$6,$7,'{}','[]',clock_timestamp()+interval '1 hour',$8,$9,$10)",
-		in.ID, o.Command.ThreadID, o.Command.RunID, j, activeDigest, in.Kind, artifact, state, cont, rep)
+	var marker any
+	if in.Kind == "approval" {
+		switch {
+		case state == "pending":
+			marker = "requested"
+		case strings.Contains(reply, `"approve"`):
+			marker = "decided"
+		default:
+			marker = "denied"
+		}
+	}
+	mustExec(t, s.pool, "INSERT INTO agent_interactions(id,thread_id,run_id,journey_id,definition_digest,kind,artifact,checkpoint,history,expires_at,state,continuation_run_id,reply,marker) VALUES($1,$2,$3,$4,$5,$6,$7,'{}','[]',clock_timestamp()+interval '1 hour',$8,$9,$10,$11)",
+		in.ID, o.Command.ThreadID, o.Command.RunID, j, activeDigest, in.Kind, artifact, state, cont, rep, marker)
 }
 
 func activeSet(t *testing.T, s *Store, o Owner) (active, pinned []string) {
@@ -198,23 +209,21 @@ func TestActiveJourneysPinnedByConsumedApproveUntilDispatched(t *testing.T) {
 	ctx := context.Background()
 	s := scopedStore(t)
 	o1 := admitClaim(t, s, threadCommand("t1", "r1", "c1", "hi"))
-	if _, err := s.Start(ctx, o1, "A", activeDigest); err != nil {
-		t.Fatal(err)
-	}
+	startScoped(t, s, o1, "A")
 	drain(t, s, o1)
-	in := approvalArtifact("i1", "call-1", "")
+	in := boundApproval(t, s, o1, "i1", "call-1", "A")
 	if err := s.Wait(ctx, o1, in, json.RawMessage(`{}`), json.RawMessage(`[]`)); err != nil {
 		t.Fatal(err)
 	}
 	reply := Command{ThreadID: "t1", RunID: "r2", CommunicationID: "c2", Principal: "p", Tenant: "tenant-a", InteractionID: "i1", ReplyKind: "approval",
 		ReplyJSON: `{"decision":"approve","binding":"` + in.Call.Binding + `"}`}
 	o2 := admitClaim(t, s, reply)
+	startScoped(t, s, o2, "A")
 
 	_, pinned := activeSet(t, s, o2)
 	expectStrings(t, "pinned before dispatch", pinned, "A")
 
-	op := Operation{CallID: "call-1", Name: "book", Arguments: `{"x":1}`, Binding: in.Call.Binding, Policy: "effectful", RequiresApproval: true}
-	if err := s.BeginAttempt(ctx, o2, op, 1, "i1"); err != nil {
+	if err := s.BeginAttempt(ctx, o2, approvedOp(t, s, o2, "call-1", "A"), 1, "i1"); err != nil {
 		t.Fatal(err)
 	}
 	_, pinned = activeSet(t, s, o2)
@@ -225,11 +234,9 @@ func TestActiveJourneysConsumedPinIsPerRun(t *testing.T) {
 	ctx := context.Background()
 	s := scopedStore(t)
 	o1 := admitClaim(t, s, threadCommand("t1", "r1", "c1", "hi"))
-	if _, err := s.Start(ctx, o1, "A", activeDigest); err != nil {
-		t.Fatal(err)
-	}
+	startScoped(t, s, o1, "A")
 	drain(t, s, o1)
-	in := approvalArtifact("i1", "call-1", "")
+	in := boundApproval(t, s, o1, "i1", "call-1", "A")
 	if err := s.Wait(ctx, o1, in, json.RawMessage(`{}`), json.RawMessage(`[]`)); err != nil {
 		t.Fatal(err)
 	}
@@ -249,11 +256,9 @@ func TestActiveJourneysNotPinnedByDenyOrClarification(t *testing.T) {
 	ctx := context.Background()
 	s := scopedStore(t)
 	o1 := admitClaim(t, s, threadCommand("t1", "r1", "c1", "hi"))
-	if _, err := s.Start(ctx, o1, "A", activeDigest); err != nil {
-		t.Fatal(err)
-	}
+	startScoped(t, s, o1, "A")
 	drain(t, s, o1)
-	in := approvalArtifact("i1", "call-1", "")
+	in := boundApproval(t, s, o1, "i1", "call-1", "A")
 	if err := s.Wait(ctx, o1, in, json.RawMessage(`{}`), json.RawMessage(`[]`)); err != nil {
 		t.Fatal(err)
 	}
@@ -268,11 +273,9 @@ func TestActiveJourneysNotPinnedByDenyOrClarification(t *testing.T) {
 	}
 
 	o3 := admitClaim(t, s, threadCommand("t1", "r3", "c3", "more"))
-	if _, err := s.Start(ctx, o3, "A", activeDigest); err != nil {
-		t.Fatal(err)
-	}
+	startScoped(t, s, o3, "A")
 	drain(t, s, o3)
-	clar := clarificationArtifact("i2", "call-2", "A")
+	clar := boundClarification(t, s, o3, "i2", "call-2", "A")
 	if err := s.Wait(ctx, o3, clar, json.RawMessage(`{}`), json.RawMessage(`[]`)); err != nil {
 		t.Fatal(err)
 	}
@@ -354,22 +357,26 @@ func interactionJourney(t *testing.T, s *Store, id string) (journey *string) {
 
 func TestWaitInteractionJourney(t *testing.T) {
 	ctx := context.Background()
-	wait := func(t *testing.T, s *Store, thread, runJourney string, in Interaction) Owner {
+	wait := func(t *testing.T, s *Store, thread, runJourney string, build func(Owner) Interaction) Owner {
 		t.Helper()
 		o := admitClaim(t, s, threadCommand(thread, "r-"+thread, "c-"+thread, "hi"))
-		if _, err := s.Start(ctx, o, runJourney, activeDigest); err != nil {
-			t.Fatal(err)
-		}
+		startScoped(t, s, o, runJourney)
 		drain(t, s, o)
-		if err := s.Wait(ctx, o, in, json.RawMessage(`{}`), json.RawMessage(`[]`)); err != nil {
+		if err := s.Wait(ctx, o, build(o), json.RawMessage(`{}`), json.RawMessage(`[]`)); err != nil {
 			t.Fatal(err)
 		}
 		return o
 	}
+	approval := func(s *Store, id, call, journey string) func(Owner) Interaction {
+		return func(o Owner) Interaction { return boundApproval(t, s, o, id, call, journey) }
+	}
+	clarification := func(s *Store, id, call, journey string) func(Owner) Interaction {
+		return func(o Owner) Interaction { return boundClarification(t, s, o, id, call, journey) }
+	}
 	s := scopedStore(t)
 
 	t.Run("interaction journey on a journeyless run", func(t *testing.T) {
-		wait(t, s, "t1", "", approvalArtifact("i1", "call-1", "A"))
+		wait(t, s, "t1", "", approval(s, "i1", "call-1", "A"))
 		if j := interactionJourney(t, s, "i1"); j == nil || *j != "A" {
 			t.Fatalf("journey = %v, want A", j)
 		}
@@ -382,19 +389,19 @@ func TestWaitInteractionJourney(t *testing.T) {
 		}
 	})
 	t.Run("interaction journey overrides the run journey", func(t *testing.T) {
-		wait(t, s, "t2", "B", approvalArtifact("i2", "call-2", "A"))
+		wait(t, s, "t2", "B", approval(s, "i2", "call-2", "A"))
 		if j := interactionJourney(t, s, "i2"); j == nil || *j != "A" {
 			t.Fatalf("journey = %v, want A", j)
 		}
 	})
-	t.Run("empty interaction journey falls back to the run journey", func(t *testing.T) {
-		wait(t, s, "t3", "B", approvalArtifact("i3", "call-3", ""))
+	t.Run("empty clarification journey falls back to the run journey", func(t *testing.T) {
+		wait(t, s, "t3", "B", clarification(s, "i3", "call-3", ""))
 		if j := interactionJourney(t, s, "i3"); j == nil || *j != "B" {
 			t.Fatalf("journey = %v, want B", j)
 		}
 	})
 	t.Run("no journey anywhere stores NULL", func(t *testing.T) {
-		wait(t, s, "t4", "", clarificationArtifact("i4", "call-4", ""))
+		wait(t, s, "t4", "", clarification(s, "i4", "call-4", ""))
 		if j := interactionJourney(t, s, "i4"); j != nil {
 			t.Fatalf("journey = %q, want NULL", *j)
 		}
@@ -403,13 +410,12 @@ func TestWaitInteractionJourney(t *testing.T) {
 
 func TestReplyTargetJourney(t *testing.T) {
 	ctx := context.Background()
-	park := func(t *testing.T, s *Store, in Interaction) {
+	park := func(t *testing.T, s *Store, journey string) {
 		t.Helper()
 		o := admitClaim(t, s, threadCommand("t1", "r1", "c1", "hi"))
-		if _, err := s.Start(ctx, o, "", activeDigest); err != nil {
-			t.Fatal(err)
-		}
+		startScoped(t, s, o, "")
 		drain(t, s, o)
+		in := boundClarification(t, s, o, "i1", "call-1", journey)
 		if err := s.Wait(ctx, o, in, json.RawMessage(`{}`), json.RawMessage(`[]`)); err != nil {
 			t.Fatal(err)
 		}
@@ -421,21 +427,21 @@ func TestReplyTargetJourney(t *testing.T) {
 
 	t.Run("both non-empty and different", func(t *testing.T) {
 		s := scopedStore(t)
-		park(t, s, clarificationArtifact("i1", "call-1", "A"))
+		park(t, s, "A")
 		if _, _, err := s.Admit(ctx, reply("B")); !errors.Is(err, ErrState) {
 			t.Fatalf("mismatch: %v", err)
 		}
 	})
 	t.Run("matching target", func(t *testing.T) {
 		s := scopedStore(t)
-		park(t, s, clarificationArtifact("i1", "call-1", "A"))
+		park(t, s, "A")
 		if _, fresh, err := s.Admit(ctx, reply("A")); err != nil || !fresh {
 			t.Fatalf("match: fresh=%v %v", fresh, err)
 		}
 	})
 	t.Run("interaction without journey accepts any target", func(t *testing.T) {
 		s := scopedStore(t)
-		park(t, s, clarificationArtifact("i1", "call-1", ""))
+		park(t, s, "")
 		if _, fresh, err := s.Admit(ctx, reply("B")); err != nil || !fresh {
 			t.Fatalf("NULL journey with target: fresh=%v %v", fresh, err)
 		}
@@ -450,7 +456,7 @@ func TestReplyTargetJourney(t *testing.T) {
 	})
 	t.Run("empty target", func(t *testing.T) {
 		s := scopedStore(t)
-		park(t, s, clarificationArtifact("i1", "call-1", "A"))
+		park(t, s, "A")
 		if _, fresh, err := s.Admit(ctx, reply("")); err != nil || !fresh {
 			t.Fatalf("no target: fresh=%v %v", fresh, err)
 		}
@@ -467,19 +473,17 @@ func TestBeginAttemptOperationJourney(t *testing.T) {
 		}
 		return j
 	}
-	readOnly := func(t *testing.T, call, journey string) Operation {
-		op := policyOp(t, call, "read_only")
+	readOnly := func(t *testing.T, s *Store, o Owner, call, journey string) Operation {
+		op := policyOp(t, s, o, call, "read_only")
 		op.JourneyID = journey
-		return op
+		return rebind(t, s, o, op)
 	}
 
 	t.Run("operation journey is stored", func(t *testing.T) {
 		s := scopedStore(t)
 		o := admitClaim(t, s, threadCommand("t1", "r1", "c1", "hi"))
-		if _, err := s.Start(ctx, o, "", activeDigest); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.BeginAttempt(ctx, o, readOnly(t, "op1", "J"), 1, ""); err != nil {
+		startScoped(t, s, o, "")
+		if err := s.BeginAttempt(ctx, o, readOnly(t, s, o, "op1", "J"), 1, ""); err != nil {
 			t.Fatal(err)
 		}
 		if j := opJourney(t, s, "op1"); j == nil || *j != "J" {
@@ -489,10 +493,8 @@ func TestBeginAttemptOperationJourney(t *testing.T) {
 	t.Run("operation journey overrides the run journey", func(t *testing.T) {
 		s := scopedStore(t)
 		o := admitClaim(t, s, threadCommand("t1", "r1", "c1", "hi"))
-		if _, err := s.Start(ctx, o, "R", activeDigest); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.BeginAttempt(ctx, o, readOnly(t, "op1", "J"), 1, ""); err != nil {
+		startScoped(t, s, o, "R")
+		if err := s.BeginAttempt(ctx, o, readOnly(t, s, o, "op1", "J"), 1, ""); err != nil {
 			t.Fatal(err)
 		}
 		if j := opJourney(t, s, "op1"); j == nil || *j != "J" {
@@ -502,10 +504,8 @@ func TestBeginAttemptOperationJourney(t *testing.T) {
 	t.Run("empty operation journey falls back to the run journey", func(t *testing.T) {
 		s := scopedStore(t)
 		o := admitClaim(t, s, threadCommand("t1", "r1", "c1", "hi"))
-		if _, err := s.Start(ctx, o, "R", activeDigest); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.BeginAttempt(ctx, o, readOnly(t, "op1", ""), 1, ""); err != nil {
+		startScoped(t, s, o, "R")
+		if err := s.BeginAttempt(ctx, o, readOnly(t, s, o, "op1", ""), 1, ""); err != nil {
 			t.Fatal(err)
 		}
 		if j := opJourney(t, s, "op1"); j == nil || *j != "R" {
@@ -515,10 +515,8 @@ func TestBeginAttemptOperationJourney(t *testing.T) {
 	t.Run("no journey anywhere stores NULL", func(t *testing.T) {
 		s := scopedStore(t)
 		o := admitClaim(t, s, threadCommand("t1", "r1", "c1", "hi"))
-		if _, err := s.Start(ctx, o, "", activeDigest); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.BeginAttempt(ctx, o, readOnly(t, "op1", ""), 1, ""); err != nil {
+		startScoped(t, s, o, "")
+		if err := s.BeginAttempt(ctx, o, readOnly(t, s, o, "op1", ""), 1, ""); err != nil {
 			t.Fatal(err)
 		}
 		if j := opJourney(t, s, "op1"); j != nil {

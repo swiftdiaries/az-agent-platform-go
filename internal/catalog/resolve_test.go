@@ -360,3 +360,80 @@ func TestResolveDeterministic(t *testing.T) {
 		seen[u] = true
 	}
 }
+
+func policyTool(key string, class definitions.Class, approval bool) Tool {
+	alias, _ := definitions.AliasFor(key)
+	return Tool{Alias: alias, OperationKey: key, RemoteName: key, Class: class, RequiresApproval: approval}
+}
+
+func policyRes(id string, tools ...Tool) Resolution { return Resolution{JourneyID: id, Tools: tools} }
+
+func TestCheckPoliciesKeyConflict(t *testing.T) {
+	in := []Resolution{
+		policyRes("a", policyTool("travel.book", definitions.ClassEffectful, true)),
+		policyRes("b", policyTool("travel.book", definitions.ClassIdempotent, true)),
+		policyRes("c", policyTool("travel.lookup", definitions.ClassReadOnly, false)),
+	}
+	out := CheckPolicies(in)
+	for i, id := range []string{"a", "b"} {
+		r := out[i]
+		want := []Unavailable{{ReasonPolicyConflict, "travel.book"}}
+		if r.JourneyID != id || r.Available() || r.Tools != nil || !reflect.DeepEqual(r.Unavailable, want) {
+			t.Fatalf("out[%d] = %+v", i, r)
+		}
+	}
+	if !out[2].Available() || len(out[2].Tools) != 1 {
+		t.Fatalf("unrelated journey changed: %+v", out[2])
+	}
+	if !in[0].Available() || len(in[0].Tools) != 1 || !in[1].Available() {
+		t.Fatalf("input mutated: %+v", in)
+	}
+}
+
+func TestCheckPoliciesApprovalConflict(t *testing.T) {
+	out := CheckPolicies([]Resolution{
+		policyRes("a", policyTool("x.op", definitions.ClassReadOnly, false)),
+		policyRes("b", policyTool("x.op", definitions.ClassReadOnly, true)),
+	})
+	if out[0].Available() || out[1].Available() {
+		t.Fatalf("out = %+v", out)
+	}
+}
+
+func TestCheckPoliciesAliasConflict(t *testing.T) {
+	a, b := policyTool("travel.book", definitions.ClassEffectful, true), policyTool("travel_book", definitions.ClassReadOnly, false)
+	if a.Alias != b.Alias {
+		t.Skipf("keys do not share an alias: %q %q", a.Alias, b.Alias)
+	}
+	out := CheckPolicies([]Resolution{policyRes("a", a), policyRes("b", b)})
+	want := []Unavailable{{ReasonPolicyConflict, a.Alias}}
+	for _, r := range out {
+		if r.Available() || r.Tools != nil || !reflect.DeepEqual(r.Unavailable, want) {
+			t.Fatalf("resolution = %+v", r)
+		}
+	}
+}
+
+func TestCheckPoliciesSamePolicyStaysAvailable(t *testing.T) {
+	in := []Resolution{
+		policyRes("a", policyTool("travel.book", definitions.ClassEffectful, true)),
+		policyRes("b", policyTool("travel.book", definitions.ClassEffectful, true)),
+	}
+	out := CheckPolicies(in)
+	if !reflect.DeepEqual(out, in) {
+		t.Fatalf("out = %+v", out)
+	}
+}
+
+func TestCheckPoliciesIgnoresUnavailable(t *testing.T) {
+	down := Resolution{JourneyID: "down", Unavailable: []Unavailable{{ReasonMissing, "travel.book"}}}
+	in := []Resolution{
+		down,
+		policyRes("a", policyTool("travel.book", definitions.ClassEffectful, true)),
+		policyRes("b", policyTool("travel.book", definitions.ClassEffectful, true)),
+	}
+	out := CheckPolicies(in)
+	if !reflect.DeepEqual(out, in) {
+		t.Fatalf("out = %+v", out)
+	}
+}

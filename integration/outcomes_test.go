@@ -204,6 +204,30 @@ func (b requestBody) method() string {
 	return v.Method
 }
 
+// beginAttemptOperation records the run's scope and returns an operation whose v2 binding matches the
+// stored run and conversation state, for direct BeginAttempt calls.
+func beginAttemptOperation(t *testing.T, store *journal.Store, owner journal.Owner, callID, alias, arguments, policy string, approval bool) journal.Operation {
+	t.Helper()
+	if err := store.RecordRunScope(t.Context(), owner, journal.RunScope{ProductVersion: "v1", EndpointID: "endpoint", Settings: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	set := strings.Repeat("a", 64)
+	if _, err := store.Start(t.Context(), owner, "", set); err != nil {
+		t.Fatal(err)
+	}
+	schema, err := journal.SchemaDigest(json.RawMessage(`{"type":"object"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := owner.Command
+	op := journal.Operation{CallID: callID, Name: alias, OperationKey: alias, NameDigest: journal.NameDigest(alias), SchemaDigest: schema, Arguments: arguments, Policy: policy, RequiresApproval: approval, JourneyID: "journey"}
+	op.Binding, err = journal.BindCall(journal.CallBinding{JourneyID: op.JourneyID, OperationKey: op.OperationKey, NameDigest: op.NameDigest, SchemaDigest: op.SchemaDigest, Arguments: json.RawMessage(arguments), ProductVersion: "v1", Principal: c.Principal, Conversation: c.ThreadID, DefinitionSet: set})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return op
+}
+
 func TestBeginAttemptSecondAttemptPredecessorMatrix(t *testing.T) {
 	for _, predecessor := range []string{"dispatching", "completed", "rejected", "auth_required", "outcome_unknown"} {
 		for _, policy := range []string{"read_only", "idempotent", "effectful"} {
@@ -218,12 +242,8 @@ func TestBeginAttemptSecondAttemptPredecessorMatrix(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				binding, err := journal.ActionBinding("lookup_destination", []byte(`{"city":"A"}`))
-				if err != nil {
-					t.Fatal(err)
-				}
-				op := journal.Operation{CallID: "stable-product-call", Name: lookupAlias, OperationKey: lookupAlias, Arguments: `{"city":"A"}`, Binding: binding, Policy: policy, RequiresApproval: policy != "read_only"}
-				if _, err := pool.Exec(t.Context(), "INSERT INTO agent_operations(call_id,thread_id,run_id,alias,operation_key,arguments,binding,policy,requires_approval,outcome) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)", op.CallID, command.ThreadID, command.RunID, op.Name, op.OperationKey, op.Arguments, op.Binding, op.Policy, op.RequiresApproval, predecessor); err != nil {
+				op := beginAttemptOperation(t, store, owner, "stable-product-call", lookupAlias, `{"city":"A"}`, policy, policy != "read_only")
+				if _, err := pool.Exec(t.Context(), "INSERT INTO agent_operations(call_id,thread_id,run_id,alias,operation_key,arguments,binding,policy,requires_approval,outcome,journey_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)", op.CallID, command.ThreadID, command.RunID, op.Name, op.OperationKey, op.Arguments, op.Binding, op.Policy, op.RequiresApproval, predecessor, op.JourneyID); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := pool.Exec(t.Context(), "INSERT INTO agent_attempts(call_id,attempt,outcome) VALUES($1,1,$2)", op.CallID, predecessor); err != nil {
@@ -267,10 +287,8 @@ func TestBeginAttemptRejectsRemovedAndUnapprovedPolicies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	binding, err := journal.ActionBinding(lookupAlias, []byte(`{}`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	base := beginAttemptOperation(t, store, owner, "c0", lookupAlias, `{}`, "read_only", false)
+	binding := base.Binding
 	for _, op := range []journal.Operation{
 		{CallID: "c1", Name: lookupAlias, OperationKey: lookupAlias, Arguments: `{}`, Binding: binding, Policy: "deduplicated", RequiresApproval: true},
 		{CallID: "c2", Name: lookupAlias, OperationKey: lookupAlias, Arguments: `{}`, Binding: binding, Policy: "idempotent"},
