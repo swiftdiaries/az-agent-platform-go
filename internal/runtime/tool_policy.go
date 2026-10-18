@@ -11,7 +11,7 @@ import (
 
 // Two dispatches share a deadline, exact intent, and platform call ID. No provider
 // retries are performed here: Model.Complete is a complete, buffered turn boundary.
-func guardedCall(ctx context.Context, in RunInput, binding *catalog.Binding, op journal.Operation, approval string) (any, error) {
+func guardedCall(ctx context.Context, in RunInput, binding toolCatalog, op journal.Operation, approval string) (any, error) {
 	ownerContext := ctx
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()

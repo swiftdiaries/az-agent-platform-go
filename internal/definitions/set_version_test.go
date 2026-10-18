@@ -3,9 +3,9 @@ package definitions
 import "testing"
 
 func TestSetVersion(t *testing.T) {
-	current := compileRetainTree(t, "j", "v2 prompt\n")
-	old := compileRetainTree(t, "j", "v1 prompt\n")
-	gone := compileRetainTree(t, "other", "v1 prompt\n")
+	current := compileRetainTree(t, "j", "v2 prompt")
+	old := compileRetainTree(t, "j", "v1 prompt")
+	gone := compileRetainTree(t, "other", "v1 prompt")
 
 	t.Run("current digest returns the receiver", func(t *testing.T) {
 		got, ok := current.Version(current.Digest())
@@ -32,11 +32,11 @@ func TestSetVersion(t *testing.T) {
 			t.Fatalf("Version(old) = %p %v want %p", got, ok, old)
 		}
 		j, ok := got.Journey("j")
-		if !ok || j.Prompt != "v1 prompt\n" {
+		if !ok || j.Prompt != "v1 prompt" {
 			t.Fatalf("old journey = %q %v", j.Prompt, ok)
 		}
 		cj, ok := retained.Journey("j")
-		if !ok || cj.Prompt != "v2 prompt\n" {
+		if !ok || cj.Prompt != "v2 prompt" {
 			t.Fatalf("current journey = %q %v", cj.Prompt, ok)
 		}
 	})
@@ -49,7 +49,7 @@ func TestSetVersion(t *testing.T) {
 		if !ok || got != gone {
 			t.Fatalf("Version(gone) = %p %v want %p", got, ok, gone)
 		}
-		if j, ok := got.Journey("other"); !ok || j.Prompt != "v1 prompt\n" {
+		if j, ok := got.Journey("other"); !ok || j.Prompt != "v1 prompt" {
 			t.Fatalf("gone journey = %q %v", j.Prompt, ok)
 		}
 	})

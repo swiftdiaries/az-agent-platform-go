@@ -79,6 +79,8 @@ type Snapshot struct {
 	JourneyID, Answer          string
 	Watermark                  int64
 	Events                     []Event
+	// ActiveJourneys is the conversation's active set, least recently used first.
+	ActiveJourneys []string
 }
 type Store struct{ pool *pgxpool.Pool }
 

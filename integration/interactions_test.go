@@ -83,7 +83,7 @@ func TestHITLDurableWaitReply(t *testing.T) {
 	}))
 	p := platform.New(runner, store)
 	defer p.Close()
-	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "comm", Principal: "alice", Tenant: testTenant, Text: "ask"}
+	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "comm", Principal: "alice", Tenant: testTenant, Text: "ask", TargetJourney: "vacation-planner"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestHITLSeparateProcessAfterWaitAndReplyCommit(t *testing.T) {
 			return agentruntime.ModelResponse{ToolCall: questionCall("process-call")}, nil
 		})), store)
 		defer p.Close()
-		if _, err := p.Submit(t.Context(), platform.Command{ThreadID: "process", RunID: "wait", CommunicationID: "wait", Principal: "alice", Tenant: testTenant, Text: "ask"}, credential.Credential{}); err != nil {
+		if _, err := p.Submit(t.Context(), platform.Command{ThreadID: "process", RunID: "wait", CommunicationID: "wait", Principal: "alice", Tenant: testTenant, Text: "ask", TargetJourney: "vacation-planner"}, credential.Credential{}); err != nil {
 			t.Fatal(err)
 		}
 		awaitState(t, p, "process", "wait", journal.RunAwaitingInput)
@@ -448,7 +448,7 @@ func TestHITLCompletedToolNotReplayed(t *testing.T) {
 		}
 	})
 	p := platform.New(policyRunner(t, backend.URL, "read_only", model), journal.New(pool))
-	c := platform.Command{ThreadID: "replay", RunID: "replay", CommunicationID: "replay", Principal: "alice", Tenant: testTenant, Text: "go"}
+	c := platform.Command{ThreadID: "replay", RunID: "replay", CommunicationID: "replay", Principal: "alice", Tenant: testTenant, Text: "go", TargetJourney: "planner"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}

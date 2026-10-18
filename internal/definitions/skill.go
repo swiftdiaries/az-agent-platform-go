@@ -110,6 +110,16 @@ func skillMetadata(data []byte) (string, string, error) {
 	return name, description, nil
 }
 
+// skillBody returns the text after the closing frontmatter line of a SKILL.md
+// that skillMetadata accepted, trimmed of surrounding whitespace.
+func skillBody(data []byte) string {
+	end := bytes.Index(data[4:], []byte("\n---\n"))
+	if !bytes.HasPrefix(data, []byte("---\n")) || end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(string(data[4+end+5:]))
+}
+
 func readLimited(path string, limit int) ([]byte, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -185,7 +195,6 @@ func cloneSkill(in SkillPackage) SkillPackage {
 
 func cloneJourney(in Journey) Journey {
 	out := in
-	out.Routing = cloneRouting(in.Routing)
 	out.Tools = cloneSelectors(in.Tools)
 	out.Deny = append([]string(nil), in.Deny...)
 	out.Skills = make([]SkillPackage, len(in.Skills))
@@ -193,11 +202,6 @@ func cloneJourney(in Journey) Journey {
 		out.Skills[i] = cloneSkill(skill)
 	}
 	return out
-}
-
-func cloneRouting(in Routing) Routing {
-	in.Keywords = append([]string(nil), in.Keywords...)
-	return in
 }
 
 func confinedPath(root, relative string) (string, error) {

@@ -13,9 +13,6 @@ func writeSkillBudgetFiles(t *testing.T, root string) {
 	if err := os.MkdirAll(filepath.Join(root, "skills", "planner"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "prompt.md"), []byte("prompt\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
 	if err := os.WriteFile(filepath.Join(root, "skills", "planner", "SKILL.md"), []byte("---\nname: planner\ndescription: Plan\n---\nUse the planner.\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +30,7 @@ func writeSkillBudgetConfigWithJourneys(t *testing.T, root, file string, first, 
 	var config strings.Builder
 	config.WriteString("catalog:\n  operation_meta_key: op\njourneys:\n")
 	for i := first; i < first+count; i++ {
-		fmt.Fprintf(&config, "  - id: journey-%03d\n    skill: skills/planner\n    system_prompt: prompt.md\n    tools:\n      - op: lookup\n", i)
+		fmt.Fprintf(&config, "  - id: journey-%03d\n    skill: skills/planner\n    tools:\n      - op: lookup\n", i)
 	}
 	if err := os.WriteFile(path, []byte(config.String()), 0600); err != nil {
 		t.Fatal(err)
@@ -130,7 +127,7 @@ func TestCompileRejectsAggregateSkillLimitInOneSet(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "guide.md"), []byte("g\n"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		fmt.Fprintf(&config, "  - id: j%03d\n    skill: skills/s%03d\n    system_prompt: prompt.md\n    tools:\n      - op: lookup\n", i, i)
+		fmt.Fprintf(&config, "  - id: j%03d\n    skill: skills/s%03d\n    tools:\n      - op: lookup\n", i, i)
 	}
 	path := filepath.Join(root, "journeys.yaml")
 	if err := os.WriteFile(path, []byte(config.String()), 0600); err != nil {

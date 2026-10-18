@@ -12,13 +12,13 @@ const (
 
 // Journey is one compiled journey definition. Compile fills every field.
 type Journey struct {
-	ID           string
-	Description  string
-	SystemPrompt string
-	Prompt       string
-	Skills       []SkillPackage
-	Digest       string
-	Routing      Routing
+	ID          string
+	Description string
+	// Prompt is the body of the journey's SKILL.md (everything after the
+	// closing frontmatter line, trimmed); there is no separate system prompt.
+	Prompt string
+	Skills []SkillPackage
+	Digest string
 
 	Tools           []Selector
 	Deny            []string
@@ -26,11 +26,4 @@ type Journey struct {
 	ProductVersions VersionRange
 	Catalog         CatalogConfig
 	Skill           string
-}
-
-// Routing is accepted until the planner replaces keyword routing (H4b).
-type Routing struct {
-	Default  bool
-	Keywords []string
-	Priority int
 }

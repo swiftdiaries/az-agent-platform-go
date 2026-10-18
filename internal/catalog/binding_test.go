@@ -47,13 +47,7 @@ func compileSet(t *testing.T, journeys ...journeySpec) *definitions.Set {
 		if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skill), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.MkdirAll(filepath.Join(dir, "prompts"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, "prompts", j.id+".md"), []byte("prompt "+j.id), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		fmt.Fprintf(&b, "  - id: %s\n    skill: skills/%s\n    system_prompt: prompts/%s.md\n    tools:\n", j.id, j.id, j.id)
+		fmt.Fprintf(&b, "  - id: %s\n    skill: skills/%s\n    tools:\n", j.id, j.id)
 		for _, op := range j.ops {
 			fmt.Fprintf(&b, "      - op: %s\n        class: read_only\n", op)
 		}

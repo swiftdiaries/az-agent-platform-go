@@ -281,8 +281,125 @@ func TestMigration000009(t *testing.T) {
 		if err := Migrate(ctx, pool); err != nil {
 			t.Fatalf("second Migrate: %v", err)
 		}
-		if n := count(t, "SELECT count(*) FROM agent_schema_migrations"); n != 9 {
-			t.Fatalf("migrations = %d, want 9", n)
+		if n := count(t, "SELECT count(*) FROM agent_schema_migrations"); n != len(migrationNames) {
+			t.Fatalf("migrations = %d, want %d", n, len(migrationNames))
+		}
+	})
+}
+
+// seedPre000010 builds a v9 database with a pinned journey run, a parked
+// interaction and a populated active set.
+func seedPre000010(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	if err := migrateTo(ctx, pool, 9); err != nil {
+		t.Fatal(err)
+	}
+	approval, err := json.Marshal(seedApprovalInteraction())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		for _, st := range []struct {
+			sql  string
+			args []any
+		}{
+			{"INSERT INTO agent_conversations(id,principal,definition_digest,active_journeys) VALUES('v9','p',$1,'[\"A\",\"B\"]'::jsonb),('plain','p',NULL,'[]'::jsonb)", []any{seedDigestA}},
+			{"INSERT INTO agent_commands(thread_id,communication_id,run_id,payload,execution_run_id) VALUES('v9','c1','r1',$1::jsonb,'r1')", []any{seedPayload("v9", "r1", "c1")}},
+			{"INSERT INTO agent_runs(id,thread_id,state,journey_id,definition_digest) VALUES('r1','v9','awaiting_input','A',$1)", []any{seedDigestA}},
+			{"INSERT INTO agent_interactions(id,thread_id,run_id,journey_id,definition_digest,kind,artifact,checkpoint,history,expires_at) VALUES($1,'v9','r1','A',$2,'approval',$3::jsonb,$4::jsonb,$5::jsonb,clock_timestamp()+interval '1 day')",
+				[]any{seedApprovalInteractionID, seedDigestA, string(approval), seedCheckpoint, seedHistoryAp}},
+		} {
+			if _, err := tx.Exec(ctx, st.sql, st.args...); err != nil {
+				return fmt.Errorf("%s: %w", st.sql, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMigration000010(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.Database(t)
+	seedPre000010(t, ctx, pool)
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	count := func(t *testing.T, query string, args ...any) int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, query, args...).Scan(&n); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+		return n
+	}
+
+	t.Run("seeded v9 data upgrades", func(t *testing.T) {
+		if n := count(t, "SELECT count(*) FROM agent_conversations WHERE id='v9' AND active_journeys='[\"A\",\"B\"]'::jsonb AND definition_digest=$1", seedDigestA); n != 1 {
+			t.Fatalf("v9 conversation changed: %d", n)
+		}
+		if n := count(t, "SELECT count(*) FROM agent_runs WHERE id='r1' AND journey_id='A' AND definition_digest=$1 AND state='awaiting_input'", seedDigestA); n != 1 {
+			t.Fatalf("r1 changed: %d", n)
+		}
+		if n := count(t, "SELECT count(*) FROM agent_interactions WHERE id=$1 AND journey_id='A' AND state='pending'", seedApprovalInteractionID); n != 1 {
+			t.Fatalf("interaction changed: %d", n)
+		}
+		if n := count(t, "SELECT count(*) FROM agent_schema_migrations"); n != 10 {
+			t.Fatalf("migrations = %d, want 10", n)
+		}
+	})
+
+	t.Run("a non-array active_journeys is rejected", func(t *testing.T) {
+		mustFail(t, pool, "UPDATE agent_conversations SET active_journeys='{}'::jsonb WHERE id='plain'")
+		mustFail(t, pool, "UPDATE agent_conversations SET active_journeys='\"A\"'::jsonb WHERE id='plain'")
+		mustFail(t, pool, "UPDATE agent_conversations SET active_journeys='null'::jsonb WHERE id='plain'")
+		mustExec(t, pool, "UPDATE agent_conversations SET active_journeys='[\"A\"]'::jsonb WHERE id='plain'")
+	})
+
+	run := func(id string, journey, digest any) error {
+		return pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, "INSERT INTO agent_commands(thread_id,communication_id,run_id,payload,execution_run_id) VALUES('plain',$1,$2,$3::jsonb,$2)", "cm-"+id, id, seedPayload("plain", id, "cm-"+id)); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, "INSERT INTO agent_runs(id,thread_id,state,journey_id,definition_digest) VALUES($1,'plain','completed',$2,$3)", id, journey, digest)
+			return err
+		})
+	}
+
+	t.Run("a run with a digest and no journey is accepted", func(t *testing.T) {
+		if err := run("rd", nil, seedDigestA); err != nil {
+			t.Fatalf("digest without journey: %v", err)
+		}
+	})
+	t.Run("a journey without a digest is rejected", func(t *testing.T) {
+		if err := run("rj", "A", nil); err == nil {
+			t.Fatal("journey without digest accepted")
+		}
+	})
+	t.Run("a run with neither, and with both, is accepted", func(t *testing.T) {
+		if err := run("rn", nil, nil); err != nil {
+			t.Fatalf("neither: %v", err)
+		}
+		if err := run("rb", "A", seedDigestA); err != nil {
+			t.Fatalf("both: %v", err)
+		}
+	})
+	t.Run("a NULL interaction journey is accepted", func(t *testing.T) {
+		mustExec(t, pool, "INSERT INTO agent_interactions(id,thread_id,run_id,journey_id,definition_digest,kind,artifact,checkpoint,history,expires_at) VALUES('inull','plain','rd',NULL,$1,'approval','{}','{}','[]',clock_timestamp()+interval '1 day')", seedDigestA)
+		if n := count(t, "SELECT count(*) FROM agent_interactions WHERE id='inull' AND journey_id IS NULL"); n != 1 {
+			t.Fatalf("NULL-journey interaction = %d", n)
+		}
+	})
+	t.Run("the replaced constraint is gone", func(t *testing.T) {
+		if n := count(t, "SELECT count(*) FROM pg_constraint WHERE conrelid='agent_runs'::regclass AND conname='agent_runs_check'"); n != 0 {
+			t.Fatal("agent_runs_check still present")
+		}
+	})
+	t.Run("Migrate again is a no-op", func(t *testing.T) {
+		if err := Migrate(ctx, pool); err != nil {
+			t.Fatalf("second Migrate: %v", err)
 		}
 	})
 }

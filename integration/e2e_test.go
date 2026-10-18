@@ -1,17 +1,22 @@
 package integration_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/mcptest"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/modeltest"
@@ -82,7 +87,8 @@ func TestE2EConversationAgent(t *testing.T) {
 
 		body := e2eReadBody(t, "POST on A", acceptancePost(t, a.url, aguitypes.RunAgentInput{
 			ThreadID: thread, RunID: run,
-			Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan a trip to Kyoto"}},
+			Messages:       []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan a trip to Kyoto"}},
+			ForwardedProps: map[string]any{"journeyId": "planner"},
 		}))
 		if !strings.Contains(body, answer) || !strings.Contains(body, "RUN_FINISHED") {
 			t.Fatalf("POST on A lacks final answer or RUN_FINISHED: %s", body)
@@ -192,7 +198,8 @@ func TestE2EConversationAgent(t *testing.T) {
 
 		postResponse := acceptancePostWithHeaders(t, a.url, aguitypes.RunAgentInput{
 			ThreadID: thread, RunID: run,
-			Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan a trip to Kyoto"}},
+			Messages:       []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan a trip to Kyoto"}},
+			ForwardedProps: map[string]any{"journeyId": "planner"},
 		}, http.Header{
 			"Cookie":    {sessionCookie + s1Sentinel},
 			decoyHeader: {s1DecoyValue},
@@ -361,7 +368,8 @@ func TestE2EConversationAgent(t *testing.T) {
 		for _, r := range runs {
 			body := e2eReadBody(t, "tenant "+r.name+" POST", acceptancePostWithHeaders(t, r.post.url, aguitypes.RunAgentInput{
 				ThreadID: r.thread, RunID: r.run,
-				Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan a trip to Kyoto"}},
+				Messages:       []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan a trip to Kyoto"}},
+				ForwardedProps: map[string]any{"journeyId": "planner"},
 			}, http.Header{"Authorization": {"Bearer " + r.token}}))
 			if !strings.Contains(body, r.answer) || !strings.Contains(body, "RUN_FINISHED") {
 				t.Fatalf("tenant %s POST lacks final answer or RUN_FINISHED: %s", r.name, body)
@@ -378,7 +386,8 @@ func TestE2EConversationAgent(t *testing.T) {
 		const threadC, runC = "e2e-s2-c", "e2e-s2-c-run"
 		bodyC := e2eReadBody(t, "tenant C POST", acceptancePostWithHeaders(t, c.url, aguitypes.RunAgentInput{
 			ThreadID: threadC, RunID: runC,
-			Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan a trip to Kyoto"}},
+			Messages:       []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan a trip to Kyoto"}},
+			ForwardedProps: map[string]any{"journeyId": "planner"},
 		}, http.Header{"Authorization": {"Bearer token-c"}}))
 		if !strings.Contains(bodyC, "RUN_ERROR") || !strings.Contains(bodyC, `"code":"dependency_unavailable"`) || strings.Contains(bodyC, "RUN_FINISHED") {
 			t.Fatalf("tenant C POST: expected RUN_ERROR dependency_unavailable and no RUN_FINISHED: %s", bodyC)
@@ -536,7 +545,8 @@ func TestE2EConversationAgent(t *testing.T) {
 			t.Helper()
 			body := e2eReadBody(t, "tenant "+tn.name+" "+run, acceptancePostWithHeaders(t, replica.url, aguitypes.RunAgentInput{
 				ThreadID: tn.thread, RunID: run,
-				Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan a trip to Kyoto"}},
+				Messages:       []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan a trip to Kyoto"}},
+				ForwardedProps: map[string]any{"journeyId": "planner"},
 			}, http.Header{"Authorization": {"Bearer " + tn.token}}))
 			if !strings.Contains(body, answer) || !strings.Contains(body, "RUN_FINISHED") {
 				t.Fatalf("tenant %s %s lacks final answer or RUN_FINISHED: %s", tn.name, run, body)
@@ -747,17 +757,403 @@ func TestE2EConversationAgent(t *testing.T) {
 		}
 		var eventLeaks int
 		if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM agent_events WHERE tool_name <> '' AND tool_name <> $1 AND tool_name <> ALL($2)`,
-			alias, []string{"request_user_input", "load_skill", "read_skill_resource", "activate_journey"}).Scan(&eventLeaks); err != nil || eventLeaks != 0 {
+			alias, []string{"request_user_input", "read_skill_resource", "activate_journey"}).Scan(&eventLeaks); err != nil || eventLeaks != 0 {
 			t.Errorf("agent_events with a tool_name other than the alias = %d (%v), want 0", eventLeaks, err)
 		}
 	})
 	t.Run("S4", func(t *testing.T) {
 		stage(t, 4, "H4b")
 		// After activate_journey only that journey's aliases are offered; per-tenant and per-user limits evict LRU journeys, pinned ones stay, and the active set survives restarts.
+		const (
+			threadA, threadB = "e2e-s4-a", "e2e-s4-b"
+			notExecuted      = `{"error":"not_executed","message":"not executed; call again after activation"}`
+		)
+		pool := database(t)
+		set := e2eJourneySet(t)
+		vN := mcptest.New(t, mcptest.Options{Name: "e2e-s4-vN", Version: "vN"}, e2eCatalog(func(o e2eOp) string { return o.remoteA }))
+		vN1 := mcptest.New(t, mcptest.Options{Name: "e2e-s4-vN1", Version: "vN+1"}, e2eCatalog(func(o e2eOp) string { return o.remoteB }))
+		allow, err := tenantdir.NewAllowlist(map[string]string{"java-vn": vN.URL(), "java-vn1": vN1.URL()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Tenant A keeps the default limit of 2; tenant B is limited to 1.
+		one := 1
+		settingsDoc := func(alice *int) settings.Document {
+			doc := settings.Document{Tenants: map[string]settings.Layer{"tenant-b": {MaxActiveJourneys: &one}}}
+			if alice != nil {
+				doc.Users = map[string]map[string]settings.Layer{"tenant-a": {testPrincipal: {MaxActiveJourneys: alice}}}
+			}
+			return doc
+		}
+		source, err := settings.NewMutable(settingsDoc(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tenancy := agentruntime.Tenancy{
+			Directory: tenantdir.NewMutable(map[string]tenantdir.Entry{
+				"tenant-a": {ProductVersion: "vN", EndpointID: "java-vn"},
+				"tenant-b": {ProductVersion: "vN+1", EndpointID: "java-vn1"},
+			}),
+			Endpoints: allow,
+			Settings:  source,
+		}
+
+		activate := func(journey string) modeltest.Step {
+			return modeltest.Call("activate_journey", map[string]any{"journey": journey})
+		}
+		// Model script; the comment on each step is its global request index.
+		model := modeltest.New(
+			// Run A1: activations on a fresh thread (limit 2).
+			activate("planner"), // 0
+			modeltest.Func(func(_ context.Context, _ agentruntime.ModelRequest) (agentruntime.ModelResponse, error) { // 1: activation plus a sibling call
+				return agentruntime.ModelResponse{ToolCalls: []agentruntime.ToolCall{
+					{CallID: "s4-act-hotels", Name: "activate_journey", Arguments: json.RawMessage(`{"journey":"hotels"}`)},
+					{CallID: "s4-sibling", Name: "travel_lookup", Arguments: json.RawMessage(`{}`)},
+				}}, nil
+			}),
+			modeltest.Func(func(_ context.Context, _ agentruntime.ModelRequest) (agentruntime.ModelResponse, error) { // 2: the sibling was never dispatched
+				if got := vN.Calls("travel/lookup"); got != 0 {
+					t.Errorf("MCP travel/lookup calls before the model re-issued the sibling = %d, want 0", got)
+				}
+				return agentruntime.ModelResponse{ToolCalls: []agentruntime.ToolCall{{CallID: "s4-lookup", Name: "travel_lookup", Arguments: json.RawMessage(`{}`)}}}, nil
+			}),
+			activate("visas"),         // 3: third journey evicts the LRU one
+			modeltest.Text("A1 done"), // 4
+			// Run A2: alice's user layer narrows the limit to 1.
+			activate("planner"),       // 5
+			modeltest.Text("A2 done"), // 6
+			// Run A3: build a pending approval for booking, which is also the LRU journey.
+			activate("booking"),                        // 7
+			activate("planner"),                        // 8: re-activation moves planner to MRU
+			modeltest.Call("book_reserve", struct{}{}), // 9: effectful, waits for approval
+			modeltest.Text("booked"),                   // 10: run A4 after the approval reply
+			// Run B1: tenant B, limit 1.
+			activate("planner"),                        // 11
+			activate("hotels"),                         // 12: evicts planner
+			modeltest.Call("hotel_search", struct{}{}), // 13
+			modeltest.Text("B1 done"),                  // 14
+			// Run A5: after restarting every replica.
+			modeltest.Text("after restart"), // 15
+		)
+		a, b, c := threeReplicas(t, pool, set, model, tenancy)
+
+		const tokenA, tokenB = "token", "token-b"
+		chat := func(replica acceptanceReplica, token, thread, run, text string) string {
+			t.Helper()
+			body := e2eReadBody(t, run, acceptancePostWithHeaders(t, replica.url, aguitypes.RunAgentInput{
+				ThreadID: thread, RunID: run,
+				Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: text}},
+			}, http.Header{"Authorization": {"Bearer " + token}}))
+			if !strings.Contains(body, "RUN_FINISHED") {
+				t.Fatalf("%s lacks RUN_FINISHED: %s", run, body)
+			}
+			return body
+		}
+		activeOf := func(principal, external string) []string {
+			t.Helper()
+			var raw []byte
+			if err := pool.QueryRow(t.Context(), `SELECT active_journeys FROM agent_conversations WHERE id=$1`, acceptanceThreadFor(t, pool, principal, external)).Scan(&raw); err != nil {
+				t.Fatal(err)
+			}
+			var ids []string
+			if err := json.Unmarshal(raw, &ids); err != nil {
+				t.Fatal(err)
+			}
+			return ids
+		}
+		requireActive := func(label, principal, external string, want ...string) {
+			t.Helper()
+			if got := activeOf(principal, external); !slices.Equal(got, want) {
+				t.Errorf("%s: agent_conversations.active_journeys = %v, want %v", label, got, want)
+			}
+		}
+		// expect checks one recorded request: its journey aliases, the active set
+		// (LRU first) and that exactly the active journeys' instructions are present.
+		expect := func(index int, aliases []string, active ...string) {
+			t.Helper()
+			request := model.Requests()[index]
+			if got := e2eJourneyAliases(request); !slices.Equal(got, aliases) {
+				t.Errorf("request %d journey aliases = %v, want %v", index, got, aliases)
+			}
+			if !slices.Equal(request.ActiveJourneys, active) && (len(request.ActiveJourneys) != 0 || len(active) != 0) {
+				t.Errorf("request %d ActiveJourneys = %v, want %v", index, request.ActiveJourneys, active)
+			}
+			if !strings.Contains(request.Instructions, "## Available journeys") {
+				t.Errorf("request %d instructions lack the available journeys section", index)
+			}
+			for _, id := range []string{"planner", "hotels", "visas", "booking"} {
+				if got, want := strings.Contains(request.Instructions, "## Active journey: "+id+"\n"), slices.Contains(active, id); got != want {
+					t.Errorf("request %d instructions contain active section for %s = %v, want %v", index, id, got, want)
+				}
+			}
+		}
+		result := func(index int, callID, want string) {
+			t.Helper()
+			if got := e2eResult(t, model.Requests()[index], callID); got != want {
+				t.Errorf("request %d result for %s = %s, want %s", index, callID, got, want)
+			}
+		}
+
+		// Run A1 (limit 2).
+		chat(a, tokenA, threadA, "e2e-s4-a1", "start")
+		if got := model.Count(); got != 5 {
+			t.Fatalf("model requests after A1 = %d, want 5", got)
+		}
+		expect(0, nil)
+		expect(1, []string{"travel_lookup"}, "planner")
+		result(1, "modeltest-call-0", `{"activated":"planner"}`)
+		expect(2, []string{"hotel_search", "travel_lookup"}, "planner", "hotels")
+		result(2, "s4-act-hotels", `{"activated":"hotels"}`)
+		result(2, "s4-sibling", notExecuted)
+		expect(3, []string{"hotel_search", "travel_lookup"}, "planner", "hotels")
+		if got := e2eResult(t, model.Requests()[3], "s4-lookup"); strings.Contains(got, `"error"`) {
+			t.Errorf("executed travel_lookup result = %s, want a tool result", got)
+		}
+		expect(4, []string{"hotel_search", "visa_check"}, "hotels", "visas")
+		result(4, "modeltest-call-3", `{"activated":"visas","evicted":["planner"]}`)
+		if got := vN.Calls("travel/lookup"); got != 1 {
+			t.Errorf("MCP travel/lookup calls = %d, want 1 (the sibling must not run)", got)
+		}
+		requireActive("after A1", testPrincipal, threadA, "hotels", "visas")
+
+		// Run A2: a user-level setting narrows A's limit to 1; the next run start evicts down.
+		if err := source.Set(settingsDoc(&one)); err != nil {
+			t.Fatal(err)
+		}
+		chat(b, tokenA, threadA, "e2e-s4-a2", "narrow")
+		expect(5, []string{"visa_check"}, "visas") // hotels (LRU) was evicted at run start
+		expect(6, []string{"travel_lookup"}, "planner")
+		result(6, "modeltest-call-5", `{"activated":"planner","evicted":["visas"]}`)
+		requireActive("after A2", testPrincipal, threadA, "planner")
+		var resolved struct {
+			MaxActiveJourneys int `json:"max_active_journeys"`
+		}
+		var recorded []byte
+		if err := pool.QueryRow(t.Context(), `SELECT settings FROM agent_runs WHERE id=(SELECT id FROM chat_runs WHERE external_id='e2e-s4-a2')`).Scan(&recorded); err != nil || json.Unmarshal(recorded, &resolved) != nil || resolved.MaxActiveJourneys != 1 {
+			t.Errorf("run A2 recorded settings = %s (%v), want max_active_journeys 1", recorded, err)
+		}
+
+		// Run A3 (limit back to 2): booking becomes the least recently used journey and has a pending approval.
+		if err := source.Set(settingsDoc(nil)); err != nil {
+			t.Fatal(err)
+		}
+		body := e2eReadBody(t, "A3", acceptancePostWithHeaders(t, c.url, aguitypes.RunAgentInput{
+			ThreadID: threadA, RunID: "e2e-s4-a3",
+			Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "book"}},
+		}, http.Header{"Authorization": {"Bearer " + tokenA}}))
+		if !strings.Contains(body, "interaction.requested") {
+			t.Fatalf("A3 lacks the approval request: %s", body)
+		}
+		expect(7, []string{"travel_lookup"}, "planner")
+		expect(8, []string{"book_reserve", "travel_lookup"}, "planner", "booking")
+		result(8, "modeltest-call-7", `{"activated":"booking"}`)
+		expect(9, []string{"book_reserve", "travel_lookup"}, "booking", "planner")
+		result(9, "modeltest-call-8", `{"activated":"planner"}`)
+		requireActive("after A3", testPrincipal, threadA, "booking", "planner")
+		if got := vN.Calls("book/reserve"); got != 0 {
+			t.Errorf("MCP book/reserve calls before approval = %d, want 0", got)
+		}
+		var pending int
+		if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM agent_interactions WHERE thread_id=$1 AND state='pending' AND journey_id='booking'`, acceptanceThreadFor(t, pool, testPrincipal, threadA)).Scan(&pending); err != nil || pending != 1 {
+			t.Fatalf("pending booking approvals = %d (%v), want 1", pending, err)
+		}
+
+		// Run A4: the limit drops to 1 while the approval is pending. The unpinned planner is evicted; the pinned, least recently used booking stays.
+		if err := source.Set(settingsDoc(&one)); err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := journal.New(pool).Snapshot(t.Context(), acceptanceThreadFor(t, pool, testPrincipal, threadA), testPrincipal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var interaction *journal.Interaction
+		for _, run := range snapshot.Runs {
+			if run.Interaction != nil {
+				interaction = run.Interaction
+			}
+		}
+		if interaction == nil {
+			t.Fatalf("no pending interaction in snapshot: %#v", snapshot.Runs)
+		}
+		replyBody := e2eReadBody(t, "A4", acceptancePostWithHeaders(t, a.url, aguitypes.RunAgentInput{
+			ThreadID: threadA, RunID: "e2e-s4-a4",
+			ForwardedProps: map[string]any{"interactionReply": map[string]any{
+				"interactionId": interaction.ID, "kind": "approval",
+				"answer": map[string]any{"decision": "approve", "binding": interaction.Call.Binding},
+			}},
+		}, http.Header{"Authorization": {"Bearer " + tokenA}}))
+		if !strings.Contains(replyBody, "RUN_FINISHED") || !strings.Contains(replyBody, "booked") {
+			t.Fatalf("A4 did not finish with the answer: %s", replyBody)
+		}
+		expect(10, []string{"book_reserve"}, "booking")
+		requireActive("after A4", testPrincipal, threadA, "booking")
+		if got := vN.Calls("book/reserve"); got != 1 {
+			t.Errorf("MCP book/reserve calls after approval = %d, want exactly 1", got)
+		}
+
+		// Run B1: tenant B (limit 1): the second activation evicts the first.
+		chat(b, tokenB, threadB, "e2e-s4-b1", "start")
+		expect(11, nil)
+		expect(12, []string{"travel_lookup"}, "planner")
+		result(12, "modeltest-call-11", `{"activated":"planner"}`)
+		expect(13, []string{"hotel_search"}, "hotels")
+		result(13, "modeltest-call-12", `{"activated":"hotels","evicted":["planner"]}`)
+		requireActive("after B1", "tenant-b/bob", threadB, "hotels")
+		if vN1.Calls("hotel search") != 1 || vN1.Calls("travel lookup") != 0 || vN.Calls("hotel/search") != 0 {
+			t.Errorf("MCP calls: vN+1 hotel search = %d, vN+1 travel lookup = %d, vN hotel/search = %d; want 1, 0, 0", vN1.Calls("hotel search"), vN1.Calls("travel lookup"), vN.Calls("hotel/search"))
+		}
+		if err := pool.QueryRow(t.Context(), `SELECT settings FROM agent_runs WHERE id=(SELECT id FROM chat_runs WHERE external_id='e2e-s4-b1')`).Scan(&recorded); err != nil || json.Unmarshal(recorded, &resolved) != nil || resolved.MaxActiveJourneys != 1 {
+			t.Errorf("run B1 recorded settings = %s (%v), want max_active_journeys 1", recorded, err)
+		}
+		historySize := func(principal, external string) int {
+			t.Helper()
+			var size int
+			if err := pool.QueryRow(t.Context(), `SELECT jsonb_array_length(history) FROM agent_conversations WHERE id=$1`, acceptanceThreadFor(t, pool, principal, external)).Scan(&size); err != nil {
+				t.Fatal(err)
+			}
+			return size
+		}
+		historyA := historySize(testPrincipal, threadA)
+		if historyA == 0 {
+			t.Fatal("conversation A has no history")
+		}
+
+		// Restart every replica: the active set and history come from the database alone.
+		for _, replica := range []acceptanceReplica{a, b, c} {
+			replica.stop()
+		}
+		a, b, c = threeReplicas(t, pool, set, model, tenancy)
+		_, _ = a, c
+		requireActive("after restart A", testPrincipal, threadA, "booking")
+		requireActive("after restart B", "tenant-b/bob", threadB, "hotels")
+		if got := historySize(testPrincipal, threadA); got != historyA {
+			t.Errorf("history length after restart = %d, want %d", got, historyA)
+		}
+		chat(b, tokenA, threadA, "e2e-s4-a5", "still there?")
+		expect(15, []string{"book_reserve"}, "booking")
+		if !strings.Contains(strings.Join(model.Requests()[15].Messages, "\n"), "start") {
+			t.Errorf("request 15 lacks the conversation history from before the restart: %v", model.Requests()[15].Messages)
+		}
+		if got := model.Count(); got != 16 {
+			t.Errorf("model requests = %d, want 16", got)
+		}
+		requireActive("after A5", testPrincipal, threadA, "booking")
 	})
 	t.Run("S5", func(t *testing.T) {
 		stage(t, 5, "H4b")
 		// A correction admitted via replica B while A's tool is blocked reaches every later provider request, and a reconnect on C is gap-free.
+		const (
+			thread     = "e2e-s5"
+			correction = "use Osaka instead"
+		)
+		pool := database(t)
+		endpoint := mcptest.New(t, mcptest.Options{Name: "e2e-s5", Version: "vN"}, e2eCatalog(func(o e2eOp) string { return o.remoteA }))
+		started, release := endpoint.Block("travel/lookup")
+		t.Cleanup(release)
+		model := modeltest.New(
+			modeltest.Call("travel_lookup", map[string]any{"destination": "Kyoto"}), // 0: blocks in MCP
+			modeltest.Call("travel_lookup", map[string]any{"destination": "Osaka"}), // 1: first request after the correction
+			modeltest.Text("corrected Osaka"),                                       // 2
+		)
+		a, b, c := threeReplicas(t, pool, e2eJourneySet(t), model, testTenancy(t, endpoint.URL()))
+
+		first := acceptancePost(t, a.url, aguitypes.RunAgentInput{
+			ThreadID: thread, RunID: "e2e-s5-a",
+			Messages:       []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan a trip"}},
+			ForwardedProps: map[string]any{"journeyId": "planner"},
+		})
+		defer first.Body.Close()
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the MCP tool did not start")
+		}
+		steering := acceptancePost(t, b.url, aguitypes.RunAgentInput{
+			ThreadID: thread, RunID: "e2e-s5-b",
+			Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: correction}},
+		})
+		defer steering.Body.Close()
+		if steering.StatusCode != http.StatusOK {
+			t.Fatalf("steering admission = %d", steering.StatusCode)
+		}
+		live := acceptanceReconnect(t, c.url, thread, "e2e-s5-b")
+		defer live.Body.Close()
+		if live.StatusCode != http.StatusOK {
+			t.Fatalf("reconnect on C = %d", live.StatusCode)
+		}
+		snapshot, err := journal.New(pool).Snapshot(t.Context(), acceptanceThread(t, pool, thread), testPrincipal)
+		if err != nil || len(snapshot.Runs) != 1 || snapshot.Runs[0].PendingCommands != 1 {
+			t.Fatalf("durable steering receipt = %#v, %v", snapshot, err)
+		}
+		if got := model.Count(); got != 1 {
+			t.Fatalf("model requests while the tool is blocked = %d, want 1", got)
+		}
+		// A second reconnect on C resumes from the newest event journalled so far.
+		var cursor int64
+		if err := pool.QueryRow(t.Context(), `SELECT max(sequence) FROM agent_events WHERE thread_id=$1`, acceptanceThread(t, pool, thread)).Scan(&cursor); err != nil || cursor == 0 {
+			t.Fatalf("newest event sequence = %d (%v)", cursor, err)
+		}
+		resumed := e2eReconnectFrom(t, c.url, thread, "e2e-s5-b", "token", cursor)
+		defer resumed.Body.Close()
+		if resumed.StatusCode != http.StatusOK {
+			t.Fatalf("resume on C = %d", resumed.StatusCode)
+		}
+		release()
+
+		streams := map[string]string{}
+		for name, response := range map[string]*http.Response{"A": first, "B (steering)": steering, "C (reconnect)": live, "C (resumed)": resumed} {
+			body := e2eReadBody(t, "stream "+name, response)
+			if !strings.Contains(body, "corrected Osaka") || !strings.Contains(body, "RUN_FINISHED") {
+				t.Fatalf("stream %s lacks the final answer or RUN_FINISHED: %s", name, body)
+			}
+			streams[name] = body
+		}
+
+		requests := model.Requests()
+		if len(requests) != 3 {
+			t.Fatalf("model requests = %d, want 3", len(requests))
+		}
+		if strings.Contains(strings.Join(requests[0].Messages, "\n"), correction) {
+			t.Errorf("request 0 already contains the correction: %v", requests[0].Messages)
+		}
+		for i := 1; i < len(requests); i++ {
+			if !strings.Contains(strings.Join(requests[i].Messages, "\n"), correction) {
+				t.Errorf("request %d lacks the correction %q: %v", i, correction, requests[i].Messages)
+			}
+		}
+		if pending := requests[1].PendingCommands; len(pending) != 1 || pending[0].Text != correction {
+			t.Errorf("request 1 pending commands = %#v, want the correction", pending)
+		}
+		// Every round was built from the same activated journey, so the correction survived rebuilding the agent.
+		for i, request := range requests {
+			if !slices.Equal(request.ActiveJourneys, []string{"planner"}) || !slices.Equal(e2eJourneyAliases(request), []string{"travel_lookup"}) {
+				t.Errorf("request %d active journeys = %v aliases = %v, want [planner] / [travel_lookup]", i, request.ActiveJourneys, e2eJourneyAliases(request))
+			}
+		}
+		if got := endpoint.Calls("travel/lookup"); got != 2 {
+			t.Errorf("MCP travel/lookup calls = %d, want 2", got)
+		}
+
+		// Gap-free replay: A saw one contiguous run of event ids. Each reconnect on C
+		// starts at its snapshot id (the larger of the cursor and the watermark) and
+		// then sees exactly the later events, in order, with no gap and no duplicate.
+		idsA := e2eEventIDs(t, streams["A"])
+		if len(idsA) < 5 || !e2eContiguous(idsA) {
+			t.Fatalf("stream A event ids = %v, want at least 5 contiguous ids", idsA)
+		}
+		for name, first := range map[string]int64{"B (steering)": 0, "C (reconnect)": 0, "C (resumed)": cursor} {
+			ids := e2eEventIDs(t, streams[name])
+			if len(ids) == 0 || !e2eContiguous(ids) || ids[len(ids)-1] != idsA[len(idsA)-1] || ids[0] < first {
+				t.Errorf("stream %s event ids = %v, want contiguous from %d to %d", name, ids, first, idsA[len(idsA)-1])
+				continue
+			}
+			if tail := idsA[slices.Index(idsA, ids[0]):]; !slices.Equal(ids, tail) {
+				t.Errorf("stream %s event ids = %v, want the suffix of A's %v", name, ids, tail)
+			}
+		}
+		if ids := e2eEventIDs(t, streams["C (resumed)"]); ids[0] != cursor || len(ids) < 2 {
+			t.Errorf("resumed stream event ids = %v, want to start at the cursor %d and continue", ids, cursor)
+		}
 	})
 	t.Run("S6", func(t *testing.T) {
 		stage(t, 6, "H5")
@@ -771,4 +1167,128 @@ func TestE2EConversationAgent(t *testing.T) {
 		stage(t, 8, "H7")
 		// An apply-then-drop-response effect yields outcome_unknown with no retry and a pinned journey, and the trace carries no content, tool descriptions or remote names.
 	})
+}
+
+// e2eOp is one operation both E2E MCP endpoints serve under different remote names.
+type e2eOp struct{ key, remoteA, remoteB string }
+
+var e2eOps = []e2eOp{
+	{"travel.lookup", "travel/lookup", "travel lookup"},
+	{"hotel.search", "hotel/search", "hotel search"},
+	{"visa.check", "visa/check", "visa check"},
+	{"book.reserve", "book/reserve", "book reserve"},
+}
+
+// e2eCatalog serves every e2eOps operation under the remote name remote picks.
+func e2eCatalog(remote func(e2eOp) string) mcptest.Catalog {
+	var tools []mcptest.Tool
+	for _, op := range e2eOps {
+		tools = append(tools, mcptest.Tool{Name: remote(op), OperationKey: op.key})
+	}
+	return mcptest.Catalog{Tools: tools}
+}
+
+// e2eJourneySet compiles four journeys: planner, hotels and visas are read-only,
+// booking is effectful (it needs approval). Each skill body is "BODY <id>".
+func e2eJourneySet(t *testing.T) *definitions.Set {
+	t.Helper()
+	root := t.TempDir()
+	config := "catalog:\n  operation_meta_key: " + testMetaKey + "\n  call_id_header: X-Platform-Call-ID\njourneys:\n"
+	for _, j := range []struct{ id, op, class string }{
+		{"planner", "travel.lookup", "read_only"},
+		{"hotels", "hotel.search", "read_only"},
+		{"visas", "visa.check", "read_only"},
+		{"booking", "book.reserve", ""},
+	} {
+		dir := filepath.Join(root, "skills", j.id)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		skill := "---\nname: " + j.id + "\ndescription: The " + j.id + " journey\n---\nBODY " + j.id + "\n"
+		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skill), 0600); err != nil {
+			t.Fatal(err)
+		}
+		config += "  - id: " + j.id + "\n    skill: skills/" + j.id + "\n    tools:\n      - op: " + j.op + "\n"
+		if j.class != "" {
+			config += "        class: " + j.class + "\n"
+		}
+	}
+	path := filepath.Join(root, "journeys.yaml")
+	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return compileSet(t, path)
+}
+
+// e2eJourneyAliases is the sorted list of journey tool aliases in a model request
+// (the request omits the product tools).
+func e2eJourneyAliases(request agentruntime.ModelRequest) []string {
+	var names []string
+	for _, tool := range request.Tools {
+		switch tool.Name {
+		case "activate_journey", "request_user_input", "read_skill_resource":
+		default:
+			names = append(names, tool.Name)
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+// e2eResult is the JSON of the tool result with the given call ID in request.
+func e2eResult(t *testing.T, request agentruntime.ModelRequest, callID string) string {
+	t.Helper()
+	for _, result := range request.ToolResults {
+		if result.CallID == callID {
+			encoded, err := json.Marshal(result.Value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(encoded)
+		}
+	}
+	t.Fatalf("request has no tool result for call %q: %#v", callID, request.ToolResults)
+	return ""
+}
+
+// e2eReconnectFrom is e2eReconnect with a Last-Event-ID cursor.
+func e2eReconnectFrom(t *testing.T, endpoint, thread, run, token string, cursor int64) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, endpoint+"?threadId="+thread+"&runId="+run, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Last-Event-ID", fmt.Sprint(cursor))
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return response
+}
+
+var e2eEventID = regexp.MustCompile(`(?m)^id: (\d+)$`)
+
+// e2eEventIDs returns the SSE event ids of body in order.
+func e2eEventIDs(t *testing.T, body string) []int64 {
+	t.Helper()
+	var ids []int64
+	for _, match := range e2eEventID.FindAllStringSubmatch(body, -1) {
+		var id int64
+		if _, err := fmt.Sscan(match[1], &id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// e2eContiguous reports whether ids increase by exactly one.
+func e2eContiguous(ids []int64) bool {
+	for i := 1; i < len(ids); i++ {
+		if ids[i] != ids[i-1]+1 {
+			return false
+		}
+	}
+	return true
 }

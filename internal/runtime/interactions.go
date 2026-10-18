@@ -6,44 +6,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+
 	"github.com/microsoft/agent-framework-go/agent"
 	"github.com/microsoft/agent-framework-go/message"
-	"github.com/microsoft/agent-framework-go/tool"
+
 	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/journeys"
 	platformskills "github.com/swiftdiaries/az-agent-platform-go/internal/skills"
 )
 
 type questionTool struct{}
 
-func (questionTool) Name() string { return "request_user_input" }
+func (questionTool) Name() string { return toolRequestUserInput }
 func (questionTool) Description() string {
 	return "Ask one to three structured clarification questions. An answer never approves a business action."
-}
-
-type loadSkillTool struct{}
-
-func (loadSkillTool) Name() string        { return "load_skill" }
-func (loadSkillTool) Description() string { return "Load the instructions for one available skill." }
-func (loadSkillTool) ReturnSchema() any   { return nil }
-func (loadSkillTool) Schema() any {
-	var schema any
-	_ = json.Unmarshal([]byte(`{"type":"object","additionalProperties":false,"required":["skillName"],"properties":{"skillName":{"type":"string"}}}`), &schema)
-	return schema
-}
-
-type readSkillResourceTool struct{}
-
-func (readSkillResourceTool) Name() string { return "read_skill_resource" }
-func (readSkillResourceTool) Description() string {
-	return "Read one declared supporting file from an available skill."
-}
-func (readSkillResourceTool) ReturnSchema() any { return nil }
-func (readSkillResourceTool) Schema() any {
-	var schema any
-	_ = json.Unmarshal([]byte(`{"type":"object","additionalProperties":false,"required":["skillName","resourceName"],"properties":{"skillName":{"type":"string"},"resourceName":{"type":"string"}}}`), &schema)
-	return schema
 }
 func (questionTool) ReturnSchema() any { return nil }
 func (questionTool) Schema() any {
@@ -52,7 +31,128 @@ func (questionTool) Schema() any {
 	return schema
 }
 
-func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definitions.Journey, cat *catalog.Binding) (output RunOutput, runErr error) {
+// conversation is the state of one run's conversation agent: the pinned set, the
+// catalog, the journeys available to this user (configuration order), and the active
+// set, which activation changes between rounds.
+type conversation struct {
+	set       *definitions.Set
+	cat       toolCatalog
+	available []definitions.Journey
+	active    *journeys.ActiveSet
+	limit     int
+}
+
+func (c *conversation) journey(id string) (definitions.Journey, bool) {
+	for _, journey := range c.available {
+		if journey.ID == id {
+			return journey, true
+		}
+	}
+	return definitions.Journey{}, false
+}
+
+func (c *conversation) isAvailable(id string) bool {
+	_, ok := c.journey(id)
+	return ok
+}
+
+func (c *conversation) availableIDs() []string {
+	ids := make([]string, len(c.available))
+	for i, journey := range c.available {
+		ids[i] = journey.ID
+	}
+	return ids
+}
+
+// activeJourneys returns the active journeys, least recently used first.
+func (c *conversation) activeJourneys() []definitions.Journey {
+	var out []definitions.Journey
+	for _, id := range c.active.IDs() {
+		if journey, ok := c.journey(id); ok {
+			out = append(out, journey)
+		}
+	}
+	return out
+}
+
+// owner resolves an alias to the active journey that owns it, most recently used first.
+func (c *conversation) owner(alias string) (string, bool) {
+	return owningJourney(c.active.IDs(), func(journeyID, alias string) bool {
+		_, ok := c.cat.Tool(journeyID, alias)
+		return ok
+	}, alias)
+}
+
+// activate processes one activate_journey call. Only a failure of the fenced journal
+// ends the run; every refusal is a result for the model.
+func (c *conversation) activate(ctx context.Context, in RunInput, arguments string) (any, error) {
+	var args struct {
+		Journey string `json:"journey"`
+	}
+	if journal.DecodeStrict([]byte(arguments), &args) != nil || args.Journey == "" {
+		return map[string]string{"error": "invalid_arguments"}, nil
+	}
+	if !c.isAvailable(args.Journey) {
+		return map[string]string{"error": "journey_unavailable"}, nil
+	}
+	// The persisted set equals the in-memory one (every change is written); the fenced
+	// read also supplies the journeys pinned now.
+	persisted, pinned, err := in.Store.ActiveJourneys(ctx, in.Owner)
+	if err != nil {
+		return nil, err
+	}
+	next := journeys.NewActiveSet(persisted)
+	evicted, err := next.Activate(args.Journey, c.limit, pinned)
+	if errors.Is(err, journeys.ErrRefused) {
+		return map[string]string{"error": "activation_refused", "message": "all active journeys are pinned"}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !slices.Equal(persisted, next.IDs()) {
+		if err := in.Store.SetActiveJourneys(ctx, in.Owner, next.IDs()); err != nil {
+			return nil, err
+		}
+	}
+	c.active = next
+	result := map[string]any{"activated": args.Journey}
+	if len(evicted) > 0 {
+		result["evicted"] = evicted
+	}
+	return result, nil
+}
+
+// readResource processes one read_skill_resource call. It returns the file body and
+// its provenance. skills.ErrChanged (and any read failure other than an undeclared
+// file) ends the run.
+func (c *conversation) readResource(arguments string) (any, *MaterialProvenance, error) {
+	var args struct {
+		Journey  string `json:"journey"`
+		Resource string `json:"resource"`
+	}
+	if journal.DecodeStrict([]byte(arguments), &args) != nil || args.Journey == "" || args.Resource == "" {
+		return map[string]string{"error": "invalid_arguments"}, nil, nil
+	}
+	unavailable := map[string]string{"error": "resource_unavailable"}
+	journey, ok := c.journey(args.Journey)
+	if !ok || !c.active.Contains(args.Journey) || args.Resource == "SKILL.md" {
+		return unavailable, nil, nil
+	}
+	name, ok := resourceSkill(journey)
+	if !ok {
+		return unavailable, nil, nil
+	}
+	material, err := platformskills.New(journey).Read(name, args.Resource)
+	if errors.Is(err, platformskills.ErrUnavailable) {
+		return unavailable, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return string(material.Body), &MaterialProvenance{ID: args.Journey + "/" + material.Resource, Digest: material.FileDigest}, nil
+}
+
+func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation) (output RunOutput, runErr error) {
 	var history []*message.Message
 	if err := json.Unmarshal(in.History, &history); err != nil {
 		return RunOutput{}, err
@@ -86,48 +186,54 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 		}
 		output.History, _ = json.Marshal(history)
 	}()
+	// pending and requestHistory are shared by every round's agent. invoke drains the
+	// inbox into pending before it builds the agent; the agent's before hook copies it
+	// onto the request and its observed callback records its inclusion.
 	var pending []journal.Input
 	var requestHistory json.RawMessage
-	skillSource := platformskills.New(journey)
-	skillCatalog := skillSource.Catalog()
-	providerSkillCatalog := make([]SkillMetadata, len(skillCatalog))
-	for i, skill := range skillCatalog {
-		providerSkillCatalog[i] = SkillMetadata{Name: skill.Name, Description: skill.Description}
-	}
-	var skillMaterial []platformskills.Material
-	// The pinned graph resumes each outstanding tool result separately. The product
-	// owns batching and durable waiting; a bare MAF agent handles one provider turn.
-	tools := append(cat.Tools(journey.ID), tool.Tool(questionTool{}))
-	if len(skillCatalog) > 0 {
-		tools = append(tools, loadSkillTool{}, readSkillResourceTool{})
-	}
-	inner := agent.New(agent.ProviderConfig{ProviderName: "configured-model", Run: modelRun(ctx, r.model, stableCallID(in.ThreadID, in.RunID), func(ctx context.Context, req *ModelRequest) error {
-		req.Handoff = Handoff{JourneyID: journey.ID, Text: in.Text}
-		req.PendingCommands = pending
-		req.History = requestHistory
-		req.DefinitionDigest = journey.Digest
-		req.SkillCatalog = append([]SkillMetadata(nil), providerSkillCatalog...)
-		req.SkillMaterial = cloneSkillMaterial(skillMaterial)
-		req.Provenance = RequestProvenance{
-			Definition: MaterialProvenance{ID: journey.ID, Digest: journey.Digest},
-			System:     MaterialProvenance{ID: journey.ID + "/system", Digest: digestValue(req.Instructions)},
-			Handoff:    MaterialProvenance{ID: journey.ID, Digest: digestValue(req.Handoff)},
-			Catalog:    MaterialProvenance{ID: journey.ID + "/skills", Digest: digestValue(req.SkillCatalog)},
-			History:    MaterialProvenance{ID: in.ThreadID + "/" + journey.ID, Digest: digestValue(req.History)},
+	var skills []MaterialProvenance
+	// buildAgent makes a fresh single-provider-call agent from the current active set.
+	// It is never reused across rounds: activation changes its tools and instructions.
+	buildAgent := func() *agent.Agent {
+		active := conv.activeJourneys()
+		activeIDs := make([]string, len(active))
+		for i, journey := range active {
+			activeIDs[i] = journey.ID
 		}
-		for _, command := range req.PendingCommands {
-			if !command.Materialized {
-				continue
+		metadata := journeyMetadata(conv.available)
+		instructions := composeInstructions(conv.set.ConversationPrompt(), conv.available, active)
+		tools := roundTools(conv.cat.Tools(activeIDs...), conv.availableIDs(), active)
+		before := func(ctx context.Context, req *ModelRequest) error {
+			req.PendingCommands = pending
+			req.History = requestHistory
+			req.DefinitionDigest = conv.set.Digest()
+			req.ActiveJourneys = slices.Clone(activeIDs)
+			req.Provenance = RequestProvenance{
+				Definition: MaterialProvenance{ID: "set", Digest: conv.set.Digest()},
+				System:     MaterialProvenance{ID: "instructions", Digest: digestValue(req.Instructions)},
+				Catalog:    MaterialProvenance{ID: "journeys", Digest: digestValue(metadata)},
+				History:    MaterialProvenance{ID: in.ThreadID, Digest: digestValue(req.History)},
+				Skills:     slices.Clone(skills),
 			}
-			item := MaterialProvenance{ID: command.CommunicationID, Digest: command.Digest}
-			req.Provenance.Pending = append(req.Provenance.Pending, item)
-			req.Provenance.IncludedInput = append(req.Provenance.IncludedInput, item)
+			for _, journey := range active {
+				req.Provenance.Active = append(req.Provenance.Active, MaterialProvenance{ID: journey.ID, Digest: journey.Digest})
+			}
+			for _, command := range req.PendingCommands {
+				if !command.Materialized {
+					continue
+				}
+				item := MaterialProvenance{ID: command.CommunicationID, Digest: command.Digest}
+				req.Provenance.Pending = append(req.Provenance.Pending, item)
+				req.Provenance.IncludedInput = append(req.Provenance.IncludedInput, item)
+			}
+			return in.Store.Check(ctx, in.Owner)
 		}
-		for _, material := range req.SkillMaterial {
-			req.Provenance.Skills = append(req.Provenance.Skills, MaterialProvenance{ID: material.Name + "/" + material.Resource, Digest: material.FileDigest})
-		}
-		return in.Store.Check(ctx, in.Owner)
-	}, func(ctx context.Context) error { return in.Store.Included(ctx, in.Owner, pending) })}, agent.Config{ID: "journey:" + journey.ID, Name: journey.ID, Description: journey.Description, Tools: tools, RunOptions: []agent.Option{agent.WithInstructions(journey.Prompt)}})
+		observed := func(ctx context.Context) error { return in.Store.Included(ctx, in.Owner, pending) }
+		return agent.New(
+			agent.ProviderConfig{ProviderName: "configured-model", Run: modelRun(ctx, r.model, stableCallID(in.ThreadID, in.RunID), before, observed)},
+			agent.Config{ID: "conversation", Name: "conversation", Description: "Conversation agent", Tools: tools, RunOptions: []agent.Option{agent.WithInstructions(instructions)}},
+		)
+	}
 	continuation, err := in.Store.Continuation(ctx, in.Owner)
 	if err != nil {
 		return RunOutput{}, err
@@ -176,7 +282,7 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 			}
 		}
 		// Function results precede newly admitted user messages in materialized history.
-		response, err := inner.Run(ctx, history).Collect()
+		response, err := buildAgent().Run(ctx, history).Collect()
 		if err == nil {
 			history = append(history, response.Messages...)
 		} else {
@@ -205,25 +311,37 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 					return RunOutput{}, fmt.Errorf("model returned no answer")
 				}
 				serialized, err := json.Marshal(history)
-				return RunOutput{JourneyID: journey.ID, Answer: response.String(), History: serialized}, err
+				return RunOutput{JourneyID: in.TargetJourney, Answer: response.String(), History: serialized}, err
 			}
 		}
-		for index, call := range calls {
+		plan := planCalls(calls, offersResources(conv.activeJourneys()), conv.owner)
+		for index, step := range plan {
+			call := step.Call
 			callNumber++
-			if call.Name == "load_skill" || call.Name == "read_skill_resource" {
-				var arguments struct {
-					SkillName    string `json:"skillName"`
-					ResourceName string `json:"resourceName,omitempty"`
-				}
-				if err := journal.DecodeStrict([]byte(call.Arguments), &arguments); err != nil || arguments.SkillName == "" || call.Name == "read_skill_resource" && arguments.ResourceName == "" || call.Name == "load_skill" && arguments.ResourceName != "" {
-					return RunOutput{}, journal.ErrState
-				}
-				material, err := skillSource.Read(arguments.SkillName, arguments.ResourceName)
+			switch step.Kind {
+			case callNotExecuted:
+				history = append(history, resultMessage(call.CallID, map[string]string{"error": "not_executed", "message": "not executed; call again after activation"}))
+				continue
+			case callActivate:
+				result, err := conv.activate(ctx, in, call.Arguments)
 				if err != nil {
 					return RunOutput{}, err
 				}
-				skillMaterial = append(skillMaterial, material)
-				history = append(history, resultMessage(call.CallID, string(material.Body)))
+				history = append(history, resultMessage(call.CallID, result))
+				continue
+			case callReadResource:
+				result, provenance, err := conv.readResource(call.Arguments)
+				if err != nil {
+					return RunOutput{}, err
+				}
+				if provenance != nil {
+					skills = append(skills, *provenance)
+				}
+				history = append(history, resultMessage(call.CallID, result))
+				continue
+			case callInactive:
+				// Never dispatched, whatever the model asks for: the gate fails closed.
+				history = append(history, resultMessage(call.CallID, map[string]string{"error": "tool_not_active"}))
 				continue
 			}
 			binding, err := journal.ActionBinding(call.Name, []byte(call.Arguments))
@@ -232,9 +350,9 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 			}
 			callID := stableCallID(in.ThreadID, fmt.Sprintf("%s/%d/%d", in.RunID, in.Iteration, callNumber))
 			var resolved catalog.Tool
-			if call.Name != "request_user_input" {
+			if step.Kind == callAlias {
 				var allowed bool
-				resolved, allowed = cat.Tool(journey.ID, call.Name)
+				resolved, allowed = conv.cat.Tool(step.Journey, call.Name)
 				if !allowed {
 					return RunOutput{}, fmt.Errorf("tool is not allowed")
 				}
@@ -247,16 +365,18 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 				callID = approved.Call.CallID
 				approvalID = approved.ID
 			}
-			if call.Name == "request_user_input" || (resolved.RequiresApproval && approvalID == "") {
+			if step.Kind == callAsk || (resolved.RequiresApproval && approvalID == "") {
 				// Close siblings explicitly before checkpointing one externally answerable
 				// request; they may be proposed again after this wait, never auto-dispatched.
-				for _, sibling := range calls[index+1:] {
-					m := resultMessage(sibling.CallID, map[string]string{"error": "deferred_for_human_input"})
+				for _, sibling := range plan[index+1:] {
+					m := resultMessage(sibling.Call.CallID, map[string]string{"error": "deferred_for_human_input"})
 					history = append(history, m)
 				}
 
-				i := journal.Interaction{ID: "interaction_" + rand.Text(), Kind: "approval", Call: journal.ProposedCall{CallID: callID, ProviderCallID: call.CallID, Name: call.Name, Arguments: json.RawMessage(call.Arguments), Binding: binding}}
-				if call.Name == "request_user_input" {
+				// A clarification is not owned by a journey; an approval belongs to the
+				// journey that owns the tool.
+				i := journal.Interaction{ID: "interaction_" + rand.Text(), Kind: "approval", JourneyID: step.Journey, Call: journal.ProposedCall{CallID: callID, ProviderCallID: call.CallID, Name: call.Name, Arguments: json.RawMessage(call.Arguments), Binding: binding}}
+				if step.Kind == callAsk {
 					i.Kind = "clarification"
 					var args struct {
 						Questions []journal.Question `json:"questions"`
@@ -286,9 +406,9 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 				if err != nil {
 					return RunOutput{}, err
 				}
-				return RunOutput{JourneyID: journey.ID, History: serialized, Waiting: true}, nil
+				return RunOutput{JourneyID: in.TargetJourney, History: serialized, Waiting: true}, nil
 			}
-			result, err := guardedCall(ctx, in, cat, journal.Operation{CallID: callID, Name: call.Name, OperationKey: resolved.OperationKey, Arguments: call.Arguments, Binding: binding, Policy: string(resolved.Class), RequiresApproval: resolved.RequiresApproval}, approvalID)
+			result, err := guardedCall(ctx, in, conv.cat, journal.Operation{CallID: callID, Name: call.Name, OperationKey: resolved.OperationKey, Arguments: call.Arguments, Binding: binding, Policy: string(resolved.Class), RequiresApproval: resolved.RequiresApproval, JourneyID: step.Journey}, approvalID)
 			if err != nil {
 				return RunOutput{}, err
 			}
@@ -306,6 +426,7 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, journey definition
 	}
 	return RunOutput{}, fmt.Errorf("provider tool round budget exhausted")
 }
+
 func resultMessage(id string, result any) *message.Message {
 	return &message.Message{Role: message.RoleTool, Contents: message.Contents{&message.FunctionResultContent{CallID: id, Result: result}}}
 }

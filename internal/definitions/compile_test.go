@@ -11,8 +11,8 @@ import (
 
 const (
 	compileSkillMD  = "---\nname: planner\ndescription: Plan time off\n---\nUse the planner.\n"
-	compileMinimal  = "catalog:\n  operation_meta_key: op\njourneys:\n  - id: j\n    skill: skills/planner\n    system_prompt: prompts/p.md\n    tools:\n      - op: lookup\n"
-	compileTwoOpsYA = "catalog:\n  operation_meta_key: op\n  call_id_header: x-call-id\njourneys:\n  - id: j\n    skill: skills/planner\n    system_prompt: prompts/p.md\n    tools:\n      - op: %s\n"
+	compileMinimal  = "catalog:\n  operation_meta_key: op\njourneys:\n  - id: j\n    skill: skills/planner\n    tools:\n      - op: lookup\n"
+	compileTwoOpsYA = "catalog:\n  operation_meta_key: op\n  call_id_header: x-call-id\njourneys:\n  - id: j\n    skill: skills/planner\n    tools:\n      - op: %s\n"
 )
 
 // writeCompileTree writes files (slash paths) under a fresh temp dir and
@@ -22,7 +22,6 @@ func writeCompileTree(t *testing.T, yaml string, extra map[string]string) string
 	root := t.TempDir()
 	files := map[string]string{
 		"journeys.yaml":              yaml,
-		"prompts/p.md":               "SECRET-PROMPT-BODY\n",
 		"skills/planner/SKILL.md":    compileSkillMD,
 		"skills/planner/guide.md":    "Prefer direct routes.\n",
 		"skills/planner/ref/more.md": "More.\n",
@@ -58,7 +57,7 @@ func TestCompileValidConfig(t *testing.T) {
 		t.Fatalf("journeys out of order: %+v", journeys)
 	}
 	j := journeys[0]
-	if j.Description != "Plan time off" || j.Prompt != "You plan vacations.\n" || j.SystemPrompt != "prompts/planner.md" || j.Skill != "skills/planner/" {
+	if j.Description != "Plan time off" || j.Prompt != "Use the planner." || j.Skill != "skills/planner/" {
 		t.Fatalf("unexpected journey metadata: %+v", j)
 	}
 	if j.MaxTools != 15 || journeys[1].MaxTools != 3 {
@@ -69,9 +68,6 @@ func TestCompileValidConfig(t *testing.T) {
 	}
 	if j.ProductVersions != (VersionRange{Min: "2026.2", MaxExclusive: "2027.1"}) || !j.ProductVersions.Contains("2026.10") || j.ProductVersions.Contains("2027.1") {
 		t.Fatalf("product versions = %+v", j.ProductVersions)
-	}
-	if !reflect.DeepEqual(j.Routing, Routing{Default: true, Keywords: []string{"vacation", "leave"}, Priority: 10}) {
-		t.Fatalf("routing = %+v", j.Routing)
 	}
 	want := []Selector{
 		{Ops: []string{"leave.balance"}},
@@ -104,18 +100,14 @@ func TestCompileValidConfig(t *testing.T) {
 	// Clones are deep.
 	journeys[0].Tools[0].Ops[0] = "mutated"
 	journeys[0].Deny[0] = "mutated"
-	journeys[0].Routing.Keywords[0] = "mutated"
 	again, _ := set.Journey("vacation-planner")
-	if again.Tools[0].Ops[0] != "leave.balance" || again.Deny[0] != "leave.delete" || again.Routing.Keywords[0] != "vacation" {
+	if again.Tools[0].Ops[0] != "leave.balance" || again.Deny[0] != "leave.delete" {
 		t.Fatal("caller mutation changed the set")
-	}
-	if def, ok := set.DefaultJourney(); !ok || def.ID != "vacation-planner" {
-		t.Fatalf("default journey = %q %v", def.ID, ok)
 	}
 }
 
 func TestCompileSkipsDotfilesAndReadsOpScalarVsList(t *testing.T) {
-	yaml := "catalog:\n  operation_meta_key: op\njourneys:\n  - id: j\n    skill: skills/planner\n    system_prompt: prompts/p.md\n    tools:\n      - op: a\n      - op: [b, c]\n"
+	yaml := "catalog:\n  operation_meta_key: op\njourneys:\n  - id: j\n    skill: skills/planner\n    tools:\n      - op: a\n      - op: [b, c]\n"
 	path := writeCompileTree(t, yaml, map[string]string{
 		"skills/planner/.DS_Store":      "junk",
 		"skills/planner/.hidden/x.md":   "hidden",
@@ -141,7 +133,7 @@ func TestCompileSkipsDotfilesAndReadsOpScalarVsList(t *testing.T) {
 
 func TestCompileRejects(t *testing.T) {
 	journey := func(body string) string {
-		return "catalog:\n  operation_meta_key: op\n  call_id_header: x-call-id\njourneys:\n  - id: j\n    skill: skills/planner\n    system_prompt: prompts/p.md\n" + body
+		return "catalog:\n  operation_meta_key: op\n  call_id_header: x-call-id\njourneys:\n  - id: j\n    skill: skills/planner\n" + body
 	}
 	tools := func(t string) string { return journey("    tools:\n" + t) }
 	cases := []struct {
@@ -152,12 +144,12 @@ func TestCompileRejects(t *testing.T) {
 		{name: "unknown top-level", yaml: compileMinimal + "extra: 1\n"},
 		{name: "unknown journey field", yaml: journey("    bogus: 1\n    tools:\n      - op: a\n")},
 		{name: "unknown selector field", yaml: tools("      - op: a\n        bogus: 1\n")},
-		{name: "unknown catalog field", yaml: "catalog:\n  operation_meta_key: op\n  bogus: 1\njourneys:\n  - id: j\n    skill: skills/planner\n    system_prompt: prompts/p.md\n    tools:\n      - op: a\n"},
+		{name: "unknown catalog field", yaml: "catalog:\n  operation_meta_key: op\n  bogus: 1\njourneys:\n  - id: j\n    skill: skills/planner\n    tools:\n      - op: a\n"},
 		{name: "trailing document", yaml: compileMinimal + "---\ncatalog: {}\n"},
 		{name: "empty file", yaml: ""},
-		{name: "missing operation_meta_key", yaml: "catalog:\n  call_id_header: x\njourneys:\n  - id: j\n    skill: skills/planner\n    system_prompt: prompts/p.md\n    tools:\n      - op: a\n"},
+		{name: "missing operation_meta_key", yaml: "catalog:\n  call_id_header: x\njourneys:\n  - id: j\n    skill: skills/planner\n    tools:\n      - op: a\n"},
 		{name: "no journeys", yaml: "catalog:\n  operation_meta_key: op\njourneys: []\n"},
-		{name: "duplicate journey id", yaml: compileMinimal + "  - id: j\n    skill: skills/planner\n    system_prompt: prompts/p.md\n    tools:\n      - op: b\n"},
+		{name: "duplicate journey id", yaml: compileMinimal + "  - id: j\n    skill: skills/planner\n    tools:\n      - op: b\n"},
 		{name: "whitespace id", yaml: strings.Replace(compileMinimal, "id: j", "id: \"a b\"", 1)},
 		{name: "long id", yaml: strings.Replace(compileMinimal, "id: j", "id: "+strings.Repeat("x", 65), 1)},
 		{name: "missing skill", yaml: strings.Replace(compileMinimal, "    skill: skills/planner\n", "", 1)},
@@ -165,10 +157,6 @@ func TestCompileRejects(t *testing.T) {
 		{name: "escaping skill", yaml: strings.Replace(compileMinimal, "skills/planner", "../skills/planner", 1)},
 		{name: "nonexistent skill", yaml: strings.Replace(compileMinimal, "skills/planner", "skills/nope", 1)},
 		{name: "skill is config dir", yaml: strings.Replace(compileMinimal, "skills/planner", ".", 1)},
-		{name: "missing prompt", yaml: strings.Replace(compileMinimal, "    system_prompt: prompts/p.md\n", "", 1)},
-		{name: "absolute prompt", yaml: strings.Replace(compileMinimal, "prompts/p.md", "/etc/passwd", 1)},
-		{name: "escaping prompt", yaml: strings.Replace(compileMinimal, "prompts/p.md", "prompts/../../p.md", 1)},
-		{name: "nonexistent prompt", yaml: strings.Replace(compileMinimal, "prompts/p.md", "prompts/none.md", 1)},
 		{name: "missing SKILL.md", yaml: compileMinimal, extra: map[string]string{"skills/planner/SKILL.md": "-"}},
 		{name: "bad frontmatter", yaml: compileMinimal, extra: map[string]string{"skills/planner/SKILL.md": "no frontmatter\n"}},
 		{name: "empty tools", yaml: journey("    tools: []\n")},
@@ -184,7 +172,7 @@ func TestCompileRejects(t *testing.T) {
 		{name: "duplicate alternative", yaml: tools("      - op: [a, a]\n")},
 		{name: "invalid class", yaml: tools("      - op: a\n        class: deduplicated\n")},
 		{name: "invalid approval", yaml: tools("      - op: a\n        approval: always\n")},
-		{name: "idempotent without header", yaml: "catalog:\n  operation_meta_key: op\njourneys:\n  - id: j\n    skill: skills/planner\n    system_prompt: prompts/p.md\n    tools:\n      - op: a\n        class: idempotent\n"},
+		{name: "idempotent without header", yaml: "catalog:\n  operation_meta_key: op\njourneys:\n  - id: j\n    skill: skills/planner\n    tools:\n      - op: a\n        class: idempotent\n"},
 		{name: "min >= max", yaml: journey("    product_versions: {min: \"2027.1\", max_exclusive: \"2026.2\"}\n    tools:\n      - op: a\n")},
 		{name: "min == max", yaml: journey("    product_versions: {min: \"1\", max_exclusive: \"1\"}\n    tools:\n      - op: a\n")},
 		{name: "op key in two selectors", yaml: tools("      - op: a\n      - op: [b, a]\n")},
@@ -198,8 +186,9 @@ func TestCompileRejects(t *testing.T) {
 		{name: "invalid alias digit", yaml: tools("      - op: 9lives\n")},
 		{name: "invalid alias length", yaml: tools("      - op: " + strings.Repeat("a", 70) + "\n")},
 		{name: "alias collision", yaml: tools("      - op: a.b\n      - op: a_b\n")},
-		{name: "invalid call id header", yaml: "catalog:\n  operation_meta_key: op\n  call_id_header: \"bad header\"\njourneys:\n  - id: j\n    skill: skills/planner\n    system_prompt: prompts/p.md\n    tools:\n      - op: a\n"},
-		{name: "duplicate keyword", yaml: journey("    routing: {keywords: [A, a]}\n    tools:\n      - op: a\n")},
+		{name: "invalid call id header", yaml: "catalog:\n  operation_meta_key: op\n  call_id_header: \"bad header\"\njourneys:\n  - id: j\n    skill: skills/planner\n    tools:\n      - op: a\n"},
+		{name: "removed key system_prompt", yaml: strings.Replace(compileMinimal, "    skill: skills/planner\n", "    skill: skills/planner\n    system_prompt: prompts/p.md\n", 1), extra: map[string]string{"prompts/p.md": "SECRET-PROMPT-BODY\n"}},
+		{name: "removed key routing", yaml: strings.Replace(compileMinimal, "    skill: skills/planner\n", "    skill: skills/planner\n    routing: {default: true}\n", 1)},
 		{name: "scalar not mapping", yaml: "just a string\n"},
 		{name: "syntax error", yaml: "catalog: [\n"},
 	}
@@ -236,7 +225,7 @@ func TestCompileRejectsSymlinks(t *testing.T) {
 	t.Run("symlink inside bundle", func(t *testing.T) {
 		path := writeCompileTree(t, compileMinimal, nil)
 		root := filepath.Dir(path)
-		if err := os.Symlink(filepath.Join(root, "prompts", "p.md"), filepath.Join(root, "skills", "planner", "link.md")); err != nil {
+		if err := os.Symlink(filepath.Join(root, "skills", "planner", "guide.md"), filepath.Join(root, "skills", "planner", "link.md")); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := Compile(path); err == nil {
@@ -251,19 +240,6 @@ func TestCompileRejectsSymlinks(t *testing.T) {
 		}
 		if _, err := Compile(path); err == nil {
 			t.Fatal("accepted a symlinked directory inside the bundle")
-		}
-	})
-	t.Run("symlinked prompt", func(t *testing.T) {
-		path := writeCompileTree(t, compileMinimal, nil)
-		root := filepath.Dir(path)
-		if err := os.Rename(filepath.Join(root, "prompts", "p.md"), filepath.Join(root, "real.md")); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Symlink(filepath.Join(root, "real.md"), filepath.Join(root, "prompts", "p.md")); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := Compile(path); err == nil {
-			t.Fatal("accepted a symlinked prompt")
 		}
 	})
 }
@@ -287,7 +263,7 @@ func TestCompileDigestIsContentAddressed(t *testing.T) {
 		yaml  string
 		extra map[string]string
 	}{
-		"prompt":     {yaml, map[string]string{"prompts/p.md": "changed prompt\n"}},
+		"prompt":     {yaml, map[string]string{"skills/planner/SKILL.md": "---\nname: planner\ndescription: Plan time off\n---\nchanged prompt\n"}},
 		"selector":   {fmt.Sprintf(compileTwoOpsYA, "other"), nil},
 		"supporting": {yaml, map[string]string{"skills/planner/guide.md": "changed\n"}},
 		"catalog":    {strings.Replace(yaml, "op\n", "op2\n", 1), nil},
@@ -306,7 +282,7 @@ func TestCompileDigestIsContentAddressed(t *testing.T) {
 func compileRetainTree(t *testing.T, id, prompt string) *Set {
 	t.Helper()
 	yaml := strings.Replace(fmt.Sprintf(compileTwoOpsYA, "lookup"), "id: j", "id: "+id, 1)
-	set, err := Compile(writeCompileTree(t, yaml, map[string]string{"prompts/p.md": prompt}))
+	set, err := Compile(writeCompileTree(t, yaml, map[string]string{"skills/planner/SKILL.md": "---\nname: planner\ndescription: Plan time off\n---\n" + prompt}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +327,7 @@ func TestCompileRetain(t *testing.T) {
 		t.Fatalf("retained Version = %p want %p ok=%v", oldSet, old, ok)
 	}
 	pj, ok := oldSet.Journey("j")
-	if !ok || pj.Prompt != "v1 prompt\n" || pj.Digest != oj.Digest {
+	if !ok || pj.Prompt != "v1 prompt" || pj.Digest != oj.Digest {
 		t.Fatalf("retained old journey = %q %v", pj.Prompt, ok)
 	}
 	goneSet, ok := retained.Version(gone.Digest())
@@ -366,7 +342,7 @@ func TestCompileRetain(t *testing.T) {
 		t.Fatalf("current Version = %p want %p ok=%v", currentSet, retained, ok)
 	}
 	pj, ok = currentSet.Journey("j")
-	if !ok || pj.Prompt != "v2 prompt\n" || pj.Digest != cj.Digest {
+	if !ok || pj.Prompt != "v2 prompt" || pj.Digest != cj.Digest {
 		t.Fatalf("current journey = %q %v", pj.Prompt, ok)
 	}
 	if current.Serves(old.Digest()) {
@@ -422,64 +398,6 @@ func TestCompileRetainCollisionAndLimits(t *testing.T) {
 	// Re-retaining an already retained digest consumes no budget.
 	if _, err := Retain(sets[0], sets[1], sets[1], sets[0]); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestCompileInferRouting(t *testing.T) {
-	yaml := `catalog:
-  operation_meta_key: op
-journeys:
-  - id: general
-    skill: skills/planner
-    system_prompt: prompts/p.md
-    routing: {default: true}
-    tools: [{op: a}]
-  - id: travel
-    skill: skills/planner
-    system_prompt: prompts/p.md
-    routing: {keywords: [Flight, hotel], priority: 5}
-    tools: [{op: b}]
-  - id: premium
-    skill: skills/planner
-    system_prompt: prompts/p.md
-    routing: {keywords: [flight], priority: 9}
-    tools: [{op: c}]
-  - id: tie
-    skill: skills/planner
-    system_prompt: prompts/p.md
-    routing: {keywords: [hotel], priority: 5}
-    tools: [{op: d}]
-`
-	set, err := Compile(writeCompileTree(t, yaml, nil))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for text, want := range map[string]string{
-		"book a FLIGHT please": "premium",
-		"need a hotel":         "travel", // equal priority: first wins
-		"hello there":          "general",
-		"  ":                   "",
-	} {
-		got, ok := set.Infer(text)
-		if want == "" {
-			if ok {
-				t.Fatalf("Infer(%q) = %q, want none", text, got.ID)
-			}
-			continue
-		}
-		if !ok || got.ID != want {
-			t.Fatalf("Infer(%q) = %q %v, want %q", text, got.ID, ok, want)
-		}
-	}
-
-	// Without a default, the first journey is the fallback.
-	noDefault := strings.Replace(yaml, "routing: {default: true}", "routing: {}", 1)
-	set, err = Compile(writeCompileTree(t, noDefault, nil))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, ok := set.Infer("hello"); !ok || got.ID != "general" {
-		t.Fatalf("fallback = %q %v", got.ID, ok)
 	}
 }
 
@@ -574,14 +492,14 @@ func TestCompileRepositoryConfig(t *testing.T) {
 	if len(journeys) != 2 || journeys[0].ID != "vacation-planner" || journeys[1].ID != "shift-swap" {
 		t.Fatalf("journeys = %+v", journeys)
 	}
-	if !journeys[0].Routing.Default || len(journeys[0].Skills) != 1 || journeys[0].Skills[0].Name != "planner" {
+	if len(journeys[0].Skills) != 1 || journeys[0].Skills[0].Name != "planner" {
 		t.Fatalf("vacation-planner = %+v", journeys[0])
 	}
 	if got, want := journeys[0].Tools, []Selector{{Ops: []string{"lookup_destination"}, Class: ClassReadOnly}}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("vacation-planner tools = %+v", got)
 	}
 	swap := journeys[1]
-	if swap.Skills[0].Name != "shift-swap" || swap.Routing.Priority != 10 || !reflect.DeepEqual(swap.Routing.Keywords, []string{"shift", "swap"}) {
+	if swap.Skills[0].Name != "shift-swap" {
 		t.Fatalf("shift-swap = %+v", swap)
 	}
 	want := []Selector{
@@ -593,5 +511,172 @@ func TestCompileRepositoryConfig(t *testing.T) {
 	}
 	if swap.Tools[1].Class != "" || swap.Tools[1].ApprovalRequired {
 		t.Fatalf("request_shift_swap must stay unclassified, got %+v", swap.Tools[1])
+	}
+}
+
+func TestCompileConversationPrompt(t *testing.T) {
+	compile := func(t *testing.T, yaml string, extra map[string]string) (*Set, error) {
+		t.Helper()
+		return Compile(writeCompileTree(t, "conversation_prompt: conv.md\n"+yaml, extra))
+	}
+	t.Run("present", func(t *testing.T) {
+		set, err := compile(t, compileMinimal, map[string]string{"conv.md": "You are the conversation agent.\n"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := set.ConversationPrompt(), "You are the conversation agent.\n"; got != want {
+			t.Fatalf("ConversationPrompt() = %q, want %q", got, want)
+		}
+		other, err := compile(t, compileMinimal, map[string]string{"conv.md": "A different base prompt.\n"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		absent, err := Compile(writeCompileTree(t, compileMinimal, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if set.Digest() == other.Digest() || set.Digest() == absent.Digest() {
+			t.Fatalf("conversation prompt does not change the set digest: %s %s %s", set.Digest(), other.Digest(), absent.Digest())
+		}
+		again, err := compile(t, compileMinimal, map[string]string{"conv.md": "You are the conversation agent.\n"})
+		if err != nil || again.Digest() != set.Digest() {
+			t.Fatalf("digest is not deterministic: %v", err)
+		}
+		for id, j := range set.journeys {
+			if j.Digest != absent.journeys[id].Digest {
+				t.Fatalf("journey digest must not depend on the conversation prompt")
+			}
+		}
+	})
+	t.Run("absent", func(t *testing.T) {
+		set, err := Compile(writeCompileTree(t, compileMinimal, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := set.ConversationPrompt(); got != "" {
+			t.Fatalf("ConversationPrompt() = %q, want empty", got)
+		}
+	})
+	t.Run("retain keeps own value", func(t *testing.T) {
+		current, err := compile(t, compileMinimal, map[string]string{"conv.md": "current\n"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		old, err := compile(t, compileMinimal, map[string]string{"conv.md": "old\n"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		retained, err := Retain(current, old)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if retained.ConversationPrompt() != "current\n" || retained.Digest() != current.Digest() {
+			t.Fatalf("retained prompt = %q", retained.ConversationPrompt())
+		}
+		v, ok := retained.Version(old.Digest())
+		if !ok || v.ConversationPrompt() != "old\n" {
+			t.Fatalf("Version(old) prompt = %v %v", ok, v)
+		}
+	})
+	t.Run("rejects", func(t *testing.T) {
+		big := strings.Repeat("x", MaxPromptBytes+1)
+		cases := []struct {
+			name, key string
+			extra     map[string]string
+		}{
+			{name: "absolute", key: "/etc/passwd"},
+			{name: "escaping", key: "../conv.md"},
+			{name: "escaping nested", key: "prompts/../../conv.md"},
+			{name: "missing file", key: "none.md"},
+			{name: "oversize", key: "conv.md", extra: map[string]string{"conv.md": big}},
+			{name: "directory", key: "skills"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				yaml := "conversation_prompt: " + tc.key + "\n" + compileMinimal
+				set, err := Compile(writeCompileTree(t, yaml, tc.extra))
+				if err == nil || set != nil {
+					t.Fatalf("Compile accepted the configuration (err=%v)", err)
+				}
+				if strings.Contains(err.Error(), "SECRET-PROMPT-BODY") {
+					t.Fatalf("error echoes file contents: %v", err)
+				}
+			})
+		}
+		t.Run("symlink", func(t *testing.T) {
+			path := writeCompileTree(t, "conversation_prompt: link.md\n"+compileMinimal, nil)
+			dir := filepath.Dir(path)
+			if err := os.Symlink(filepath.Join(dir, "skills", "planner", "guide.md"), filepath.Join(dir, "link.md")); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+			if set, err := Compile(path); err == nil || set != nil {
+				t.Fatalf("Compile accepted a symlinked conversation prompt (err=%v)", err)
+			}
+		})
+		t.Run("empty value", func(t *testing.T) {
+			// An explicit empty path is the same as an absent key.
+			set, err := Compile(writeCompileTree(t, "conversation_prompt: \"\"\n"+compileMinimal, nil))
+			if err != nil || set.ConversationPrompt() != "" {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	})
+}
+
+func TestCompileSkillBodyPrompt(t *testing.T) {
+	t.Run("prompt is the SKILL.md body", func(t *testing.T) {
+		skill := "---\nname: planner\ndescription: Plan time off\n---\n\n  Use the planner.\n\nSecond paragraph.\n\n"
+		set, err := Compile(writeCompileTree(t, compileMinimal, map[string]string{"skills/planner/SKILL.md": skill}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		j, _ := set.Journey("j")
+		if want := "Use the planner.\n\nSecond paragraph."; j.Prompt != want {
+			t.Fatalf("Prompt = %q, want %q", j.Prompt, want)
+		}
+	})
+	t.Run("body changes the journey digest", func(t *testing.T) {
+		build := func(body string) Journey {
+			skill := "---\nname: planner\ndescription: Plan time off\n---\n" + body
+			set, err := Compile(writeCompileTree(t, compileMinimal, map[string]string{"skills/planner/SKILL.md": skill}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			j, _ := set.Journey("j")
+			return j
+		}
+		if a, b := build("one\n"), build("two\n"); a.Digest == b.Digest || a.Prompt == b.Prompt {
+			t.Fatal("body change did not change the journey")
+		}
+	})
+	t.Run("empty body", func(t *testing.T) {
+		skill := "---\nname: planner\ndescription: Plan time off\n---\n"
+		set, err := Compile(writeCompileTree(t, compileMinimal, map[string]string{"skills/planner/SKILL.md": skill}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if j, _ := set.Journey("j"); j.Prompt != "" {
+			t.Fatalf("Prompt = %q, want empty", j.Prompt)
+		}
+	})
+}
+
+// The runtime no longer routes and prompts come from SKILL.md bodies, so the
+// per-journey routing and system_prompt keys are unknown fields.
+func TestCompileRejectsRemovedKeys(t *testing.T) {
+	for key, line := range map[string]string{
+		"routing":       "    routing: {default: true}\n",
+		"system_prompt": "    system_prompt: prompts/p.md\n",
+	} {
+		t.Run(key, func(t *testing.T) {
+			yaml := strings.Replace(compileMinimal, "    skill: skills/planner\n", "    skill: skills/planner\n"+line, 1)
+			set, err := Compile(writeCompileTree(t, yaml, map[string]string{"prompts/p.md": "p\n"}))
+			if err == nil || set != nil {
+				t.Fatalf("Compile accepted %s (err=%v)", key, err)
+			}
+			if !strings.Contains(err.Error(), "unknown field") {
+				t.Fatalf("%s was not rejected as an unknown field: %v", key, err)
+			}
+		})
 	}
 }

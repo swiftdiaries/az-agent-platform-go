@@ -192,3 +192,46 @@ func hasInputTypes(raw any, want ...string) bool {
 	}
 	return true
 }
+
+// A journey's tools leave request.Tools when it is evicted, but its calls stay in
+// the durable history and must still be replayable.
+func TestForeignFunctionCallInHistory(t *testing.T) {
+	var sent atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		body := decodeBody(t, request)
+		sent.Add(1)
+		input, _ := body["input"].([]any)
+		var call, result map[string]any
+		for _, item := range input {
+			entry := item.(map[string]any)
+			switch entry["type"] {
+			case "function_call":
+				call = entry
+			case "function_call_output":
+				result = entry
+			}
+		}
+		if call == nil || call["name"] != "evicted_alias" || call["call_id"] != "call_foreign" || result == nil || result["call_id"] != "call_foreign" {
+			t.Errorf("foreign call/result missing from input: %#v", input)
+		}
+		tools, _ := body["tools"].([]any)
+		if len(tools) != 1 {
+			t.Errorf("tools = %#v", body["tools"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_f","object":"response","created_at":1741891428,"status":"completed","model":"fixture-deployment","output":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"fine","annotations":[]}]}]}`)
+	}))
+	defer server.Close()
+	response, err := newAdapter(t, server).Complete(t.Context(), runtime.ModelRequest{
+		ProviderMessages: []*message.Message{
+			message.NewText("go"),
+			{Role: message.RoleAssistant, Contents: message.Contents{&message.FunctionCallContent{CallID: "call_foreign", Name: "evicted_alias", Arguments: `{"a":1}`}}},
+			{Role: message.RoleTool, Contents: message.Contents{&message.FunctionResultContent{CallID: "call_foreign", Result: map[string]any{"ok": true}}}},
+			message.NewText("continue"),
+		},
+		Tools: []runtime.ModelTool{{Name: "active_alias", Description: "active", Schema: map[string]any{"type": "object"}}},
+	})
+	if err != nil || sent.Load() != 1 || response.Text != "fine" {
+		t.Fatalf("sent/response/error = %d/%+v/%v", sent.Load(), response, err)
+	}
+}

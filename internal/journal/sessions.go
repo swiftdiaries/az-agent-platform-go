@@ -59,7 +59,8 @@ func (s *Store) Start(ctx context.Context, o Owner, journey, digest string) (jso
 		}
 		// A reply continuation run copies the interaction's journey and digest; the
 		// digest of a pre-000009 interaction is an old per-journey digest, so overwrite it.
-		result, err := tx.Exec(ctx, "UPDATE agent_runs SET journey_id=$3,definition_digest=$4 WHERE thread_id=$1 AND id=$2 AND (journey_id IS NULL OR journey_id=$3)", c.ThreadID, c.RunID, journey, digest)
+		// An empty journey (no explicit target) pins the definition and leaves journey_id as is.
+		result, err := tx.Exec(ctx, "UPDATE agent_runs SET journey_id=COALESCE(NULLIF($3,''),journey_id),definition_digest=$4 WHERE thread_id=$1 AND id=$2 AND ($3='' OR journey_id IS NULL OR journey_id=$3)", c.ThreadID, c.RunID, journey, digest)
 		if err != nil {
 			return err
 		}
@@ -82,8 +83,8 @@ func (s *Store) Finish(ctx context.Context, o Owner, state RunState, history jso
 		if err := lockOwner(ctx, tx, o); err != nil {
 			return err
 		}
-		var journey string
-		if err := tx.QueryRow(ctx, "SELECT COALESCE(journey_id,'') FROM agent_runs WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID).Scan(&journey); err != nil {
+		var pinned bool
+		if err := tx.QueryRow(ctx, "SELECT definition_digest IS NOT NULL FROM agent_runs WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID).Scan(&pinned); err != nil {
 			return err
 		}
 		if state == RunCompleted {
@@ -103,7 +104,7 @@ func (s *Store) Finish(ctx context.Context, o Owner, state RunState, history jso
 				return err
 			}
 		}
-		if len(history) > 0 && journey != "" {
+		if len(history) > 0 && pinned {
 			if _, err := tx.Exec(ctx, "UPDATE agent_conversations SET history=$2 WHERE id=$1", c.ThreadID, history); err != nil {
 				return err
 			}

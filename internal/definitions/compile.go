@@ -24,8 +24,9 @@ const (
 )
 
 type rawConfig struct {
-	Catalog  rawCatalog   `yaml:"catalog"`
-	Journeys []rawJourney `yaml:"journeys"`
+	Catalog            rawCatalog   `yaml:"catalog"`
+	ConversationPrompt string       `yaml:"conversation_prompt"`
+	Journeys           []rawJourney `yaml:"journeys"`
 }
 
 type rawCatalog struct {
@@ -36,18 +37,10 @@ type rawCatalog struct {
 type rawJourney struct {
 	ID              string      `yaml:"id"`
 	Skill           string      `yaml:"skill"`
-	SystemPrompt    string      `yaml:"system_prompt"`
-	Routing         rawRouting  `yaml:"routing"`
 	ProductVersions rawVersions `yaml:"product_versions"`
 	Tools           []rawTool   `yaml:"tools"`
 	Deny            []string    `yaml:"deny"`
 	MaxTools        *int        `yaml:"max_tools"`
-}
-
-type rawRouting struct {
-	Default  bool     `yaml:"default"`
-	Keywords []string `yaml:"keywords"`
-	Priority int      `yaml:"priority"`
 }
 
 type rawVersions struct {
@@ -171,8 +164,22 @@ func Compile(path string) (*Set, error) {
 		return nil, fmt.Errorf("resolve config directory: %w", err)
 	}
 
+	var conversationPrompt string
+	if raw.ConversationPrompt != "" {
+		promptPath, err := confinedPath(root, raw.ConversationPrompt)
+		if err != nil {
+			return nil, fmt.Errorf("conversation_prompt: %v", err)
+		}
+		data, err := readLimited(promptPath, MaxPromptBytes)
+		if err != nil {
+			return nil, fmt.Errorf("conversation_prompt: %v", err)
+		}
+		conversationPrompt = string(data)
+	}
+
 	set := &Set{
-		catalog: catalog, journeys: make(map[string]Journey), canonical: make(map[string][]byte),
+		conversationPrompt: conversationPrompt,
+		catalog:            catalog, journeys: make(map[string]Journey), canonical: make(map[string][]byte),
 	}
 	skills := make(map[string]SkillPackage)
 	var digests []string
@@ -195,7 +202,7 @@ func Compile(path string) (*Set, error) {
 		set.order = append(set.order, journey.ID)
 		digests = append(digests, journey.Digest)
 	}
-	if set.digest, err = setDigest(catalog, digests); err != nil {
+	if set.digest, err = setDigest(catalog, conversationPrompt, digests); err != nil {
 		return nil, err
 	}
 	return set, nil
@@ -233,10 +240,6 @@ func compileJourney(root string, catalog CatalogConfig, n int, rj rawJourney, sk
 	if rj.ID == "" || len(rj.ID) > maxJourneyID || strings.IndexFunc(rj.ID, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
 		return fail("id is required, at most %d bytes, without whitespace", maxJourneyID)
 	}
-	routing, err := compileRouting(rj.Routing)
-	if err != nil {
-		return fail("%v", err)
-	}
 	versions := VersionRange{Min: rj.ProductVersions.Min, MaxExclusive: rj.ProductVersions.MaxExclusive}
 	if err := validateVersionRange(versions); err != nil {
 		return fail("%v", err)
@@ -251,18 +254,6 @@ func compileJourney(root string, catalog CatalogConfig, n int, rj rawJourney, sk
 	tools, deny, err := compileTools(catalog, rj)
 	if err != nil {
 		return fail("%v", err)
-	}
-
-	if rj.SystemPrompt == "" {
-		return fail("system_prompt is required")
-	}
-	promptPath, err := confinedPath(root, rj.SystemPrompt)
-	if err != nil {
-		return fail("system_prompt: %v", err)
-	}
-	prompt, err := readLimited(promptPath, MaxPromptBytes)
-	if err != nil {
-		return fail("system_prompt: %v", err)
 	}
 
 	if rj.Skill == "" {
@@ -284,24 +275,10 @@ func compileJourney(root string, catalog CatalogConfig, n int, rj rawJourney, sk
 	}
 
 	return Journey{
-		ID: rj.ID, Description: pkg.Description, SystemPrompt: rj.SystemPrompt, Prompt: string(prompt),
-		Skills: []SkillPackage{pkg}, Routing: routing, Tools: tools, Deny: deny, MaxTools: maxTools,
+		ID: rj.ID, Description: pkg.Description, Prompt: skillBody(pkg.Instructions.Data),
+		Skills: []SkillPackage{pkg}, Tools: tools, Deny: deny, MaxTools: maxTools,
 		ProductVersions: versions, Catalog: catalog, Skill: rj.Skill,
 	}, nil
-}
-
-func compileRouting(raw rawRouting) (Routing, error) {
-	routing := Routing{Default: raw.Default, Priority: raw.Priority}
-	seen := map[string]bool{}
-	for _, keyword := range raw.Keywords {
-		keyword = strings.ToLower(strings.TrimSpace(keyword))
-		if keyword == "" || seen[keyword] {
-			return Routing{}, errors.New("routing has an empty or duplicate keyword")
-		}
-		seen[keyword] = true
-		routing.Keywords = append(routing.Keywords, keyword)
-	}
-	return routing, nil
 }
 
 func validateVersionRange(r VersionRange) error {

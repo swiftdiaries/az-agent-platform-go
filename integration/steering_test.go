@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -241,7 +242,8 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 	}
 	post := func(replica int, run, text, cookie string) *http.Response {
 		t.Helper()
-		payload, _ := json.Marshal(aguitypes.RunAgentInput{ThreadID: "external-thread", RunID: run, Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: text}}})
+		// The journey is an explicit target: there is no routing.
+		payload, _ := json.Marshal(aguitypes.RunAgentInput{ThreadID: "external-thread", RunID: run, Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: text}}, ForwardedProps: map[string]any{"journeyId": "vacation-planner"}})
 		req, _ := http.NewRequest(http.MethodPost, apis[replica].URL, bytes.NewReader(payload))
 		req.Header.Set("Authorization", "Bearer token")
 		req.Header.Set("Cookie", cookie)
@@ -316,7 +318,7 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 		}
 	}
 	first, second := <-observed, <-observed
-	if first.Handoff.JourneyID != "vacation-planner" || len(first.PendingCommands) != 1 || len(first.History) == 0 {
+	if !slices.Equal(first.ActiveJourneys, []string{"vacation-planner"}) || len(first.PendingCommands) != 1 || len(first.History) == 0 {
 		t.Fatalf("missing explicit provider input: %+v", first)
 	}
 	if len(second.PendingCommands) != 2 || second.PendingCommands[0].Text != "first correction" || second.PendingCommands[1].Text != "second correction" || len(second.ToolResults) != 1 || !bytes.Contains(second.History, []byte("available Kyoto")) {
@@ -451,7 +453,7 @@ func TestSteeringFinalDrainUsesLiveOwner(t *testing.T) {
 	defer a.Close()
 	b := platform.New(runner, journal.New(pool))
 	defer b.Close()
-	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "initial", Principal: "alice", Tenant: testTenant, Text: "initial"}
+	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "initial", Principal: "alice", Tenant: testTenant, Text: "initial", TargetJourney: "vacation-planner"}
 	if _, err := a.Submit(ctx, c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -516,7 +518,7 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 			close(release)
 		}
 	}()
-	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "initial", Principal: "alice", Tenant: testTenant, Text: "initial"}
+	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "initial", Principal: "alice", Tenant: testTenant, Text: "initial", TargetJourney: "vacation-planner"}
 	if _, err := a.Submit(ctx, c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}

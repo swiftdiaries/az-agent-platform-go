@@ -70,7 +70,7 @@ func TestAcceptanceThreeServiceHTTPSteeringReconnectAndForcedDrain(t *testing.T)
 	registry := acceptanceSet(t, "read_only")
 	a, b, c := threeReplicas(t, pool, registry, model, testTenancy(t, mcpAPI.URL))
 
-	first := acceptancePost(t, a.url, aguitypes.RunAgentInput{ThreadID: "steer-thread", RunID: "run-a", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan"}}})
+	first := acceptancePost(t, a.url, aguitypes.RunAgentInput{ThreadID: "steer-thread", RunID: "run-a", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan"}}, ForwardedProps: map[string]any{"journeyId": "planner"}})
 	defer first.Body.Close()
 	if first.StatusCode != http.StatusOK {
 		t.Fatalf("first admission = %d", first.StatusCode)
@@ -178,7 +178,7 @@ func TestAcceptanceThreeServiceHTTPApprovalAndReconnect(t *testing.T) {
 	registry := acceptanceSet(t, "effectful")
 	a, b, c := threeReplicas(t, pool, registry, model, testTenancy(t, mcpAPI.URL))
 
-	wait := acceptancePost(t, a.url, aguitypes.RunAgentInput{ThreadID: "approval-thread", RunID: "approval-run", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "change"}}})
+	wait := acceptancePost(t, a.url, aguitypes.RunAgentInput{ThreadID: "approval-thread", RunID: "approval-run", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "change"}}, ForwardedProps: map[string]any{"journeyId": "planner"}})
 	defer wait.Body.Close()
 	if wait.StatusCode != http.StatusOK {
 		t.Fatalf("approval request = %d", wait.StatusCode)

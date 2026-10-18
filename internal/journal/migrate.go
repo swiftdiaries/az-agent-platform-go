@@ -14,7 +14,7 @@ import (
 var migrations embed.FS
 
 // migrationNames lists the forward-only migrations in order; version = index+1.
-var migrationNames = []string{"000001_conversations.sql", "000002_ownership.sql", "000003_command_dispositions.sql", "000004_interactions_operations.sql", "000005_definition_current.sql", "000006_consumed_commands.sql", "000007_run_scope.sql", "000008_catalog.sql", "000009_conversation_session.sql"}
+var migrationNames = []string{"000001_conversations.sql", "000002_ownership.sql", "000003_command_dispositions.sql", "000004_interactions_operations.sql", "000005_definition_current.sql", "000006_consumed_commands.sql", "000007_run_scope.sql", "000008_catalog.sql", "000009_conversation_session.sql", "000010_active_set.sql"}
 
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	return migrateTo(ctx, pool, len(migrationNames))

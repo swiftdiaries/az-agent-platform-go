@@ -69,7 +69,7 @@ func TestRunScopeRecordedAndDependencyUnavailable(t *testing.T) {
 		store := journal.New(pool)
 		p := platform.New(agentruntime.NewRunner(acceptanceSet(t, "read_only"), scripted(models), tenancy), store)
 		t.Cleanup(p.Close)
-		c := platform.Command{ThreadID: "tenancy", RunID: "tenancy", CommunicationID: "tenancy", Principal: testPrincipal, Tenant: tenant, Text: "plan"}
+		c := platform.Command{ThreadID: "tenancy", RunID: "tenancy", CommunicationID: "tenancy", Principal: testPrincipal, Tenant: tenant, Text: "plan", TargetJourney: "planner"}
 		if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 			t.Fatal(err)
 		}

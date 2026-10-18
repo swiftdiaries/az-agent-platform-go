@@ -4,8 +4,6 @@ catalog:
 journeys:
   - id: vacation-planner
     skill: skills/planner/
-    system_prompt: prompts/planner.md
-    routing: {default: true, keywords: [Vacation, " Leave "], priority: 10}
     product_versions: {min: "2026.2", max_exclusive: "2027.1"}
     tools:
       - op: leave.balance
@@ -17,8 +15,6 @@ journeys:
     deny: [leave.delete]
   - id: expenses
     skill: skills/expenses
-    system_prompt: prompts/expenses.md
-    routing: {keywords: [expense, receipt], priority: 20}
     max_tools: 3
     tools:
       - op: expense.submit

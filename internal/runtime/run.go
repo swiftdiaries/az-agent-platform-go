@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"slices"
 	"strings"
 
 	"github.com/microsoft/agent-framework-go/agent"
@@ -22,8 +23,8 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/journeys"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/settings"
-	platformskills "github.com/swiftdiaries/az-agent-platform-go/internal/skills"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/tenantdir"
 )
 
@@ -39,36 +40,37 @@ type ToolResult struct {
 	Value  any
 }
 
-type Handoff struct{ JourneyID, Text string }
-
 type ModelRequest struct {
-	Handoff         Handoff
 	History         json.RawMessage
 	PendingCommands []journal.Input
-	Instructions    string
-	Messages        []string
+	// Instructions is journeys.Compose(...) for this round.
+	Instructions string
+	Messages     []string
 	// ProviderMessages is the exact MAF history for this turn. It is transient:
 	// providers must not replace the product-owned durable history with a
 	// provider session.
 	ProviderMessages []*message.Message
 	Tools            []ModelTool
 	ToolResults      []ToolResult
+	// DefinitionDigest is the digest of the pinned definition set.
 	DefinitionDigest string
-	SkillCatalog     []SkillMetadata
-	SkillMaterial    []platformskills.Material
-	Provenance       RequestProvenance
+	// ActiveJourneys is the active set for this round, least recently used first.
+	ActiveJourneys []string
+	Provenance     RequestProvenance
 	// OnDispatch commits materialization at the final provider request boundary.
 	// A provider must call it at most once, after constructing the exact request
 	// and immediately before its transport sends it.
 	OnDispatch func(context.Context) error
 }
 
-// SkillMetadata is the metadata-only skill catalog exposed to the provider.
-type SkillMetadata struct{ Name, Description string }
-
+// RequestProvenance records the digests of the material behind one request.
+// Definition is the set digest; System the composed instructions; Catalog the
+// available journey metadata; History the durable history. Active holds one entry
+// per active journey (least recently used first) and Skills one per supporting file
+// read in this run.
 type RequestProvenance struct {
-	Definition, System, Handoff, Catalog, History MaterialProvenance
-	Pending, IncludedInput, Skills                []MaterialProvenance
+	Definition, System, Catalog, History   MaterialProvenance
+	Active, Pending, IncludedInput, Skills []MaterialProvenance
 }
 
 type MaterialProvenance struct{ ID, Digest string }
@@ -193,7 +195,9 @@ func (r *Runner) Ready(ctx context.Context, store *journal.Store) (bool, error) 
 }
 
 // Binding resolves the conversation's pinned definition set (or the database
-// current pointer for a new one) and routes the request within that set.
+// current pointer for a new one). There is no routing: the journey it returns is
+// the explicit target when one is given and present in the pinned set, and ""
+// otherwise (the conversation's active set decides what the model can use).
 func (r *Runner) Binding(ctx context.Context, in RunInput) (string, string, error) {
 	if r == nil || r.set == nil || in.Store == nil {
 		return "", "", journal.ErrDefinition
@@ -206,11 +210,13 @@ func (r *Runner) Binding(ctx context.Context, in RunInput) (string, string, erro
 	if !ok {
 		return "", "", journal.ErrDefinition
 	}
-	journey, err := r.route(ctx, set, in.TargetJourney, in.Text)
-	if err != nil {
-		return "", "", err
+	if in.TargetJourney == "" {
+		return "", digest, nil
 	}
-	return journey.ID, digest, nil
+	if _, ok := set.Journey(in.TargetJourney); !ok {
+		return "", "", fmt.Errorf("unknown journey target")
+	}
+	return in.TargetJourney, digest, nil
 }
 
 func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
@@ -221,15 +227,16 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 	if !ok {
 		return RunOutput{}, journal.ErrDefinition
 	}
-	journey, ok := set.Journey(input.TargetJourney)
-	if !ok {
-		return RunOutput{}, journal.ErrDefinition
+	if input.TargetJourney != "" {
+		if _, ok := set.Journey(input.TargetJourney); !ok {
+			return RunOutput{}, journal.ErrDefinition
+		}
 	}
 	ctx, span := otel.Tracer("az-agent-platform/runtime").Start(ctx, "journey.run")
-	span.SetAttributes(
-		attribute.String("thread.id", input.ThreadID), attribute.String("run.id", input.RunID),
-		attribute.String("journey.id", journey.ID),
-	)
+	span.SetAttributes(attribute.String("thread.id", input.ThreadID), attribute.String("run.id", input.RunID))
+	if input.TargetJourney != "" {
+		span.SetAttributes(attribute.String("journey.id", input.TargetJourney))
+	}
 	defer span.End()
 	if err := input.Store.Check(ctx, input.Owner); err != nil {
 		return RunOutput{}, err
@@ -242,15 +249,60 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 		return RunOutput{}, err
 	}
 	defer binding.Close()
-	resolution, ok := binding.Resolution(journey.ID)
-	if !ok || !resolution.Available() {
-		return RunOutput{}, unavailableJourney(resolution)
-	}
+	return r.converse(ctx, input, set, binding)
+}
 
+// converse prepares the conversation's active set for this run and runs the loop.
+// Journeys that do not resolve for this user are hidden, not failures: only an
+// explicit target that is unavailable fails the run.
+func (r *Runner) converse(ctx context.Context, input RunInput, set *definitions.Set, cat toolCatalog) (RunOutput, error) {
+	var available []definitions.Journey
+	for _, journey := range set.Journeys() {
+		if resolution, ok := cat.Resolution(journey.ID); ok && resolution.Available() {
+			available = append(available, journey)
+		}
+	}
+	isAvailable := func(id string) bool {
+		return slices.ContainsFunc(available, func(j definitions.Journey) bool { return j.ID == id })
+	}
+	limit := input.Settings.MaxActiveJourneys
+	if limit < 1 {
+		return RunOutput{}, fmt.Errorf("invalid max active journeys: %d", limit)
+	}
+	persisted, pinned, err := input.Store.ActiveJourneys(ctx, input.Owner)
+	if err != nil {
+		return RunOutput{}, err
+	}
+	active := journeys.NewActiveSet(persisted)
+	for _, id := range active.IDs() {
+		if !isAvailable(id) {
+			active.Remove(id)
+		}
+	}
+	if _, err := active.Fit(limit, pinned); err != nil {
+		return RunOutput{}, err
+	}
+	if input.TargetJourney != "" {
+		if !isAvailable(input.TargetJourney) {
+			resolution, _ := cat.Resolution(input.TargetJourney)
+			return RunOutput{}, unavailableJourney(resolution)
+		}
+		if _, err := active.Activate(input.TargetJourney, limit, pinned); err != nil {
+			if errors.Is(err, journeys.ErrRefused) {
+				return RunOutput{}, fmt.Errorf("%w: %w", ErrJourneyUnavailable, err)
+			}
+			return RunOutput{}, err
+		}
+	}
+	if !slices.Equal(persisted, active.IDs()) {
+		if err := input.Store.SetActiveJourneys(ctx, input.Owner, active.IDs()); err != nil {
+			return RunOutput{}, err
+		}
+	}
 	if err := input.Store.Check(ctx, input.Owner); err != nil {
 		return RunOutput{}, err
 	}
-	return r.runHarness(ctx, input, journey, binding)
+	return r.runHarness(ctx, input, &conversation{set: set, cat: cat, available: available, active: active, limit: limit})
 }
 
 // unavailableJourney describes why a journey's tools did not resolve. It names
@@ -369,13 +421,4 @@ func stableCallID(threadID, runID string) string {
 func digestValue(value any) string {
 	data, _ := json.Marshal(value)
 	return fmt.Sprintf("%x", sha256.Sum256(data))
-}
-
-func cloneSkillMaterial(in []platformskills.Material) []platformskills.Material {
-	out := make([]platformskills.Material, len(in))
-	for i, material := range in {
-		out[i] = material
-		out[i].Body = append([]byte(nil), material.Body...)
-	}
-	return out
 }

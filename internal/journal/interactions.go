@@ -39,6 +39,9 @@ type Interaction struct {
 	Questions []Question   `json:"questions,omitempty"`
 	Call      ProposedCall `json:"call"`
 	ExpiresAt time.Time    `json:"expiresAt"`
+	// JourneyID is the journey that owns the interaction ("" for the run's journey, or none).
+	// It is stored in its own column and never appears in the artifact.
+	JourneyID string `json:"-"`
 }
 type Answer struct {
 	Option string `json:"option,omitempty"`
@@ -174,7 +177,7 @@ func (s *Store) Wait(ctx context.Context, o Owner, i Interaction, checkpoint, hi
 		if err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, "INSERT INTO agent_interactions(id,thread_id,run_id,journey_id,definition_digest,kind,artifact,checkpoint,history,expires_at) SELECT $3,thread_id,id,journey_id,definition_digest,$4,$5,$6,$7,$8 FROM agent_runs WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID, i.ID, i.Kind, artifact, checkpoint, history, i.ExpiresAt); err != nil {
+		if _, err = tx.Exec(ctx, "INSERT INTO agent_interactions(id,thread_id,run_id,journey_id,definition_digest,kind,artifact,checkpoint,history,expires_at) SELECT $3,thread_id,id,COALESCE(NULLIF($9,''),journey_id),definition_digest,$4,$5,$6,$7,$8 FROM agent_runs WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID, i.ID, i.Kind, artifact, checkpoint, history, i.ExpiresAt, i.JourneyID); err != nil {
 			return err
 		}
 		if _, err = tx.Exec(ctx, "UPDATE agent_conversations SET history=$2 WHERE id=$1", c.ThreadID, history); err != nil {
@@ -265,7 +268,7 @@ func (s *Store) reply(ctx context.Context, c Command) (Receipt, bool, error) {
 		var artifact []byte
 		var state, journey, oldRun string
 		var valid bool
-		err = tx.QueryRow(ctx, "SELECT artifact,state,journey_id,run_id FROM agent_interactions WHERE thread_id=$1 AND id=$2 FOR UPDATE", c.ThreadID, c.InteractionID).Scan(&artifact, &state, &journey, &oldRun)
+		err = tx.QueryRow(ctx, "SELECT artifact,state,COALESCE(journey_id,''),run_id FROM agent_interactions WHERE thread_id=$1 AND id=$2 FOR UPDATE", c.ThreadID, c.InteractionID).Scan(&artifact, &state, &journey, &oldRun)
 		if err == pgx.ErrNoRows {
 			return ErrState
 		}
@@ -286,7 +289,7 @@ func (s *Store) reply(ctx context.Context, c Command) (Receipt, bool, error) {
 		if err = json.Unmarshal(artifact, &i); err != nil {
 			return err
 		}
-		if i.Kind != c.ReplyKind || (c.TargetJourney != "" && c.TargetJourney != journey) {
+		if i.Kind != c.ReplyKind || (c.TargetJourney != "" && journey != "" && c.TargetJourney != journey) {
 			return ErrState
 		}
 		if err = i.ValidateReply(answer); err != nil {

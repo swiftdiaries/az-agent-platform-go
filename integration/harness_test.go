@@ -125,6 +125,8 @@ func withDescription(tool *mcp.Tool, description string) *mcp.Tool {
 type acceptanceReplica struct {
 	app *service.Service
 	url string
+	// stop shuts the replica down; it is idempotent and also runs on test cleanup.
+	stop func()
 }
 
 func startAcceptanceReplica(t *testing.T, pool *pgxpool.Pool, set *definitions.Set, model agentruntime.Model, tenancy agentruntime.Tenancy) acceptanceReplica {
@@ -143,18 +145,22 @@ func startAcceptanceReplica(t *testing.T, pool *pgxpool.Pool, set *definitions.S
 	}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- app.Serve(listener) }()
-	t.Cleanup(func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		if err := app.Shutdown(shutdownCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-			t.Error(err)
-		}
-		if err := <-serveErr; err != nil {
-			t.Error(err)
-		}
-		app.Close()
-	})
-	return acceptanceReplica{app: app, url: "http://" + listener.Addr().String()}
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := app.Shutdown(shutdownCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+				t.Error(err)
+			}
+			if err := <-serveErr; err != nil {
+				t.Error(err)
+			}
+			app.Close()
+		})
+	}
+	t.Cleanup(stop)
+	return acceptanceReplica{app: app, url: "http://" + listener.Addr().String(), stop: stop}
 }
 
 func acceptancePost(t *testing.T, endpoint string, input aguitypes.RunAgentInput) *http.Response {

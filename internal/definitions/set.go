@@ -6,21 +6,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 // Set is an immutable compiled definition set. It serves its current
 // journeys and, after Retain, older compiled sets by set digest.
 type Set struct {
-	catalog    CatalogConfig
-	digest     string
-	order      []string
-	journeys   map[string]Journey
-	sets       map[string]*Set // retained set digest -> original compiled set
-	original   *Set            // compiled set a Retain copy was made from; nil if compiled
-	canonical  map[string][]byte
-	skillBytes int
-	skillFiles int
+	catalog CatalogConfig
+	// conversationPrompt is the base prompt of the single conversation agent.
+	conversationPrompt string
+	digest             string
+	order              []string
+	journeys           map[string]Journey
+	sets               map[string]*Set // retained set digest -> original compiled set
+	original           *Set            // compiled set a Retain copy was made from; nil if compiled
+	canonical          map[string][]byte
+	skillBytes         int
+	skillFiles         int
 }
 
 // Retain returns a copy of current that can also serve the retained sets by
@@ -31,7 +32,7 @@ func Retain(current *Set, retained ...*Set) (*Set, error) {
 		return nil, errors.New("current definition set is required")
 	}
 	out := &Set{
-		catalog: current.catalog, digest: current.digest,
+		catalog: current.catalog, digest: current.digest, conversationPrompt: current.conversationPrompt,
 		order:      append([]string(nil), current.order...),
 		journeys:   make(map[string]Journey, len(current.journeys)),
 		sets:       make(map[string]*Set, len(current.sets)),
@@ -119,6 +120,10 @@ func (s *Set) Digest() string { return s.digest }
 // Catalog returns the integration input of the current journeys.
 func (s *Set) Catalog() CatalogConfig { return s.catalog }
 
+// ConversationPrompt returns the base prompt of the conversation agent, or ""
+// when the configuration declares none.
+func (s *Set) ConversationPrompt() string { return s.conversationPrompt }
+
 // Journeys returns the current journeys in configuration order.
 func (s *Set) Journeys() []Journey {
 	out := make([]Journey, len(s.order))
@@ -134,46 +139,9 @@ func (s *Set) Journey(id string) (Journey, bool) {
 	return cloneJourney(j), ok
 }
 
-// DefaultJourney returns the first journey of the configuration.
-func (s *Set) DefaultJourney() (Journey, bool) {
-	if s == nil || len(s.order) == 0 {
-		return Journey{}, false
-	}
-	return s.Journey(s.order[0])
-}
-
-// Infer routes text with the same semantics as Registry.Infer.
-func (s *Set) Infer(text string) (Journey, bool) {
-	text = strings.ToLower(strings.TrimSpace(text))
-	if text == "" {
-		return Journey{}, false
-	}
-	bestPriority, bestIndex := 0, -1
-	for index, id := range s.order {
-		journey := s.journeys[id]
-		matched := false
-		for _, keyword := range journey.Routing.Keywords {
-			matched = matched || strings.Contains(text, keyword)
-		}
-		if matched && (bestIndex < 0 || journey.Routing.Priority > bestPriority) {
-			bestPriority, bestIndex = journey.Routing.Priority, index
-		}
-	}
-	if bestIndex >= 0 {
-		return cloneJourney(s.journeys[s.order[bestIndex]]), true
-	}
-	for _, id := range s.order {
-		if s.journeys[id].Routing.Default {
-			return cloneJourney(s.journeys[id]), true
-		}
-	}
-	return s.DefaultJourney()
-}
-
 type canonicalJourney struct {
 	ID, Description, Prompt string
 	Skills                  []skillIdentity
-	Routing                 Routing
 	ProductVersions         VersionRange
 	Tools                   []Selector
 	Deny                    []string
@@ -184,7 +152,7 @@ type canonicalJourney struct {
 func canonicalBytes(j Journey) ([]byte, error) {
 	return json.Marshal(canonicalJourney{
 		ID: j.ID, Description: j.Description, Prompt: j.Prompt,
-		Skills: skillIdentities(j.Skills), Routing: cloneRouting(j.Routing),
+		Skills:          skillIdentities(j.Skills),
 		ProductVersions: j.ProductVersions, Tools: cloneSelectors(j.Tools),
 		Deny: append([]string(nil), j.Deny...), MaxTools: j.MaxTools, Catalog: j.Catalog,
 	})
@@ -192,11 +160,12 @@ func canonicalBytes(j Journey) ([]byte, error) {
 
 func hexDigest(data []byte) string { return fmt.Sprintf("%x", sha256.Sum256(data)) }
 
-func setDigest(catalog CatalogConfig, digests []string) (string, error) {
+func setDigest(catalog CatalogConfig, conversationPrompt string, digests []string) (string, error) {
 	data, err := json.Marshal(struct {
-		Catalog  CatalogConfig
-		Journeys []string
-	}{catalog, digests})
+		Catalog            CatalogConfig
+		ConversationPrompt string
+		Journeys           []string
+	}{catalog, conversationPrompt, digests})
 	if err != nil {
 		return "", err
 	}

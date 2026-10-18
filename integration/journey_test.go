@@ -60,6 +60,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	var observations []mcpObservation
 	var transportObservations []transportObservation
 	var expiredAttempts int
+	refused := map[string]string{}
 	server := mcp.NewServer(&mcp.Implementation{Name: "java-fixture", Version: "1"}, nil)
 	mcp.AddTool(server, lookupTool("look up a destination"),
 		func(_ context.Context, req *mcp.CallToolRequest, input struct {
@@ -110,7 +111,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	model := modelFunc(func(_ context.Context, req agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		if len(req.ToolResults) == 0 {
 			// The model sees the alias (never the remote name the server publishes).
-			if got := toolNames(req.Tools); !slices.Equal(got, []string{"lookup_destination", "request_user_input", "load_skill", "read_skill_resource"}) {
+			if got := toolNames(req.Tools); !slices.Equal(got, []string{"lookup_destination", "request_user_input", "activate_journey"}) {
 				t.Fatalf("model tools = %v", got)
 			}
 			if slices.Contains(req.Messages, "try remote") {
@@ -133,6 +134,13 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 				CallID: "provider-call-id", Name: "lookup_destination", Arguments: json.RawMessage(`{"destination":"Kyoto"}`),
 			}}, nil
 		}
+		if name := req.ToolResults[0].Name; name == "hidden_tool" || name == remoteLookup {
+			// A call to a tool that is not active is answered, never dispatched, and the run continues.
+			mu.Lock()
+			refused[name] = jsonOf(t, req.ToolResults[0].Value)
+			mu.Unlock()
+			return agentruntime.ModelResponse{Text: "that tool is not available"}, nil
+		}
 		if req.ToolResults[0].CallID != "provider-call-id" {
 			t.Fatalf("provider result correlation ID = %q", req.ToolResults[0].CallID)
 		}
@@ -148,8 +156,10 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 
 	body := aguitypes.RunAgentInput{
 		ThreadID: "thread-secret-alice@example.com", RunID: "run-secret-ssn-1234",
-		State:    map[string]any{"principal": "mallory", "journey": "vacation-planner"},
-		Messages: []aguitypes.Message{{ID: "message-1", Role: aguitypes.RoleUser, Content: "Plan Kyoto"}},
+		State: map[string]any{"principal": "mallory", "journey": "vacation-planner"},
+		// The target comes from forwardedProps only; the state journey above is ignored.
+		ForwardedProps: map[string]any{"journeyId": "vacation-planner"},
+		Messages:       []aguitypes.Message{{ID: "message-1", Role: aguitypes.RoleUser, Content: "Plan Kyoto"}},
 	}
 	response := postAGUI(t, api.URL, body, "alice-token", "session=alice", "steal-me")
 	if response.StatusCode != http.StatusOK {
@@ -257,7 +267,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	hiddenBody.ThreadID, hiddenBody.RunID = "thread-4", "message-4"
 	hiddenBody.Messages = []aguitypes.Message{{ID: "message-4", Role: aguitypes.RoleUser, Content: "try hidden"}}
 	hidden := postAGUI(t, api.URL, hiddenBody, "alice-token", "session=alice", "")
-	if hidden.StatusCode != http.StatusOK || !strings.Contains(hidden.Body, `"code":"internal_error"`) || strings.Contains(hidden.Body, "hidden_tool") {
+	if hidden.StatusCode != http.StatusOK || !strings.Contains(hidden.Body, "that tool is not available") || strings.Contains(hidden.Body, `"code":"internal_error"`) {
 		t.Fatalf("unregistered tool response = %#v", hidden)
 	}
 
@@ -265,10 +275,15 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	remoteBody.ThreadID, remoteBody.RunID = "thread-4b", "message-4b"
 	remoteBody.Messages = []aguitypes.Message{{ID: "message-4b", Role: aguitypes.RoleUser, Content: "try remote"}}
 	remote := postAGUI(t, api.URL, remoteBody, "alice-token", "session=alice", "")
-	if remote.StatusCode != http.StatusOK || !strings.Contains(remote.Body, `"code":"internal_error"`) || strings.Contains(remote.Body, remoteLookup) {
+	if remote.StatusCode != http.StatusOK || !strings.Contains(remote.Body, "that tool is not available") || strings.Contains(remote.Body, `"code":"internal_error"`) || strings.Contains(remote.Body, remoteLookup) {
 		t.Fatalf("model-requested remote name response = %#v", remote)
 	}
 	mu.Lock()
+	for _, name := range []string{"hidden_tool", remoteLookup} {
+		if !strings.Contains(refused[name], "tool_not_active") {
+			t.Fatalf("result for inactive tool %q = %q, want tool_not_active", name, refused[name])
+		}
+	}
 	callCountAfterRemote := len(observations)
 	mu.Unlock()
 	if callCountAfterRemote != 2 {
@@ -516,12 +531,12 @@ var journeyConfigCases = []struct {
 	{"invalid approval", replacing("class: read_only", "class: read_only\n        approval: optional"), "approval"},
 	{"missing operation_meta_key", replacing("  operation_meta_key: operation_key\n", ""), "operation_meta_key"},
 	{"invalid alias", replacing(controlTool, "      - op: 9lives\n"), "alias"},
-	{"reserved alias", replacing(controlTool, "      - op: load_skill\n"), "reserved"},
+	{"reserved alias", replacing(controlTool, "      - op: activate_journey\n"), "reserved"},
 	{"empty tools", replacing(controlToolSet, "    tools: []\n"), "tools must not be empty"},
 	{"missing tools", replacing(controlToolSet, ""), "tools must not be empty"},
 	{"duplicate journey", func(c string) string { return c + c[strings.Index(c, "  - id: planner"):] }, "duplicate journey id"},
-	{"escaping prompt", replacing("system_prompt: prompts/planner.md", "system_prompt: ../planner.md"), "parent components"},
-	{"missing prompt", replacing("system_prompt: prompts/planner.md", "system_prompt: prompts/missing.md"), "system_prompt"},
+	{"escaping conversation prompt", prepending("conversation_prompt: ../conversation.md\n"), "parent components"},
+	{"missing conversation prompt", prepending("conversation_prompt: missing.md\n"), "conversation_prompt"},
 	{"escaping skill path", replacing("skill: skills/planner", "skill: ../planner"), "parent components"},
 	{"absolute skill path", replacing("skill: skills/planner", "skill: /etc"), "absolute"},
 	{"missing skill bundle", replacing("skill: skills/planner", "skill: skills/absent"), "skill:"},
@@ -599,7 +614,8 @@ func TestJourneyConfigRejectsEndpoint(t *testing.T) {
 }
 
 // A journey whose required operation the server does not publish under the
-// configured _meta key is unavailable: the run fails without a model call and
+// configured _meta key is unavailable (hidden from the model); an explicit
+// target at it fails the run without a model call and
 // without any tool dispatch (an unkeyed tool of the same name is never offered).
 func TestJourneyUnavailableRunFailsWithoutModelCall(t *testing.T) {
 	pool := database(t)
@@ -622,7 +638,7 @@ func TestJourneyUnavailableRunFailsWithoutModelCall(t *testing.T) {
 			})), journal.New(pool))
 			defer p.Close()
 			id := "unavailable-" + strings.ReplaceAll(name, " ", "-")
-			c := platform.Command{ThreadID: id, RunID: id, CommunicationID: id, Principal: "alice", Tenant: testTenant, Text: "go"}
+			c := platform.Command{ThreadID: id, RunID: id, CommunicationID: id, Principal: "alice", Tenant: testTenant, Text: "go", TargetJourney: "planner"}
 			if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 				t.Fatal(err)
 			}
@@ -655,7 +671,7 @@ func assertTrace(t *testing.T, spans []sdktrace.ReadOnlySpan, callID string, for
 	if traceID == "" {
 		t.Fatal("chat.accept trace not recorded")
 	}
-	wantNames := map[string]bool{"chat.accept": false, "agent.start_turn": false, "hub.route": false, "journey.run": false, "model.call": false, "catalog.resolve": false, "mcp.call": false}
+	wantNames := map[string]bool{"chat.accept": false, "agent.start_turn": false, "journey.run": false, "model.call": false, "catalog.resolve": false, "mcp.call": false}
 	spanIDs := make(map[string]string)
 	parents := make(map[string]string)
 	for _, span := range spans {
@@ -690,7 +706,6 @@ func assertTrace(t *testing.T, spans []sdktrace.ReadOnlySpan, callID string, for
 	}
 	for child, parent := range map[string]string{
 		"agent.start_turn": "chat.accept",
-		"hub.route":        "agent.start_turn",
 		"journey.run":      "agent.start_turn",
 		"model.call":       "journey.run",
 		"catalog.resolve":  "journey.run",

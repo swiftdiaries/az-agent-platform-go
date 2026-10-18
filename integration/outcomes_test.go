@@ -46,10 +46,7 @@ func lookupTool(description string) *mcp.Tool {
 // resolves to effectful).
 func policyRunner(t *testing.T, url, class string, model agentruntime.Model) *agentruntime.Runner {
 	t.Helper()
-	prompt, err := os.ReadFile("../configs/prompts/planner.md")
-	if err != nil {
-		t.Fatal(err)
-	}
+	const prompt = "You help the user plan a vacation. Use only the configured read-only destination lookup.\nNever claim an action was taken and never expose credentials or internal errors.\n"
 	written, want := class, definitions.Class(class)
 	if class == "effectful" || class == "unclassified" {
 		written = ""
@@ -57,7 +54,7 @@ func policyRunner(t *testing.T, url, class string, model agentruntime.Model) *ag
 	if class == "unclassified" {
 		want = ""
 	}
-	path := writeBundleConfig(t, t.TempDir(), string(prompt), lookupAlias, written)
+	path := writeBundleConfig(t, t.TempDir(), prompt, lookupAlias, written)
 	if class == "effectful" {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -138,7 +135,7 @@ func TestToolCallLostAfterEffectNoRetry(t *testing.T) {
 	})
 	p := platform.New(policyRunner(t, backend.URL, "unclassified", model), journal.New(pool))
 	defer p.Close()
-	c := platform.Command{ThreadID: "effect-thread", RunID: "effect-run", CommunicationID: "effect-comm", Principal: "alice", Tenant: testTenant, Text: "change"}
+	c := platform.Command{ThreadID: "effect-thread", RunID: "effect-run", CommunicationID: "effect-comm", Principal: "alice", Tenant: testTenant, Text: "change", TargetJourney: "planner"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +339,7 @@ func TestToolCallVerifiedRetryStableID(t *testing.T) {
 			})
 			p := platform.New(policyRunner(t, backend.URL, class, model), journal.New(pool))
 			defer p.Close()
-			c := platform.Command{ThreadID: "retry-thread", RunID: "retry", CommunicationID: "retry", Principal: "alice", Tenant: testTenant, Text: "go"}
+			c := platform.Command{ThreadID: "retry-thread", RunID: "retry", CommunicationID: "retry", Principal: "alice", Tenant: testTenant, Text: "go", TargetJourney: "planner"}
 			if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 				t.Fatal(err)
 			}
@@ -398,7 +395,7 @@ func TestToolCallPredispatchPersistenceFailure(t *testing.T) {
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "pre", Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
 	}), testTenancy(t, backend.URL)), journal.New(pool))
 	defer p.Close()
-	c := platform.Command{ThreadID: "pre", RunID: "pre", CommunicationID: "pre", Principal: "alice", Tenant: testTenant, Text: "go"}
+	c := platform.Command{ThreadID: "pre", RunID: "pre", CommunicationID: "pre", Principal: "alice", Tenant: testTenant, Text: "go", TargetJourney: "vacation-planner"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -436,7 +433,7 @@ func TestToolCallCompletionPersistenceFailurePublishesUnknownBeforeRunFailure(t 
 	defer p.Close()
 	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": testPrincipal}, p, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
-	response := postJSONAGUI(t, api.URL, `{"threadId":"completion-thread","runId":"completion-run","messages":[{"id":"user","role":"user","content":"go"}],"tools":[],"context":[],"state":{},"forwardedProps":{}}`, "token", "", "")
+	response := postJSONAGUI(t, api.URL, `{"threadId":"completion-thread","runId":"completion-run","messages":[{"id":"user","role":"user","content":"go"}],"tools":[],"context":[],"state":{},"forwardedProps":{"journeyId":"planner"}}`, "token", "", "")
 	unknownAt := strings.Index(response.Body, "tool.outcome_unknown")
 	failedAt := strings.Index(response.Body, `"code":"internal_error"`)
 	if response.StatusCode != http.StatusOK || unknownAt < 0 || failedAt < unknownAt || strings.Contains(response.Body, providerCallID) {
@@ -496,7 +493,7 @@ func TestToolCallZeroOneMultipleAndDelayed(t *testing.T) {
 			})
 			p := platform.New(policyRunner(t, backend.URL, "read_only", model), journal.New(pool))
 			defer p.Close()
-			c := platform.Command{ThreadID: "multi", RunID: "multi", CommunicationID: "multi", Principal: "alice", Tenant: testTenant, Text: "go"}
+			c := platform.Command{ThreadID: "multi", RunID: "multi", CommunicationID: "multi", Principal: "alice", Tenant: testTenant, Text: "go", TargetJourney: "planner"}
 			if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 				t.Fatal(err)
 			}
@@ -544,7 +541,7 @@ func TestApprovalFreshCredentialsAndRejectedReplies(t *testing.T) {
 				return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "write", Name: "lookup_destination", Arguments: json.RawMessage(`{"amount":9007199254740993}`)}}, nil
 			})), journal.New(pool))
 			defer p.Close()
-			c := platform.Command{ThreadID: "approval", RunID: "approval", CommunicationID: "approval", Principal: "alice", Tenant: testTenant, Text: "change"}
+			c := platform.Command{ThreadID: "approval", RunID: "approval", CommunicationID: "approval", Principal: "alice", Tenant: testTenant, Text: "change", TargetJourney: "planner"}
 			if _, err := p.Submit(t.Context(), c, liveCredential("old-live-auth")); err != nil {
 				t.Fatal(err)
 			}
@@ -667,7 +664,7 @@ func TestBusinessErrorChangedActionRequiresNewApproval(t *testing.T) {
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: fmt.Sprintf("call-%d", round), Name: "lookup_destination", Arguments: json.RawMessage(fmt.Sprintf(`{"attempt":%d}`, round))}}, nil
 	})), journal.New(pool))
 	defer p.Close()
-	c := platform.Command{ThreadID: "repair", RunID: "repair", CommunicationID: "repair", Principal: "alice", Tenant: testTenant, Text: "go"}
+	c := platform.Command{ThreadID: "repair", RunID: "repair", CommunicationID: "repair", Principal: "alice", Tenant: testTenant, Text: "go", TargetJourney: "planner"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -738,7 +735,7 @@ func TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted(t *testing.T) {
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: providerCallID, Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
 	})), journal.New(ownerPool))
 	defer p.Close()
-	c := platform.Command{ThreadID: "loss", RunID: "loss", CommunicationID: "loss", Principal: testPrincipal, Tenant: testTenant, Text: "go"}
+	c := platform.Command{ThreadID: "loss", RunID: "loss", CommunicationID: "loss", Principal: testPrincipal, Tenant: testTenant, Text: "go", TargetJourney: "planner"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
@@ -812,7 +809,7 @@ func TestToolCallPartialProviderFailureIsNotVisible(t *testing.T) {
 		return agentruntime.ModelResponse{Text: "private partial output", ToolCall: &agentruntime.ToolCall{CallID: "partial", Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, errors.New("private stream failure")
 	})), journal.New(pool))
 	defer p.Close()
-	c := platform.Command{ThreadID: "partial", RunID: "partial", CommunicationID: "partial", Principal: "alice", Tenant: testTenant, Text: "go"}
+	c := platform.Command{ThreadID: "partial", RunID: "partial", CommunicationID: "partial", Principal: "alice", Tenant: testTenant, Text: "go", TargetJourney: "vacation-planner"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
