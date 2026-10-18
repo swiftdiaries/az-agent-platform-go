@@ -1,0 +1,7 @@
+# Tenant directory (strict YAML; AGENT_PLATFORM_TENANT_DIRECTORY).
+# Maps each tenant to a product version and an endpoint ID. The ID must be a
+# key in AGENT_PLATFORM_MCP_ENDPOINTS; URLs live only in that allowlist.
+tenants:
+  example-tenant:
+    product_version: "1.0"
+    endpoint: java-monolith

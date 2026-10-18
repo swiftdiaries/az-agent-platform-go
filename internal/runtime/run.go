@@ -190,6 +190,8 @@ func (r *Runner) Scope(ctx context.Context, in RunInput) (RunScope, error) {
 // Admit asks the cost gate whether the run may start and builds the request
 // decoration for its provider calls. A denial is the *cost.LimitError; a gate
 // failure is ErrDependencyUnavailable. Neither error text carries attribution.
+// in.TargetJourney becomes Attribution.Journey unchecked, so the caller must
+// already have validated it through Binding.
 func (r *Runner) Admit(ctx context.Context, in RunInput) (cost.Attribution, cost.Access, error) {
 	var gate cost.Gate = cost.Open{}
 	if r.tenancy.Cost != nil {

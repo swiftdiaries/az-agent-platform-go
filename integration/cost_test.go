@@ -40,10 +40,21 @@ func newCostFixture(t *testing.T, steps ...modeltest.Step) *costFixture {
 
 func (f *costFixture) post(t *testing.T, thread, run string) (body, internalThread, internalRun string) {
 	t.Helper()
+	return f.postJourney(t, thread, run, "planner")
+}
+
+// postJourney posts a Chat run whose forwardedProps.journeyId is journey; an
+// empty journey sends no journeyId (an untargeted run).
+func (f *costFixture) postJourney(t *testing.T, thread, run, journey string) (body, internalThread, internalRun string) {
+	t.Helper()
+	props := map[string]any{}
+	if journey != "" {
+		props["journeyId"] = journey
+	}
 	body = e2eReadBody(t, run, acceptancePost(t, f.url, aguitypes.RunAgentInput{
 		ThreadID: thread, RunID: run,
 		Messages:       []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan a trip to Kyoto"}},
-		ForwardedProps: map[string]any{"journeyId": "planner"},
+		ForwardedProps: props,
 	}))
 	internalThread = acceptanceThread(t, f.pool, thread)
 	if err := f.pool.QueryRow(t.Context(), `SELECT id FROM chat_runs WHERE thread_id=$1 AND external_id=$2`, internalThread, run).Scan(&internalRun); err != nil {
@@ -160,5 +171,97 @@ func TestCostUsageRecordedPerModelCall(t *testing.T) {
 	if f.model.Requests()[0].Access != (cost.Access{}) {
 		// Open inner gate decorates nothing; the zero Access is what the model sees.
 		t.Errorf("Open gate produced a non-zero Access")
+	}
+}
+
+// usageJourneys returns agent_usage.journey_id (NULL as nil) for every row of a run.
+func (f *costFixture) usageJourneys(t *testing.T, thread, run string) []*string {
+	t.Helper()
+	rows, err := f.pool.Query(t.Context(), `SELECT journey_id FROM agent_usage WHERE thread_id=$1 AND run_id=$2 ORDER BY seq`, thread, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []*string
+	for rows.Next() {
+		var j *string
+		if err := rows.Scan(&j); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, j)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestCostAttributionRejectsUnknownJourney(t *testing.T) {
+	const bogus = "evil-journey-x"
+	f := newCostFixture(t, modeltest.Text("never"))
+	body, thread, run := f.postJourney(t, "cost-bogus", "cost-bogus-run", bogus)
+	if strings.Contains(body, "RUN_FINISHED") {
+		t.Fatalf("run with an unknown journey finished: %s", body)
+	}
+	if got := f.state(t, thread, run); got != string(journal.RunFailed) {
+		t.Fatalf("state = %q, want failed", got)
+	}
+	if got := len(f.gate.Admits()); got != 0 {
+		t.Errorf("Admit calls = %d, want 0 (attribution must be validated first)", got)
+	}
+	if got := len(f.gate.Accesses()); got != 0 {
+		t.Errorf("Access calls = %d, want 0", got)
+	}
+	if n := f.model.Count(); n != 0 {
+		t.Errorf("model requests = %d, want 0", n)
+	}
+	if n := len(f.endpoint.Requests()); n != 0 {
+		t.Errorf("MCP requests = %d, want 0", n)
+	}
+	var n int
+	if err := f.pool.QueryRow(t.Context(), `SELECT count(*) FROM agent_usage WHERE journey_id=$1`, bogus).Scan(&n); err != nil || n != 0 {
+		t.Errorf("usage rows carrying %q = %d (err %v), want 0", bogus, n, err)
+	}
+}
+
+func TestCostAttributionValidTarget(t *testing.T) {
+	f := newCostFixture(t, modeltest.Text("Kyoto is available").WithUsage(modeltest.Usage{InputTokens: 4, OutputTokens: 2}))
+	body, thread, run := f.postJourney(t, "cost-valid", "cost-valid-run", "planner")
+	if !strings.Contains(body, "RUN_FINISHED") {
+		t.Fatalf("run did not finish: %s", body)
+	}
+	admits := f.gate.Admits()
+	if len(admits) != 1 || admits[0].Journey != "planner" {
+		t.Fatalf("admits = %+v, want exactly one with Journey planner", admits)
+	}
+	js := f.usageJourneys(t, thread, run)
+	if len(js) == 0 {
+		t.Fatal("no usage rows")
+	}
+	for i, j := range js {
+		if j == nil || *j != "planner" {
+			t.Errorf("usage row %d journey_id = %v, want planner", i, j)
+		}
+	}
+}
+
+func TestCostAttributionUntargeted(t *testing.T) {
+	f := newCostFixture(t, modeltest.Text("Kyoto is available").WithUsage(modeltest.Usage{InputTokens: 4, OutputTokens: 2}))
+	body, thread, run := f.postJourney(t, "cost-untargeted", "cost-untargeted-run", "")
+	if !strings.Contains(body, "RUN_FINISHED") {
+		t.Fatalf("run did not finish: %s", body)
+	}
+	admits := f.gate.Admits()
+	if len(admits) != 1 || admits[0].Journey != "" {
+		t.Fatalf("admits = %+v, want exactly one with empty Journey", admits)
+	}
+	js := f.usageJourneys(t, thread, run)
+	if len(js) == 0 {
+		t.Fatal("no usage rows")
+	}
+	for i, j := range js {
+		if j != nil {
+			t.Errorf("usage row %d journey_id = %q, want NULL", i, *j)
+		}
 	}
 }

@@ -22,13 +22,18 @@ const budgetBody = `{"error":{"type":"rate_limit_error","code":"budget_exceeded"
 
 func limitServer(t *testing.T, calls *atomic.Int32, header http.Header, body string) *httptest.Server {
 	t.Helper()
+	return statusServer(t, http.StatusTooManyRequests, calls, header, body)
+}
+
+func statusServer(t *testing.T, status int, calls *atomic.Int32, header http.Header, body string) *httptest.Server {
+	t.Helper()
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
 		for k, v := range header {
 			w.Header()[k] = v
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusTooManyRequests)
+		w.WriteHeader(status)
 		_, _ = io.WriteString(w, body)
 	}))
 	t.Cleanup(server.Close)
@@ -59,6 +64,49 @@ func TestLimitBudgetExceeded(t *testing.T) {
 		if strings.Contains(err.Error(), leak) {
 			t.Fatalf("error %q leaks %q", err, leak)
 		}
+	}
+}
+
+const liteLLM400Body = `{"error":{"message":"Budget has been exceeded SECRETBODY","type":"budget_exceeded","param":null,"code":"400"}}`
+
+func TestLimit400BudgetExceeded(t *testing.T) {
+	var calls atomic.Int32
+	server := statusServer(t, http.StatusBadRequest, &calls, http.Header{"Retry-After": {"30"}, "X-Secret-Header": {"SECRETHEADER"}}, liteLLM400Body)
+	_, err := complete(t, server, runtime.ModelRequest{})
+	var limit *cost.LimitError
+	if !errors.As(err, &limit) || !errors.Is(err, cost.ErrLimitExceeded) {
+		t.Fatalf("error = %v", err)
+	}
+	if limit.Kind != cost.LimitBudget || limit.RetryAfter != 30*time.Second {
+		t.Fatalf("limit = %+v", limit)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("http requests = %d", calls.Load())
+	}
+	for _, leak := range []string{"SECRETBODY", "SECRETHEADER", "Budget has been exceeded"} {
+		if strings.Contains(err.Error(), leak) {
+			t.Fatalf("error %q leaks %q", err, leak)
+		}
+	}
+}
+
+func TestLimit400PlainIsNotLimit(t *testing.T) {
+	for name, body := range map[string]string{
+		"json": `{"error":{"message":"bad SECRETBODY","type":"invalid_request_error"}}`,
+		"text": "bad SECRETBODY",
+	} {
+		t.Run(name, func(t *testing.T) {
+			var calls atomic.Int32
+			server := statusServer(t, http.StatusBadRequest, &calls, nil, body)
+			_, err := complete(t, server, runtime.ModelRequest{})
+			var limit *cost.LimitError
+			if err == nil || errors.As(err, &limit) || errors.Is(err, cost.ErrLimitExceeded) {
+				t.Fatalf("error = %v", err)
+			}
+			if calls.Load() != 1 || strings.Contains(err.Error(), "SECRETBODY") {
+				t.Fatalf("calls/error = %d/%v", calls.Load(), err)
+			}
+		})
 	}
 }
 

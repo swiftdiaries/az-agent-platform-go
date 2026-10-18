@@ -182,7 +182,7 @@ func TestCompileRejects(t *testing.T) {
 		{name: "max_tools 65", yaml: journey("    max_tools: 65\n    tools:\n      - op: a\n")},
 		{name: "reserved request_user_input", yaml: tools("      - op: request_user_input\n")},
 		{name: "reserved activate_journey", yaml: tools("      - op: [x, activate_journey]\n")},
-		{name: "alias reserved via punctuation", yaml: tools("      - op: load.skill\n")},
+		{name: "alias reserved via punctuation", yaml: tools("      - op: activate.journey\n")},
 		{name: "invalid alias digit", yaml: tools("      - op: 9lives\n")},
 		{name: "invalid alias length", yaml: tools("      - op: " + strings.Repeat("a", 70) + "\n")},
 		{name: "alias collision", yaml: tools("      - op: a.b\n      - op: a_b\n")},
@@ -422,12 +422,12 @@ func TestCompileHelpers(t *testing.T) {
 			t.Errorf("AliasFor(%q) = %q, %v; want %q, %v", in, alias, ok, want.alias, want.valid)
 		}
 	}
-	for _, name := range []string{"request_user_input", "load_skill", "read_skill_resource", "activate_journey"} {
+	for _, name := range []string{"request_user_input", "read_skill_resource", "activate_journey"} {
 		if !IsReservedToolName(name) {
 			t.Errorf("%s not reserved", name)
 		}
 	}
-	if IsReservedToolName("lookup") || IsReservedToolName("Load_Skill") {
+	if IsReservedToolName("lookup") || IsReservedToolName("load_skill") || IsReservedToolName("Activate_Journey") {
 		t.Error("ordinary name reserved")
 	}
 

@@ -236,16 +236,18 @@ func (p *Platform) execute(ctx context.Context, owner journal.Owner, c Command, 
 	if err == nil {
 		// Resolved once per run; the ErrPending follow-up loop reuses it.
 		in.ProductVersion, in.Endpoint, in.Settings = scope.Entry.ProductVersion, scope.Endpoint, scope.Settings
+		// Binding is DB-only and validates the client-supplied target against the
+		// pinned set, so attribution below never carries a raw journeyId.
+		journey, digest, err = p.runner.Binding(ctx, in)
+	}
+	if err == nil {
+		in.TargetJourney = journey
+		in.DefinitionDigest = digest
 		// Admitted once per run; a denial sends nothing to MCP or the model.
 		in.Attribution, in.Access, err = p.runner.Admit(ctx, in)
 	}
 	if err == nil {
-		journey, digest, err = p.runner.Binding(ctx, in)
-	}
-	if err == nil {
 		in.History, err = p.store.Start(ctx, owner, journey, digest)
-		in.TargetJourney = journey
-		in.DefinitionDigest = digest
 	}
 	for {
 		var output agentruntime.RunOutput

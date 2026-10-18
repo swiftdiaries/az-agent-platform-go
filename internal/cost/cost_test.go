@@ -378,9 +378,25 @@ func TestClassifyLimitPlain429IsRate(t *testing.T) {
 }
 
 func TestClassifyLimitNon429(t *testing.T) {
-	for _, st := range []int{200, 400, 500, 503} {
+	for _, st := range []int{200, 404, 500, 503} {
 		if le, ok := ClassifyLimit(st, nil, []byte(`{"error":{"code":"budget_exceeded"}}`), now); ok || le != nil {
 			t.Errorf("%d ok", st)
+		}
+	}
+}
+
+func TestClassifyLimit400BudgetExceeded(t *testing.T) {
+	body := []byte(`{"error":{"message":"Budget has been exceeded","type":"budget_exceeded","param":null,"code":"400"}}`)
+	le, ok := ClassifyLimit(400, http.Header{"Retry-After": {"12"}}, body, now)
+	if !ok || le.Kind != LimitBudget || le.RetryAfter != 12*time.Second {
+		t.Fatal(le, ok)
+	}
+}
+
+func TestClassifyLimit400Plain(t *testing.T) {
+	for _, body := range []string{`{"error":{"type":"invalid_request_error"}}`, "", "not json"} {
+		if le, ok := ClassifyLimit(400, nil, []byte(body), now); ok || le != nil {
+			t.Errorf("%q: %v %v", body, le, ok)
 		}
 	}
 }

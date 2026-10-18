@@ -31,6 +31,8 @@ data:
   AGENT_PLATFORM_PORT: "8080"
   AGENT_PLATFORM_SHUTDOWN_GRACE: 25s
   AGENT_PLATFORM_CONFIG: /app/configs/journeys.yaml
+  # Retained configs must be the YAML schema and mounted alongside the current
+  # journeys.yaml; conversations stay pinned to older digests.
   AGENT_PLATFORM_RETAINED_CONFIGS: ""
   KEYCLOAK_JWT_ISSUER: <required-keycloak-issuer>
   KEYCLOAK_JWKS_URL: <required-keycloak-jwks-url>
@@ -43,7 +45,15 @@ data:
   AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT: <required-foundry-project-endpoint>
   AZ_AGENT_FOUNDRY_DEPLOYMENT: <required-foundry-deployment>
   AZURE_CLIENT_ID: <required-workload-identity-client-id>
-  TEST_JAVA_MCP_ENDPOINT: <required-java-mcp-endpoint>
+  AGENT_PLATFORM_MCP_ENDPOINTS: java-monolith=<required-java-mcp-endpoint>
+  AGENT_PLATFORM_CREDENTIAL_HEADERS: Cookie,Authorization
+  AGENT_PLATFORM_TENANT_DIRECTORY: /app/tenancy/tenant-directory.yaml
+  AGENT_PLATFORM_SETTINGS: /app/tenancy/settings.yaml
+  # open (default) or headers. With headers, the enforcement point must accept
+  # the attribution headers only from Agent (mTLS or network policy).
+  AGENT_PLATFORM_COST_GATE: open
+  # key=Header-Name pairs; blank uses the X-Agent-* defaults.
+  AGENT_PLATFORM_COST_HEADERS: ""
   OTEL_SERVICE_NAME: az-agent-platform
   OTEL_SERVICE_VERSION: <required-release-version>
   OTEL_EXPORTER_OTLP_ENDPOINT: ""
@@ -59,44 +69,42 @@ metadata:
 immutable: true
 data:
   journeys.yaml: |
-    {
-      "mcp_servers": [
-        {
-          "id": "java-monolith",
-          "endpoint": "${TEST_JAVA_MCP_ENDPOINT}",
-          "forward_headers": ["Cookie", "Authorization"],
-          "call_id_header": "X-Platform-Call-ID",
-          "tools": ["lookup_destination", "lookup_shift", "request_shift_swap"],
-          "policies": {
-            "lookup_destination": {"class":"read_only"},
-            "lookup_shift": {"class":"read_only"},
-            "request_shift_swap": {"class":"effectful"}
-          }
-        }
-      ],
-      "skill_packages": [
-        {"name":"planner", "root":"skills/planner"},
-        {"name":"shift-swap", "root":"skills/shift-swap"}
-      ],
-      "journeys": [
-        {
-          "id": "vacation-planner",
-          "description": "Plan a vacation using the configured read-only destination lookup",
-          "routing": {"default":true},
-          "system_prompt": "prompts/planner.md",
-          "mcp": {"server": "java-monolith", "tools": ["lookup_destination"]},
-          "skills": ["planner"]
-        },
-        {
-          "id": "shift-swap",
-          "description": "Review available work shifts and request an explicit swap",
-          "routing": {"keywords":["shift", "swap"], "priority":10},
-          "system_prompt": "prompts/shift-swap.md",
-          "mcp": {"server": "java-monolith", "tools": ["lookup_shift", "request_shift_swap"]},
-          "skills": ["shift-swap"]
-        }
-      ]
-    }
+    conversation_prompt: conversation.md
+    catalog:
+      operation_meta_key: operation_key
+      call_id_header: X-Platform-Call-ID
+    journeys:
+      - id: vacation-planner
+        skill: skills/planner
+        tools:
+          - op: lookup_destination
+            class: read_only
+      - id: shift-swap
+        skill: skills/shift-swap
+        tools:
+          - op: lookup_shift
+            class: read_only
+          - op: request_shift_swap
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-platform-tenancy
+  namespace: agent-platform-task-6
+  labels:
+    app.kubernetes.io/name: az-agent-platform
+    app.kubernetes.io/managed-by: task-6
+data:
+  tenant-directory.yaml: |
+    tenants:
+      example-tenant:
+        product_version: "1.0"
+        endpoint: java-monolith
+  settings.yaml: |
+    default:
+      max_active_journeys: 2
+      cost:
+        profile: ""
 ---
 apiVersion: v1
 kind: Service
@@ -266,6 +274,9 @@ spec:
               mountPath: /app/configs/journeys.yaml
               subPath: journeys.yaml
               readOnly: true
+            - name: tenancy-config
+              mountPath: /app/tenancy
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /readyz
@@ -292,3 +303,6 @@ spec:
             items:
               - key: journeys.yaml
                 path: journeys.yaml
+        - name: tenancy-config
+          configMap:
+            name: agent-platform-tenancy

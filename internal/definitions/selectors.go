@@ -121,7 +121,7 @@ func AliasFor(op string) (string, bool) {
 // IsReservedToolName reports whether name belongs to the product runtime.
 func IsReservedToolName(name string) bool {
 	switch name {
-	case "request_user_input", "load_skill", "read_skill_resource", "activate_journey":
+	case "request_user_input", "read_skill_resource", "activate_journey":
 		return true
 	}
 	return false

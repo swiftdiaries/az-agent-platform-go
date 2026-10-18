@@ -214,11 +214,12 @@ func sanitize(err error) error {
 	return errors.New("LiteLLM model request failed")
 }
 
-// limitError classifies a 429 as an enforcement rejection. It reads only the
+// limitError hands 429 and 400 responses to the shared classifier, which
+// decides whether they are enforcement rejections. It reads only the
 // status, the Retry-After headers and the body's error code, and never copies
 // header or body text into the returned error.
 func limitError(apiErr *openai.Error) (*cost.LimitError, bool) {
-	if apiErr.StatusCode != http.StatusTooManyRequests {
+	if apiErr.StatusCode != http.StatusTooManyRequests && apiErr.StatusCode != http.StatusBadRequest {
 		return nil, false
 	}
 	body := []byte(apiErr.RawJSON())

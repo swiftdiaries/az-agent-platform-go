@@ -11,16 +11,24 @@ import (
 
 const budgetExceeded = "budget_exceeded"
 
-// ClassifyLimit maps an enforcement rejection to a *LimitError. Only status
-// 429 qualifies. It is a budget limit when the JSON body carries code or type
+// ClassifyLimit maps an enforcement rejection to a *LimitError. Status 429
+// qualifies: it is a budget limit when the JSON body carries code or type
 // "budget_exceeded", top-level or under "error"; otherwise a rate limit.
+// Status 400 qualifies only with that budget signal (LiteLLM reports an
+// exhausted budget as 400); a plain 400 is not a limit. Other statuses never
+// qualify.
 func ClassifyLimit(status int, header http.Header, body []byte, now time.Time) (*LimitError, bool) {
-	if status != http.StatusTooManyRequests {
-		return nil, false
-	}
+	budget := bodySignalsBudget(body)
 	kind := LimitRate
-	if bodySignalsBudget(body) {
+	switch {
+	case status == http.StatusBadRequest && budget:
 		kind = LimitBudget
+	case status == http.StatusTooManyRequests:
+		if budget {
+			kind = LimitBudget
+		}
+	default:
+		return nil, false
 	}
 	return &LimitError{Kind: kind, RetryAfter: ParseRetryAfter(header, now)}, true
 }

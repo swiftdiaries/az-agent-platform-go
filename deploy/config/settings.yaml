@@ -1,0 +1,7 @@
+# Settings (strict YAML; AGENT_PLATFORM_SETTINGS). Layers: default, then
+# tenants, then users (a user layer may only narrow limits).
+default:
+  max_active_journeys: 2
+  cost:
+    # Opaque profile name interpreted by the cost enforcer; "" means none.
+    profile: ""
