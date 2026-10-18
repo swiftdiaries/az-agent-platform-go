@@ -29,14 +29,14 @@ A declarative bundle for one product use case: instructions loaded on demand, a 
 _Avoid_: use case, specialist, skill (when meaning the whole bundle)
 
 **Active journeys**:
-The journeys whose instructions and tools are currently in play for a conversation. At most N are active at once, where N is the tenant's `max_active_journeys` setting (default 2). The least recently used unpinned journey is evicted first; a journey with an open approval or uncertain effect is pinned and stays active.
+The journeys whose instructions and tools are currently in play for a conversation. At most N are active at once, where N is the tenant's `max_active_journeys` setting (default 2). The least recently used unpinned journey is evicted first, where a journey is used when it is activated, one of its tools is called, or its supporting files are read; a journey with an open approval or uncertain effect is pinned and stays active.
 _Avoid_: active specialist
 
 **Explicit target**:
 An optional stable journey identifier supplied with a user message that activates that journey directly. UI mention syntax is outside the agent platform language.
 
 **Definition version**:
-An immutable compiled set of journeys (a `definitions.Set`, identified by its digest), pinned by a conversation. It identifies instructions, tool selectors, and policy overlays, but not the tools a given user can reach, which come from that user's catalog snapshot.
+An immutable compiled set of journeys (a `definitions.Set`, identified by its digest), pinned by a conversation and re-pinned to the current set at a run start when the conversation is idle (no open wait, no unresolved operation). It identifies instructions, tool selectors, and policy overlays, but not the tools a given user can reach, which come from that user's catalog snapshot.
 
 ### Tools and products
 
@@ -62,7 +62,7 @@ _Avoid_: tool list, server contract
 A user's tool catalog captured when a conversation's first message is handled, identified by digest and revalidated at each run start. It never grants permission; the MCP server still authorizes every call.
 
 **Tool alias**:
-The stable model-facing name for an operation key, mapped to the user's dynamic tool name at call time.
+The stable model-facing name for a tool selector's operation, the same on every tenant and product version whichever of the selector's operation keys resolves. It is mapped to the user's dynamic tool name at call time.
 
 **Product version**:
 The release of the product a tenant runs. Each product version has its own MCP server version and endpoint.

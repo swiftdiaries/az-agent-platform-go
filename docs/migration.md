@@ -131,6 +131,8 @@ Interfaces stay limited to the ports. Everything else is a concrete type, so no 
 
 ## Behaviour (target, expressed in TARGET's loop)
 
+H6b amends aliases, recency, the context budget, definition re-pin, tag-selector classes, settings narrowing and 403 handling. Where this section is silent or older, `docs/design.md` wins.
+
 ### Conversation agent and journeys
 
 - **What the model sees.** The model gets metadata (name and description) for the journeys **available to this user**. A journey is available when every required operation resolves in the user's snapshot.
@@ -169,7 +171,7 @@ sequenceDiagram
 - **Operation keys.** `_meta` carries a namespaced, stable operation key per tool, plus optional tags. MCP `annotations` carry side-effect hints. The `_meta` key name is set in config (`catalog.operation_meta_key`) because it is an integration input. `_meta` describes what a tool *is*, never which journey uses it.
 - **Selectors and overlay.** Selectors name operation keys (with alternatives in preference order), or tags narrowed by hints. The overlay can only narrow: deny an operation, require approval, or set the retry class (`read_only`/`idempotent`). It is authoritative for approval and retry.
 - **Resolution** happens at run start against the snapshot. A missing or ambiguous required operation, or a set over `max_tools`, makes the journey **unavailable**. It is hidden, never failed mid-turn. Name normalization and collision checks run per journey, after filtering.
-- **Aliases.** Aliases are derived from operation keys (`leave_balance`). Binding maps each alias to the user's remote name at call time, which fixes the `CallTool` name bug. Description and schema come from the server.
+- **Aliases.** One alias per op selector: its `alias:`, or else derived from its first alternative (`leave_balance`); a tag-only match derives from its own key (from H6b; before H6b, from the resolved key). Binding maps each alias to the user's remote name at call time, which fixes the `CallTool` name bug. Description and schema come from the server.
 - **Snapshots:**
   - **Contents:** raw descriptors including `_meta` and annotations.
   - **Scope:** stored per `(tenant, principal, product version, endpoint ID)`, with a per-principal "latest" pointer. Each conversation pins one digest, and one conversation's revalidation never moves another conversation's pin.
@@ -372,15 +374,17 @@ journeys:
     product_versions: {min: "2026.2", max_exclusive: "2027.1"}
     tools:
       - op: leave.balance
+        class: read_only                        # class is allowed only on op selectors (H6b)
       - op: [leave.request.v2, leave.request]   # alternatives in preference order
+        alias: leave_request                    # optional (H6b); default AliasFor(first alternative)
         approval: required                      # overlay may only narrow
-      - tags: [leave]
-        read_only: true
+      - tags: [leave]                           # no class: tag-only matches are effectful
+        read_only: true                         # hint filter, not a class
     max_tools: 15
 ```
 
 - **Startup validates** duplicate IDs, paths (no escaping or symlinks; reuse `definitions/registry.go:27 compileSkill` and `skills/source.go secureRead`), selectors, overlays and version ranges. It never validates tool names.
-- **Rollout.** The compiled set is digest-addressed. `AGENT_PLATFORM_RETAINED_CONFIGS` keeps pinned sets loadable, and readiness requires every pinned set plus the current one (reusing `Store.DefinitionsReady`).
+- **Rollout.** The compiled set is digest-addressed. `AGENT_PLATFORM_RETAINED_CONFIGS` keeps needed sets loadable, and readiness (`Store.DefinitionsReady`) requires the current set plus, from H6b, only sets referenced by open waits or unresolved operations; idle conversations re-pin at run start.
 
 ## Migration
 
@@ -407,7 +411,8 @@ It runs as ordered subtests:
 | S5 | A correction admitted through replica B while A's tool is blocked appears in every later provider request, and a reconnect on C is gap-free | H4b |
 | S6 | Approval wait → tenant moved to vN+1 → approve → superseded plus a new interaction → approve → dispatched exactly once on vN+1. A clarification reply survives the same flip | H5 |
 | S7 | Runs the **real `litellm` provider** over HTTP against `modeltest.ResponsesServer`, a scripted OpenAI-Responses-compatible stub acting as the enforcement point. It receives `Headers` attribution on every model request (no credential in it). Its 429 `budget_exceeded` → run `limit_exceeded` with `Retry-After`, no retry, no `outcome_unknown`. A `Scripted` `Admit` denial → `limit_exceeded` with zero model requests. `agent_usage` rows match the stub's reported tokens | H6 |
-| S8 | An apply-then-drop-response effect → `outcome_unknown`, no retry, the journey pinned. The trace has no content, tool descriptions or remote names | H7 |
+| S8 | Design corrections (see H6b): one alias for a `[k.v2, k]` selector across two tenants on different alternatives and across a version flip, each tenant's own remote name at MCP; history truncation with a `history_truncated` event; idle definition re-pin with `definition_changed`; dispatch keeps a journey from eviction; 403 → `not_permitted` result, run continues | H6b |
+| S9 | An apply-then-drop-response effect → `outcome_unknown`, no retry, the journey pinned. The trace has no content, tool descriptions or remote names | H7 |
 
 The ratchet is `integration/e2e_progress_test.go`, which declares `const e2eReachedStage = N`:
 
@@ -426,10 +431,11 @@ flowchart LR
     H4a --> H4b["H4b activate_journey,<br/>active set · S4 S5"]
     H4b --> H5["H5 Approval markers,<br/>supersede · S6"]
     H5 --> H6["H6 Cost seam: attribution,<br/>Gate, limit outcome, usage · S7"]
-    H6 --> H7["H7 outcome_unknown pin, telemetry,<br/>deploy, docs, CI · S8"]
+    H6 --> H6b["H6b Design corrections:<br/>aliases, budget, re-pin, LRU · S8"]
+    H6b --> H7["H7 outcome_unknown pin, telemetry,<br/>deploy, docs, CI · S9"]
 ```
 
-Each hop adds at most one forward-only SQL migration, starting at `000007`.
+Each hop adds at most one forward-only SQL migration. **Numbers are positional:** a migration's version is its index in `migrationNames` (`journal/migrate.go:17`), so a new file takes the next free number when it lands, and a duplicate or skipped number is a silent error. Landed: `000007` H2, `000008` H3, `000009` H4a, `000010` H4b, `000011` H5. Planned: `000012` H6 (`000012_usage_limit.sql`), then `000013` for H6b only if a card needs one.
 
 ### P0: Prerequisites (orchestrator, before H0)
 
@@ -555,6 +561,7 @@ This hop changes **storage only**. Behaviour stays the same, so S0–S3 stay gre
   - scope `read_skill_resource` to active journeys;
   - persist the active set in `Wait` and `Finish`;
   - activate an explicit target before round 0.
+- **Migration `000010`** (`000010_active_set.sql`, landed in `3244bad`): an array CHECK on `agent_conversations.active_journeys`; a run may carry a definition pin without a journey; `agent_interactions.journey_id` becomes nullable for clarifications. `Store.ActiveJourneys`/`SetActiveJourneys` (fenced) read and write the set.
 - **Providers.** Drop `ModelRequest.SkillCatalog` and `SkillMaterial`. `Provenance` covers the active set.
 - **Config.** Fold `configs/prompts/*.md` into the `SKILL.md` bodies, and add `configs/conversation.md`.
 - **Tests to rewrite** as activation equivalents:
@@ -566,9 +573,9 @@ This hop changes **storage only**. Behaviour stays the same, so S0–S3 stay gre
 
 ### H5: Approvals
 
-- **Migration `000010`.** `agent_interactions` gains:
+- **Migration `000011`** (`000011_approval_markers.sql`, landed). `agent_interactions` gains:
   - `marker` (requested, decided, denied, dispatched, superseded);
-  - `operation_key`, `schema_digest`, `product_version`, `catalog_digest`, `definition_digest`;
+  - `operation_key`, `name_digest`, `schema_digest`, `product_version`, `catalog_digest` (`definition_digest` exists since `000004`);
   - `active_journeys`.
 - **Binding v2.** It covers the operation key, name digest, schema digest, canonical arguments (`json.Number`, with trailing data rejected), product version, principal, conversation and definition-set digest. It is used by `Wait`, `Reply` and `BeginAttempt` (`operations.go:17`) and by `runHarness` (`interactions.go:238`).
 - **Markers.**
@@ -582,13 +589,33 @@ This hop changes **storage only**. Behaviour stays the same, so S0–S3 stay gre
   - adapters `Open` (the default), `Headers` (`AGENT_PLATFORM_COST_HEADERS`) and `Scripted`, chosen by `AGENT_PLATFORM_COST_GATE`;
   - `Usage` and `Scope`.
 - **Providers.** `litellm` and `foundry` apply `Access` in their transport (openai-go middleware; azcore policy). They classify 429s as `ErrLimitExceeded{Kind: budget|rate, RetryAfter}` and return `Usage`.
-- **Migration `000011`.** `agent_usage(thread_id, run_id, seq, model, input_tokens, output_tokens, cached_tokens, tenant, principal, journey_id)` and the terminal state `limit_exceeded`, which touches the same four places as in H2.
+- **Migration `000012`** (`000012_usage_limit.sql`). `agent_usage(thread_id, run_id, seq, model, input_tokens, output_tokens, cached_tokens, tenant, principal, journey_id)` and the terminal state `limit_exceeded`, which touches the same four places as in H2.
 - **Read side.** `cost.Usage(scope, window)`. HTTP exposure waits for the cost API.
 - **Room left (documented in `docs/design.md`, not built):**
   - an Envoy or Linkerd RLS service with a Postgres ledger, which agentgateway's `remoteRateLimit` would call to check and to charge `llm.cost.total` in micro-USD;
   - a `LiteLLMKeys` adapter;
   - the cost API endpoints.
 - **S7 fixture.** `modeltest.ResponsesServer` is a scripted, OpenAI-Responses-compatible `httptest` server. It records headers and can return 429 with agentgateway's budget body or usage. S7 runs the real `litellm` provider against it, so attribution, classification and usage cross a real HTTP boundary.
+
+### H6b: Design corrections
+
+Lands the arena-review amendments (2026-10-18) after H6 and before H7. The decisions are in `docs/design.md`; this hop only schedules them. It changes no S0–S7 assertion: S8 runs on its own definition set and replicas, and if an earlier stage breaks, the card stops and reports.
+
+- **M7, tag-selector class** ([Policy classes](design.md#policy-classes-and-approval)). Compile rejects `class:` on a tag selector (`definitions/compile.go:332-339` accepts it today). In `Resolve`, a tag match contributes no class (`catalog/resolve.go:146-155` passes the selector's class to `choose`): a tool matched only by tags is `effectful`, an op selector's class wins for a tool it names, and a tag `approval: required` still ORs in.
+- **M4, selector aliases** ([Aliases](design.md#aliases)). `Selector.Alias` is the explicit `alias:` (op selectors only) or `AliasFor(Ops[0])`. Compile checks one alias per selector, replacing the per-alternative check (`compile.go:363-370`), and rejects one alias with different alternatives across journeys; `checkPolicyConflicts` (`compile.go:509-521`) groups by selector alias, not `AliasFor(key)`. `Resolve` sets `Tool.Alias` from the selector for op-chosen tools and from the key for tag-only ones (`resolve.go:203`). `Binding`'s cross-journey alias check (`binding.go:187`) is unchanged; M8 tracks it.
+- **M14, settings clamp** ([Settings seam](design.md#settings-seam)). One pure `settings.Merge(def, tenant, user Layer) Settings` clamps the user value to the tenant's; `Compiled.Resolve` (`settings.go:192-209`) calls it, and `Compile` drops the user-above-tenant rejection (`settings.go:172`). Bounds stay per layer.
+- **M15, 401 vs 403** ([Effects](design.md#effects-retry-and-errors)). The transport returns `ErrNotPermitted` for 403 and keeps `ErrAuthRequired` for 401 (`catalog/transport.go:62`). `Binding.Call` does not set `broken` on 403. At `Catalog.Open` both still map to `auth_required`. `guardedCall` records outcome `rejected`, makes no second attempt, and returns `{"error":"not_permitted"}`. `mcptest` gains a 403 control.
+- **M9, true LRU** ([Active set](design.md#active-set-and-the-per-tenant-limit)). `ActiveSet.Touch(id)`. The runtime touches the owning journey (`dispatch.go:157`) on an alias dispatch and on `read_skill_resource`, and writes a changed order once per round through `SetActiveJourneys`.
+- **M5, history budget** ([Context budget](design.md#context-budget)). A pure `trimHistory(history, budget, protected) (kept, Truncation)` in `internal/runtime`, applied in `invoke` (`interactions.go:313-337`) to the slice sent to the provider and to the provenance digest, never to the persisted history. A fenced `Store.HistoryTruncated` appends the `history_truncated` event. `AGENT_PLATFORM_HISTORY_BUDGET` is parsed in `cmd` and required for the configured model.
+- **M6, idle re-pin** ([Definitions](design.md#definitions), [Rollout](design.md#journey-definition)). In `ResolveDefinition`'s transaction (`journal/definitions.go:17`), a pin that differs from current is replaced when the conversation is idle (no pending interaction, the command is not a reply continuation, no `dispatching`/`outcome_unknown` operation), and `definition_changed` is appended. One SQL predicate for the referenced digests (current, pending interactions, consumed interactions whose continuation run is not terminal, runs of unresolved operations) backs `DefinitionsReady` and `ActivateDefinition` (`definitions.go:76-143`), replacing "every distinct pin".
+- **Migration.** None planned. If a card needs one, it is `000013`.
+- **Test level.** M7 and M14 are unit-only (compile, resolve and settings tests). M4, M5, M6, M9 and M15 have unit tests plus S8 assertions.
+- **S8** (new; H7's stage becomes S9):
+  - M4: the selector `[leave.request.v2, leave.request]`; tenant A's catalog has only `leave.request` and tenant B's only `leave.request.v2`. Both provider requests advertise the same alias, and MCP receives each tenant's own remote name. After tenant A flips to a version with `leave.request.v2`, the next request advertises the same alias, and a call reaches A's new remote name.
+  - M5: with a budget that fits about two turns, after four turns the provider request omits the oldest turns, every function call in it has its result, one `history_truncated` event carries counts and no sentinel content, and the persisted history still has all four turns.
+  - M6: an idle conversation pinned to set D1. Replicas restart with D2 current and D1 not retained, and readiness passes. The next message emits `definition_changed` D1→D2 and runs on D2. A conversation with a pending approval under D1 keeps D1, and a replica without D1 is not Ready.
+  - M9: tenant A (limit 2) activates J1 and J2, dispatches a J1 alias, then activates J3; J2 is evicted and J1 stays.
+  - M15: a tool answering 403 yields `{"error":"not_permitted"}` to the model after exactly one MCP call, and a later call in the same run succeeds. A 401 still ends the run `auth_required`.
 
 ### H7: `outcome_unknown` pin, telemetry, deploy, docs, CI
 
@@ -602,7 +629,7 @@ This hop changes **storage only**. Behaviour stays the same, so S0–S3 stay gre
 - **Docs and CI:**
   - rewrite `docs/acceptance.md` (fixture PASS or BLOCKED for each case) and `README.md`;
   - add `.github/workflows/test.yaml`, running the race suite with a `postgres:16` service.
-- **E2E.** S8, with N=8.
+- **E2E.** S9, with N=9.
 
 ## Execution model
 
@@ -710,7 +737,7 @@ flowchart TD
 |---|---|---|---|---|
 | H4b.1 ∥ | `internal/journeys` (see H4b) | `internal/journeys/*` | — | `gt ./internal/journeys -run 'TestActivate.*|TestFit.*|TestCompose.*'` |
 | H4b.2 ∥ | Config: fold `configs/prompts/*.md` into the `SKILL.md` bodies and add `configs/conversation.md`; the `Set` compiles the conversation prompt; routing is still accepted | `configs/**`, `internal/definitions/*` | — | `gt ./internal/definitions/...` |
-| H4b.3 | Runtime activation (see H4b); delete `router.go`, `Routing`/`Infer` and `load_skill`; drop the provider fields | `internal/{runtime,definitions,provider}/*` | H4b.1, H4b.2 | `go build ./... && gt ./internal/...` |
+| H4b.3 | Runtime activation (see H4b); delete `router.go`, `Routing`/`Infer` and `load_skill`; drop the provider fields; migration `000010` with `Store.ActiveJourneys`/`SetActiveJourneys` (fenced) | `internal/{runtime,definitions,provider,journal}/*` | H4b.1, H4b.2 | `go build ./... && gt ./internal/...`; `gt ./internal/journal -run 'TestMigration000010'` |
 | H4b.4 | Controller target activation; rewrite the five tests listed in H4b | `internal/platform/*`, `integration/*_test.go` | H4b.3 | `gt ./integration` |
 | H4b.5 | S4 and S5 bodies | `integration/e2e_test.go` | H4b.4 | hop gate with N=5 |
 
@@ -719,7 +746,7 @@ flowchart TD
 | ID | Task | Files | Depends | Verify |
 |---|---|---|---|---|
 | H5.1 | Additive binding v2 (`BindCall`); the old `ActionBinding` is kept | `internal/journal/binding.go` (+test) | — | `gt ./internal/journal -run 'TestBindCall.*'` (number fidelity, trailing data rejected, every field changes the digest) |
-| H5.2 | Migration `000010` plus markers; switch `Wait`, `Reply` and `BeginAttempt` to v2; remove `ActionBinding`. Build may be red in `runtime` until H5.3 | `internal/journal/**` | H5.1 | `gt ./internal/journal -run 'TestMigration000010|TestApprovalMarkers.*'` |
+| H5.2 | Migration `000011` plus markers; switch `Wait`, `Reply` and `BeginAttempt` to v2; remove `ActionBinding`. Build may be red in `runtime` until H5.3 | `internal/journal/**` | H5.1 | `gt ./internal/journal -run 'TestMigration000011|TestApprovalMarkers.*'` |
 | H5.3 | Runtime guard plus call sites; update `TestReplyLosslessActionBinding`, `TestApprovalFreshCredentialsAndRejectedReplies`, `TestBusinessErrorChangedActionRequiresNewApproval` and `TestHITL*` | `internal/runtime/*`, `integration/{interactions,outcomes,acceptance}_test.go` | H5.2 | `gt ./integration -run 'TestHITL.*|TestReply.*|TestApproval.*|TestBusinessError.*|TestAcceptance.*'` |
 | H5.4 | S6 body | `integration/e2e_test.go` | H5.3 | hop gate with N=6 |
 
@@ -729,10 +756,24 @@ flowchart TD
 |---|---|---|---|---|
 | H6.1 | `internal/cost` (see H6) | `internal/cost/*` | — | `gt ./internal/cost -run 'TestRedact.*|TestHeaders.*|TestScripted.*'` |
 | H6.2 ∥ | Providers: apply `Access`, classify 429s, return `Usage`; additive `ModelRequest.Access`, `ModelResponse.Usage`, `ErrLimitExceeded` | `internal/provider/{litellm,foundry}/*`, `internal/runtime/run.go` | H6.1 | `gt ./internal/provider/... -run 'TestLimit.*|TestUsage.*|TestAccess.*'` |
-| H6.3 ∥ | Migration `000011`; `RecordUsage` (fenced); journal-backed `cost.Usage`; `limit_exceeded` in all four state places except Chat | `internal/journal/**`, `internal/cost/usage_store.go` | H6.1 | `gt ./internal/journal ./internal/cost -run 'TestMigration000011|TestUsage.*'` |
+| H6.3 ∥ | Migration `000012`; `RecordUsage` (fenced); journal-backed `cost.Usage`; `limit_exceeded` in all four state places except Chat | `internal/journal/**`, `internal/cost/usage_store.go` | H6.1 | `gt ./internal/journal ./internal/cost -run 'TestMigration000012|TestUsage.*'` |
 | H6.4 ∥ | `modeltest.ResponsesServer` (see H6) | `internal/modeltest/responses.go` (+test) | — | `gt ./internal/modeltest -run 'TestResponsesServer.*'` (exercised with the openai-go client) |
 | H6.5 | Wiring: `Admit` and `Access` from `Settings.Cost`; record usage per model call; finish `limit_exceeded`; Chat mapping; `cmd` env | `internal/{platform,runtime,chat}/*`, `cmd/agent-platform/*` | H6.2, H6.3 | `go build ./... && gt ./integration` |
 | H6.6 | S7 body (the real `litellm` provider against `ResponsesServer`) | `integration/e2e_test.go`, `integration/harness_test.go` | H6.4, H6.5 | hop gate with N=7 |
+
+**H6b: Design corrections**
+
+| ID | Task | Files | Depends | Verify |
+|---|---|---|---|---|
+| H6b.1 | M7: reject `class:` on tag selectors; tag matches contribute no class, op selector class wins (see H6b). Unit only | `internal/definitions/compile.go`, `internal/catalog/resolve.go` (+tests) | — | `gt ./internal/definitions ./internal/catalog -run 'TestCompile.*|TestResolve.*'` |
+| H6b.2 | M4: `alias:` on op selectors; `Selector.Alias`; one alias per selector, set-wide consistency, `checkPolicyConflicts` by alias; `Resolve` takes the selector alias. Unit cases: two snapshots on different alternatives give one alias and each own remote name; `TestOpenResolvesAliasesAcrossTenants` gains a v2 case | `internal/definitions/{compile,selectors}.go`, `internal/catalog/resolve.go` (+tests, `binding_test.go`) | H6b.1 | `gt ./internal/definitions ./internal/catalog -run 'TestCompile.*|TestResolve.*|TestOpen.*|TestJourneysResolveAgainstSupportedVersions'` |
+| H6b.3 ∥ | M14: `settings.Merge` clamps the user value; `Compile` stops rejecting user above tenant; `TestNarrowOnly` asserts the clamp. Unit only | `internal/settings/*` | — | `gt ./internal/settings -run 'TestLayering|TestNarrowOnly|TestMerge.*|TestBounds|TestDigest|TestMutable'` |
+| H6b.4 ∥ | M9: `ActiveSet.Touch(id)` (MRU move, no eviction, no-op when absent) | `internal/journeys/*` | — | `gt ./internal/journeys -run 'TestTouch.*|TestActivate.*|TestFit.*'` |
+| H6b.5 ∥ | M6: idle re-pin plus `definition_changed` in `ResolveDefinition`; the referenced-digest predicate for `DefinitionsReady` and `ActivateDefinition`; rewrite `TestConversationDefinitionsReady` for the bounded rule; cases for a pending approval, a reply continuation and an unresolved operation keeping their pin | `internal/journal/definitions.go` (+tests) | — | `gt ./internal/journal -run 'TestConversationDefinition.*|TestConversationActivateDefinition|TestRepin.*'` |
+| H6b.6 ∥ | M15: `ErrNotPermitted` for 403 on `tools/call`, no `broken`; `Open` keeps `auth_required`; `mcptest` 403 control | `internal/catalog/{transport,binding}.go` (+tests), `internal/mcptest/*` | H6b.2 | `gt ./internal/catalog ./internal/mcptest -run 'TestBindingCall.*|TestOpen.*|TestServer.*'` |
+| H6b.7 ∥ | M5: pure `trimHistory` (turn boundaries, pairs, protected calls, latest turn kept, deterministic); `invoke` trims the request and the provenance digest only; fenced `Store.HistoryTruncated`; `AGENT_PLATFORM_HISTORY_BUDGET` in `cmd` (required); a zero runtime budget disables trimming, for tests only | `internal/runtime/{history,interactions}.go` (+tests), `internal/journal/*.go` (event method only), `cmd/agent-platform/*` | H6b.5 | `gt ./internal/runtime -run 'TestTrimHistory.*'`; `gt ./internal/journal -run 'TestHistoryTruncated.*'`; `gt ./cmd/agent-platform` |
+| H6b.8 | Runtime wiring: M9 `Touch` on alias dispatch and `read_skill_resource`, one fenced write per changed round; M15 `guardedCall` returns `not_permitted` after one attempt with outcome `rejected` | `internal/runtime/{dispatch,interactions,tool_policy}.go` (+tests), `integration/*_test.go` (call sites) | H6b.4, H6b.6, H6b.7 | `go build ./... && gt ./internal/... && gt ./integration` |
+| H6b.9 | S8 body on its own definition set and replicas (see H6b); rename H7's stage to S9 (`stage(t, 9, "H7")`); N=8 | `integration/e2e_test.go`, `integration/harness_test.go`, `integration/e2e_progress_test.go` | H6b.2, H6b.3, H6b.5, H6b.8 | hop gate with N=8 |
 
 **H7: outcome_unknown pin, telemetry, deploy, docs, CI**
 
@@ -742,7 +783,7 @@ flowchart TD
 | H7.2 | Telemetry (see H7) | `internal/telemetry/*`, span call sites in `internal/{runtime,catalog,platform}` | H7.1 | `gt ./internal/telemetry/... ./integration -run 'TestTelemetry.*'` |
 | H7.3 ∥ | Deploy (see H7), preserving the uncommitted edits | `deploy/**` | — | `docker compose -f deploy/compose.yaml config -q`; `gt ./integration -run 'TestService.*'` |
 | H7.4 ∥ | CI workflow | `.github/workflows/test.yaml` | — | `actionlint` if available; the job command matches `gt ./...` |
-| H7.5 | S8 body; N=8 | `integration/e2e_test.go`, `integration/e2e_progress_test.go` | H7.1, H7.2 | hop gate with N=8 |
+| H7.5 | S9 body; N=9 | `integration/e2e_test.go`, `integration/e2e_progress_test.go` | H7.1, H7.2 | hop gate with N=9 |
 | H7.6 | `docs/acceptance.md` and `README.md` | `docs/acceptance.md`, `README.md` | H7.1–H7.5 | links resolve; every case names an existing test |
 
 ## Verification
@@ -750,7 +791,7 @@ flowchart TD
 - **Per hop:** the hop gate (above), re-run by the orchestrator before it asks to commit.
 - **Final:**
   - `go test -race ./... -count=1` on a fresh database;
-  - the `000007`–`000011` migration tests over seeded pre-migration data;
+  - the migration tests over seeded pre-migration data for every migration from `000007` to the last in `migrationNames` (`000012` once H6 lands, `000013` if H6b adds one);
   - `go run ./cmd/agent-platform` against the local compose stack (fresh database) to confirm that startup validation and readiness work.
 - **PostgreSQL.** Real `postgres:16` through `internal/pgtest`. A missing database reports BLOCKED, never a pass.
 - **Not covered.** Real Keycloak, Foundry, Java MCP, agentgateway or other enforcement, and Kubernetes stay BLOCKED in `acceptance.md`.
@@ -764,6 +805,9 @@ flowchart TD
 5. **Nested subagent spawning** may be unavailable. The probe decides at the start, with a defined fallback.
 6. **Attribution trust.** Until mTLS or a service token is in place, the deploy docs require network policy so that only Agent reaches the gateway's model routes.
 7. **Hop size.** H3 and H4a are the largest. Leads may split a card further, but never merge cards.
+8. **H6b alias change on existing histories.** Where a non-first alternative resolved, the alias changes (`leave_request` becomes `leave_request_v2`). A model call to the old alias gets `tool_not_active`, and an approval naming it no longer resolves, so the guard supersedes it and asks again (`interactions.go:391-402`); nothing is dispatched. Setting `alias:` to the old name avoids the change. `configs/journeys.yaml` has no alternatives today.
+9. **H6b re-pin of idle conversations.** An idle thread moves to the current set at its next run start; active journeys absent or unavailable in it are dropped (`run.go:276-280`). A non-idle thread never re-pins, so re-pin cannot supersede an approval; if its pin is not served, the run fails `ErrDefinition` before any dispatch and readiness keeps that pod out of service.
+10. **H6b tag-selector class.** A retained or current config with `class:` on a tag selector now fails compile, so the pod is not Ready. No config in the repo has one.
 
 ## Integration inputs (not decided here)
 
