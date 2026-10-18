@@ -149,8 +149,11 @@ Current behaviour, which supersedes the wording above where they differ: the
 conversation prompt (`conversation_prompt`) and each journey's skill package
 are loaded and digested with `journeys.yaml` at startup. Every retained set in
 `AGENT_PLATFORM_RETAINED_CONFIGS` must use the same YAML schema and be mounted
-alongside the current one; any journey or config change must keep the previous
-config retained, or conversations still pinned to it fail closed.
+alongside the current one. Idle conversations re-pin to the current set at
+their next run (`definition_changed`), so a previous set must stay retained only
+while some conversation referencing it has an open wait (a pending interaction
+or an unfinished reply continuation) or an unresolved operation; until then a
+replica without it is not Ready (bounded readiness).
 
 ### Tenancy, settings, credentials and cost gate
 

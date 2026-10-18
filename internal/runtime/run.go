@@ -319,8 +319,13 @@ func (r *Runner) converse(ctx context.Context, input RunInput, set *definitions.
 			active.Remove(id)
 		}
 	}
-	if _, err := active.Fit(limit, pinned); err != nil {
+	trace.SpanFromContext(ctx).SetAttributes(attribute.Int("journeys.limit", limit))
+	fitEvicted, err := active.Fit(limit, pinned)
+	if err != nil {
 		return RunOutput{}, err
+	}
+	if len(fitEvicted) > 0 {
+		recordJourneyEvent(ctx, "journey.evicted", limit, "fit", "", fitEvicted)
 	}
 	// A continuation resumes interactions bound to journeys that may have since become
 	// unavailable; its target is simply not activated, and the approval guard decides.
@@ -330,12 +335,15 @@ func (r *Runner) converse(ctx context.Context, input RunInput, set *definitions.
 			resolution, _ := cat.Resolution(input.TargetJourney)
 			return RunOutput{}, unavailableJourney(resolution)
 		}
-		if _, err := active.Activate(input.TargetJourney, limit, pinned); err != nil {
+		evicted, err := active.Activate(input.TargetJourney, limit, pinned)
+		if err != nil {
 			if errors.Is(err, journeys.ErrRefused) {
+				recordJourneyEvent(ctx, "journey.activation_refused", limit, "target", input.TargetJourney, nil)
 				return RunOutput{}, fmt.Errorf("%w: %w", ErrJourneyUnavailable, err)
 			}
 			return RunOutput{}, err
 		}
+		recordJourneyEvent(ctx, "journey.activated", limit, "target", input.TargetJourney, evicted)
 	}
 	if !slices.Equal(persisted, active.IDs()) {
 		if err := input.Store.SetActiveJourneys(ctx, input.Owner, active.IDs()); err != nil {
@@ -346,6 +354,19 @@ func (r *Runner) converse(ctx context.Context, input RunInput, set *definitions.
 		return RunOutput{}, err
 	}
 	return r.runHarness(ctx, input, &conversation{set: set, cat: cat, available: available, active: active, limit: limit})
+}
+
+// recordJourneyEvent adds a journey lifecycle event to the current span. It carries
+// config journey IDs and counts only, never tool names, descriptions or content.
+func recordJourneyEvent(ctx context.Context, name string, limit int, trigger, journeyID string, evicted []string) {
+	attrs := []attribute.KeyValue{attribute.Int("journeys.limit", limit), attribute.String("journeys.trigger", trigger)}
+	if journeyID != "" {
+		attrs = append(attrs, attribute.String("journey.id", journeyID))
+	}
+	if len(evicted) > 0 {
+		attrs = append(attrs, attribute.StringSlice("journeys.evicted", evicted))
+	}
+	trace.SpanFromContext(ctx).AddEvent(name, trace.WithAttributes(attrs...))
 }
 
 // unavailableJourney describes why a journey's tools did not resolve. It names

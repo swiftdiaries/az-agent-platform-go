@@ -23,7 +23,7 @@ func seededHistory(n int) []*message.Message {
 
 func (h *harness) runSeeded(history []*message.Message, budget int) (RunOutput, error) {
 	h.t.Helper()
-	ctx := context.Background()
+	ctx := h.runCtx()
 	if _, err := h.store.Start(ctx, h.owner, "", h.set.Digest()); err != nil {
 		h.t.Fatal(err)
 	}

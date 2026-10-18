@@ -275,17 +275,22 @@ func (b *Binding) Call(ctx context.Context, callID, alias string, arguments []by
 	result, err := b.session.CallTool(context.WithValue(ctx, callIDKey{}, callID), &mcp.CallToolParams{Name: t.RemoteName, Arguments: json.RawMessage(arguments)})
 	if err != nil {
 		if errors.Is(err, ErrAuthRequired) {
+			span.SetAttributes(attribute.String("outcome", "auth_required"))
 			b.broken.Store(true)
 			return nil, fmt.Errorf("call MCP tool: %w", ErrAuthRequired)
 		}
 		if errors.Is(err, ErrNotPermitted) {
+			span.SetAttributes(attribute.String("outcome", "not_permitted"))
 			return nil, fmt.Errorf("call MCP tool: %w", ErrNotPermitted)
 		}
+		span.SetAttributes(attribute.String("outcome", "error"))
 		return nil, err
 	}
 	if result.IsError {
+		span.SetAttributes(attribute.String("outcome", "business_rejected"))
 		return nil, ErrBusinessRejected
 	}
+	span.SetAttributes(attribute.String("outcome", "completed"))
 	return result, nil
 }
 

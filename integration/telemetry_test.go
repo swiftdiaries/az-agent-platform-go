@@ -14,10 +14,14 @@ import (
 	"testing"
 	"time"
 
+	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/mcptest"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/modeltest"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/telemetry"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -197,5 +201,90 @@ func testTelemetryCorrelation(t *testing.T, header string) {
 	}
 	if !names["catalog.resolve"] || !names["mcp.call"] {
 		t.Fatalf("catalog.resolve/mcp.call spans missing: %v", names)
+	}
+}
+
+// captureRedactedSpans is captureSpans with the production redaction processor in front
+// of the recorder, as telemetry.New wires it.
+func captureRedactedSpans(t *testing.T) *tracetest.SpanRecorder {
+	t.Helper()
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(telemetry.Redact(recorder)))
+	previous := otel.GetTracerProvider()
+	otel.SetTracerProvider(provider)
+	t.Cleanup(func() {
+		otel.SetTracerProvider(previous)
+		_ = provider.Shutdown(context.Background())
+	})
+	return recorder
+}
+
+func TestTelemetryTraceHasNoDescriptionsOrRemoteNames(t *testing.T) {
+	const (
+		descriptionSentinel = "azap-description-sentinel-4d7a1c"
+		remoteName          = "remote_only_name_8e2f"
+		userText            = "plan a trip to azap-user-text-5b90"
+		resultText          = "azap-result-text-c3a6"
+		answer              = "azap-answer-done"
+	)
+	recorder := captureRedactedSpans(t)
+	pool := database(t)
+	endpoint := mcptest.New(t, mcptest.Options{Name: "telemetry", Version: "vN"}, mcptest.Catalog{Tools: []mcptest.Tool{
+		{Name: remoteName, Description: descriptionSentinel, OperationKey: "travel.lookup", Result: resultText},
+	}})
+	model := modeltest.New(
+		modeltest.Call("travel_lookup", map[string]any{"destination": "Kyoto"}),
+		modeltest.Text(answer),
+	)
+	replica := startAcceptanceReplica(t, pool, acceptanceSet(t, "read_only"), model, testTenancy(t, endpoint.URL()))
+	response := acceptancePost(t, replica.url, aguitypes.RunAgentInput{
+		ThreadID: "telemetry-thread", RunID: "telemetry-run",
+		Messages:       []aguitypes.Message{{Role: aguitypes.RoleUser, Content: userText}},
+		ForwardedProps: map[string]any{"journeyId": "planner"},
+	})
+	if body := e2eReadBody(t, "POST", response); !strings.Contains(body, answer) || !strings.Contains(body, "RUN_FINISHED") {
+		t.Fatalf("run did not finish: %s", body)
+	}
+	waitForEndedSpans(t, recorder, "chat.accept", "agent.start_turn", "journey.run", "catalog.resolve", "model.call", "mcp.call")
+
+	spans := recorder.Ended()
+	var mcpCall, journeyRun sdktrace.ReadOnlySpan
+	for _, span := range spans {
+		switch span.Name() {
+		case "mcp.call":
+			mcpCall = span
+		case "journey.run":
+			journeyRun = span
+		}
+	}
+	if spanAttribute(mcpCall, "tool.alias") != "travel_lookup" || spanAttribute(mcpCall, "operation.key") != "travel.lookup" || spanAttribute(mcpCall, "outcome") != "completed" {
+		t.Fatalf("mcp.call = %s", spanDump(mcpCall))
+	}
+	activated := false
+	for _, event := range journeyRun.Events() {
+		if event.Name == "journey.activated" {
+			activated = true
+		}
+	}
+	if !activated {
+		t.Fatalf("journey.run lacks a journey.activated event: %s", spanDump(journeyRun))
+	}
+	if hits := sentinelSpanHits(spans, descriptionSentinel, remoteName, userText, resultText); len(hits) > 0 {
+		t.Fatalf("spans leaked content: %v", hits)
+	}
+
+	// Control: the redaction processor drops a server-supplied tool description while
+	// keeping the stable tool name, and the scanner would have caught it otherwise.
+	_, probe := otel.Tracer("redaction-control").Start(t.Context(), "probe")
+	probe.SetAttributes(attribute.String("gen_ai.tool.description", descriptionSentinel), attribute.String("gen_ai.tool.name", "travel_lookup"))
+	probe.End()
+	var probeSpan sdktrace.ReadOnlySpan
+	for _, span := range recorder.Ended() {
+		if span.Name() == "probe" {
+			probeSpan = span
+		}
+	}
+	if probeSpan == nil || len(sentinelSpanHits([]sdktrace.ReadOnlySpan{probeSpan}, descriptionSentinel)) != 0 || spanAttribute(probeSpan, "gen_ai.tool.name") != "travel_lookup" {
+		t.Fatalf("redaction control failed: %v", probeSpan)
 	}
 }

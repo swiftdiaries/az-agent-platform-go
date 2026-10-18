@@ -239,7 +239,7 @@ func TestApprovalMarkersDecidedThenDispatched(t *testing.T) {
 		t.Fatalf("marker = %q, operation rows = %d", m, operationRows(t, s, "call-1"))
 	}
 	_, pinned = activeSet(t, s, o2)
-	expectStrings(t, "pinned after dispatch", pinned)
+	expectStrings(t, "pinned after dispatch (carried by the dispatching operation)", pinned, "A")
 	// a dispatched approval cannot authorize again
 	if err := s.BeginAttempt(ctx, o2, op, 1, "i1"); !errors.Is(err, ErrState) {
 		t.Fatalf("second attempt-1: %v", err)

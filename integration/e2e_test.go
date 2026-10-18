@@ -23,6 +23,7 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/journeys"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/mcptest"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/modeltest"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/provider/litellm"
@@ -1553,6 +1554,7 @@ func TestE2EConversationAgent(t *testing.T) {
 	t.Run("S9", func(t *testing.T) {
 		stage(t, 9, "H7")
 		// An apply-then-drop-response effect yields outcome_unknown with no retry and a pinned journey, and the trace carries no content, tool descriptions or remote names.
+		e2eS9(t)
 	})
 }
 
@@ -2270,5 +2272,159 @@ func e2eS8NotPermitted(t *testing.T) {
 	}
 	if got := model.Count(); got != 4 {
 		t.Errorf("model requests = %d, want 4", got)
+	}
+}
+
+// e2eS9 is the effect-loss stage: apply, drop the response, outcome_unknown with no retry, the
+// journey pinned (also under a lowered limit and eviction pressure), and a content-free trace.
+func e2eS9(t *testing.T) {
+	const (
+		thread, token = "e2e-s9", "token"
+		userText      = "azap-s9-user-text-71c4"
+		argument      = "azap-s9-argument-3be8"
+		description   = "azap-s9-description-90d2"
+		answer        = "azap-s9-answer-5f16"
+		credential    = "azap-s9-credential-a7e0"
+	)
+	recorder := captureRedactedSpans(t)
+	pool := database(t)
+	set := e2eS8Set(t, "s9",
+		e2eS8Journey{"hotels", e2eS8ReadOnly("hotel.search")},
+		e2eS8Journey{"visas", e2eS8ReadOnly("visa.check")},
+		e2eS8Journey{"booking", "      - op: book.reserve\n"},
+	)
+	catalog := e2eCatalog(func(o e2eOp) string { return o.remoteA })
+	for i := range catalog.Tools {
+		if catalog.Tools[i].OperationKey == "book.reserve" {
+			catalog.Tools[i].Description = description
+		}
+	}
+	endpoint := mcptest.New(t, mcptest.Options{Name: "e2e-s9", Version: "vN"}, catalog)
+	endpoint.DropResponseAfterApply("book/reserve", 1)
+	model := modeltest.New(
+		modeltest.Call("activate_journey", map[string]any{"journey": "hotels"}),  // 0
+		modeltest.Call("activate_journey", map[string]any{"journey": "booking"}), // 1: the set is now [hotels booking], at the default limit 2
+		modeltest.Call("book_reserve", map[string]any{"note": argument}),         // 2: waits for approval, then loses its response
+		modeltest.Text(answer), // must never be requested
+	)
+	a, b, c := threeReplicas(t, pool, set, model, testTenancy(t, endpoint.URL()))
+	post := func(replica acceptanceReplica, run string, input aguitypes.RunAgentInput) string {
+		t.Helper()
+		input.ThreadID, input.RunID = thread, run
+		return e2eReadBody(t, run, acceptancePostWithHeaders(t, replica.url, input, http.Header{
+			"Authorization": {"Bearer " + token}, "Cookie": {"session=" + credential},
+		}))
+	}
+
+	body := post(a, "e2e-s9-run1", e2eS8Say(userText, ""))
+	if !strings.Contains(body, "interaction.requested") || strings.Contains(body, "RUN_ERROR") {
+		t.Fatalf("run 1 did not wait for approval: %s", body)
+	}
+	internal := acceptanceThread(t, pool, thread)
+	var interaction, binding string
+	if err := pool.QueryRow(t.Context(), `SELECT id, artifact->'call'->>'binding' FROM agent_interactions WHERE thread_id=$1 AND state='pending'`, internal).Scan(&interaction, &binding); err != nil {
+		t.Fatalf("no pending approval: %v", err)
+	}
+	if endpoint.Calls("book/reserve") != 0 {
+		t.Fatalf("book/reserve called before approval")
+	}
+
+	// The approved effect is applied, its response is lost: outcome_unknown, no retry, no model re-issue.
+	body = post(b, "e2e-s9-run2", aguitypes.RunAgentInput{ForwardedProps: map[string]any{"interactionReply": map[string]any{
+		"interactionId": interaction, "kind": "approval", "answer": map[string]any{"decision": "approve", "binding": binding},
+	}}})
+	if !strings.Contains(body, "RUN_ERROR") || strings.Contains(body, "RUN_FINISHED") {
+		t.Fatalf("lost-effect run: expected RUN_ERROR and no RUN_FINISHED: %s", body)
+	}
+	run2 := e2eInternalRun(t, pool, internal, "e2e-s9-run2")
+	if got := e2eRunState(t, pool, internal, run2); got != string(journal.RunFailed) {
+		t.Errorf("lost-effect run state = %q, want failed", got)
+	}
+	var unknownEvents int
+	if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM agent_events WHERE thread_id=$1 AND kind='tool.outcome_unknown'`, internal).Scan(&unknownEvents); err != nil || unknownEvents != 1 {
+		t.Errorf("tool.outcome_unknown events = %d (%v), want 1", unknownEvents, err)
+	}
+	if got := e2eOutcomeUnknown(t, pool, internal, run2); got != 2 {
+		t.Errorf("outcome_unknown operations+attempts = %d, want 2", got)
+	}
+	if endpoint.Applied("book/reserve") != 1 || endpoint.Calls("book/reserve") != 1 {
+		t.Errorf("book/reserve applied/calls = %d/%d, want 1/1 (no retry)", endpoint.Applied("book/reserve"), endpoint.Calls("book/reserve"))
+	}
+	if got := model.Count(); got != 3 {
+		t.Errorf("model requests = %d, want 3 (no model request after the lost call)", got)
+	}
+
+	// The journey is pinned: the operation row carries it, the active set keeps it.
+	var outcome, journeyID string
+	if err := pool.QueryRow(t.Context(), `SELECT outcome, COALESCE(journey_id,'') FROM agent_operations WHERE thread_id=$1`, internal).Scan(&outcome, &journeyID); err != nil {
+		t.Fatal(err)
+	}
+	if outcome != "outcome_unknown" || journeyID != "booking" {
+		t.Errorf("operation outcome/journey_id = %s/%s, want outcome_unknown/booking", outcome, journeyID)
+	}
+	if got := e2eS8Active(t, pool, testPrincipal, thread); !slices.Equal(got, []string{"hotels", "booking"}) {
+		t.Errorf("active journeys = %v, want [hotels booking]", got)
+	}
+
+	// A follow-up message is stopped at the thread level: no MCP call, no model request.
+	body = post(c, "e2e-s9-run3", e2eS8Say("again", ""))
+	if !strings.Contains(body, "RUN_ERROR") || strings.Contains(body, "RUN_FINISHED") {
+		t.Errorf("follow-up: expected RUN_ERROR and no RUN_FINISHED: %s", body)
+	}
+	if got := e2eRunState(t, pool, internal, e2eInternalRun(t, pool, internal, "e2e-s9-run3")); got != string(journal.RunFailed) {
+		t.Errorf("follow-up run state = %q, want failed", got)
+	}
+	if endpoint.Calls("book/reserve") != 1 || endpoint.Count("tools/call") != 1 || model.Count() != 3 {
+		t.Errorf("follow-up reached MCP/model: book/reserve %d, tools/call %d, model %d, want 1, 1, 3", endpoint.Calls("book/reserve"), endpoint.Count("tools/call"), model.Count())
+	}
+
+	// The pin holds under a lowered limit and eviction pressure, read through the journal for a fresh command on the thread.
+	store := journal.New(pool)
+	command := journal.Command{ThreadID: internal, RunID: "e2e-s9-direct", CommunicationID: "e2e-s9-direct", Principal: testPrincipal, Tenant: testTenant, Text: "direct"}
+	if _, _, err := store.Admit(t.Context(), command); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := store.Claim(t.Context(), command, "e2e-s9", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, pinned, err := store.ActiveJourneys(t.Context(), owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(active, []string{"hotels", "booking"}) || !slices.Equal(pinned, []string{"booking"}) {
+		t.Fatalf("ActiveJourneys = %v, pinned %v, want [hotels booking], [booking]", active, pinned)
+	}
+	set1 := journeys.NewActiveSet(active)
+	if evicted, err := set1.Fit(1, pinned); err != nil || !slices.Equal(evicted, []string{"hotels"}) || !slices.Equal(set1.IDs(), []string{"booking"}) {
+		t.Errorf("Fit(1) evicted %v (%v), left %v, want [hotels] evicted and [booking] kept", evicted, err, set1.IDs())
+	}
+	set2 := journeys.NewActiveSet(active)
+	if evicted, err := set2.Activate("visas", 2, pinned); err != nil || !slices.Equal(evicted, []string{"hotels"}) || !set2.Contains("booking") {
+		t.Errorf("Activate(visas, 2) evicted %v (%v), set %v, want hotels evicted and booking kept", evicted, err, set2.IDs())
+	}
+	set3 := journeys.NewActiveSet([]string{"booking"})
+	if _, err := set3.Activate("visas", 1, pinned); !errors.Is(err, journeys.ErrRefused) || !slices.Equal(set3.IDs(), []string{"booking"}) {
+		t.Errorf("Activate(visas, 1) with only the pinned journey = %v, set %v, want ErrRefused and [booking] kept", err, set3.IDs())
+	}
+
+	// Trace privacy and shape.
+	waitForEndedSpans(t, recorder, "chat.accept", "agent.start_turn", "journey.run", "catalog.resolve", "model.call", "mcp.call")
+	spans := recorder.Ended()
+	var mcpCall sdktrace.ReadOnlySpan
+	for _, span := range spans {
+		if span.Name() == "mcp.call" {
+			mcpCall = span
+		}
+	}
+	if spanAttribute(mcpCall, "tool.alias") != "book_reserve" || spanAttribute(mcpCall, "operation.key") != "book.reserve" {
+		t.Errorf("mcp.call = %s", spanDump(mcpCall))
+	}
+	needles := []string{userText, "again", argument, description, answer, credential}
+	for _, op := range e2eOps {
+		needles = append(needles, op.remoteA, op.remoteB)
+	}
+	if hits := sentinelSpanHits(spans, needles...); len(hits) > 0 {
+		t.Errorf("spans leaked content: %v", hits)
 	}
 }

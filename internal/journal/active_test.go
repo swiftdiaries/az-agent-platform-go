@@ -227,7 +227,10 @@ func TestActiveJourneysPinnedByConsumedApproveUntilDispatched(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, pinned = activeSet(t, s, o2)
-	expectStrings(t, "pinned after BeginAttempt", pinned)
+	expectStrings(t, "pinned after BeginAttempt (carried by the dispatching operation)", pinned, "A")
+	mustExec(t, s.pool, "UPDATE agent_operations SET outcome='completed' WHERE call_id='call-1'")
+	_, pinned = activeSet(t, s, o2)
+	expectStrings(t, "pinned once the operation is resolved", pinned)
 }
 
 func TestActiveJourneysConsumedPinIsPerRun(t *testing.T) {

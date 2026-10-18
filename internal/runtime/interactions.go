@@ -10,6 +10,8 @@ import (
 
 	"github.com/microsoft/agent-framework-go/agent"
 	"github.com/microsoft/agent-framework-go/message"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
@@ -170,6 +172,7 @@ func (c *conversation) activate(ctx context.Context, in RunInput, arguments stri
 	next := journeys.NewActiveSet(persisted)
 	evicted, err := next.Activate(args.Journey, c.limit, pinned)
 	if errors.Is(err, journeys.ErrRefused) {
+		recordJourneyEvent(ctx, "journey.activation_refused", c.limit, "tool", args.Journey, nil)
 		return map[string]string{"error": "activation_refused", "message": "all active journeys are pinned"}, nil
 	}
 	if err != nil {
@@ -182,6 +185,7 @@ func (c *conversation) activate(ctx context.Context, in RunInput, arguments stri
 	}
 	c.active = next
 	c.persisted = next.IDs()
+	recordJourneyEvent(ctx, "journey.activated", c.limit, "tool", args.Journey, evicted)
 	result := map[string]any{"activated": args.Journey}
 	if len(evicted) > 0 {
 		result["evicted"] = evicted
@@ -365,6 +369,9 @@ func (r *Runner) runHarness(ctx context.Context, in RunInput, conv *conversation
 			return nil, err
 		}
 		if truncation.TurnsDropped > 0 {
+			trace.SpanFromContext(ctx).AddEvent("history.truncated", trace.WithAttributes(
+				attribute.Int("turns_dropped", truncation.TurnsDropped), attribute.Int("messages_dropped", truncation.MessagesDropped),
+				attribute.Int("estimate_before", truncation.EstimateBefore), attribute.Int("estimate_after", truncation.EstimateAfter), attribute.Int("budget", truncation.Budget)))
 			if err = in.Store.HistoryTruncated(ctx, in.Owner, journal.HistoryTruncation{TurnsDropped: truncation.TurnsDropped, MessagesDropped: truncation.MessagesDropped, EstimateBefore: truncation.EstimateBefore, EstimateAfter: truncation.EstimateAfter, Budget: truncation.Budget}); err != nil {
 				history = history[:beforeInput]
 				return nil, err

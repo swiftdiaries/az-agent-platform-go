@@ -215,6 +215,8 @@ type harness struct {
 	cat     *fakeCatalog
 	model   *scriptedModel
 	runner  *Runner
+	// ctx, when set, is the context runs are driven with (for tracing tests).
+	ctx context.Context
 	// version is the product version recorded on each run's scope.
 	version string
 }
@@ -248,7 +250,7 @@ func (h *harness) run(target string, limit int) (RunOutput, error) {
 
 func (h *harness) runWith(target string, limit, iteration int) (RunOutput, error) {
 	h.t.Helper()
-	ctx := context.Background()
+	ctx := h.runCtx()
 	history, err := h.store.Start(ctx, h.owner, target, h.set.Digest())
 	if err != nil {
 		h.t.Fatal(err)
@@ -697,3 +699,10 @@ func TestHarnessClarificationHasNoJourney(t *testing.T) {
 }
 
 func settingsWith(limit int) settings.Settings { return settings.Settings{MaxActiveJourneys: limit} }
+
+func (h *harness) runCtx() context.Context {
+	if h.ctx != nil {
+		return h.ctx
+	}
+	return context.Background()
+}

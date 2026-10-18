@@ -69,7 +69,7 @@ func New(cfg Config) (*Provider, error) {
 		if err != nil {
 			return nil, err
 		}
-		options = append(options, tracesdk.WithBatcher(exporter))
+		options = append(options, tracesdk.WithSpanProcessor(Redact(tracesdk.NewBatchSpanProcessor(exporter))))
 	}
 	provider := tracesdk.NewTracerProvider(options...)
 	otel.SetTracerProvider(provider)
