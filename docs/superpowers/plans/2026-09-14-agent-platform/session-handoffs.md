@@ -1,3 +1,5 @@
+> **Superseded.** This document is historical. The current design is [docs/design.md](../../../design.md); the migration plan is [docs/migration.md](../../../migration.md).
+
 # Implementation handoff
 
 Use one brief for an author or independent reviewer. The coordinator fills in the scope from [index.md](index.md); no separate handoff database is needed.

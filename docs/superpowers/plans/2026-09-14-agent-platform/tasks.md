@@ -1,3 +1,5 @@
+> **Superseded.** This document is historical. The current design is [docs/design.md](../../../design.md); the migration plan is [docs/migration.md](../../../migration.md).
+
 # Agent platform implementation tasks
 
 Read [index.md](index.md), [interfaces.md](interfaces.md) and the approved spec before implementing. Paths below are relative to the standalone destination repository. Each deliverable owns its tests and adds only the types it actually uses. The file list names starting locations; record exact assigned paths before work begins.

@@ -1,3 +1,5 @@
+> **Superseded.** This document is historical. The current design is [docs/design.md](../../../design.md); the migration plan is [docs/migration.md](../../../migration.md).
+
 # Chat–Agent boundary
 
 Chat owns authenticated AG-UI ingress, external ID mapping and event delivery. Agent owns commands, sessions, execution and lifecycle truth. Render the Chat snapshot from authoritative Agent records; add persisted projections only after measured query cost justifies them.

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,81 +16,11 @@ import (
 	"time"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/service"
 )
-
-type acceptanceReplica struct {
-	app *service.Service
-	url string
-}
-
-func startAcceptanceReplica(t *testing.T, pool *pgxpool.Pool, registry *definitions.Registry, model agentruntime.Model) acceptanceReplica {
-	t.Helper()
-	app, err := service.New(service.Dependencies{
-		Pool: pool, Registry: registry, Authenticator: chat.StaticBearerTokens{"token": "alice"}, Model: model,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- app.Serve(listener) }()
-	t.Cleanup(func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		if err := app.Shutdown(shutdownCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-			t.Error(err)
-		}
-		if err := <-serveErr; err != nil {
-			t.Error(err)
-		}
-		app.Close()
-	})
-	return acceptanceReplica{app: app, url: "http://" + listener.Addr().String()}
-}
-
-func acceptancePost(t *testing.T, endpoint string, input aguitypes.RunAgentInput) *http.Response {
-	t.Helper()
-	body, err := json.Marshal(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer token")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return response
-}
-
-func acceptanceReconnect(t *testing.T, endpoint, thread, run string) *http.Response {
-	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, endpoint+"?threadId="+thread+"&runId="+run, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer token")
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return response
-}
 
 func acceptanceRegistry(t *testing.T, endpoint, policy string) *definitions.Registry {
 	t.Helper()
@@ -110,15 +39,6 @@ func acceptanceRegistry(t *testing.T, endpoint, policy string) *definitions.Regi
 		t.Fatal(err)
 	}
 	return registry
-}
-
-func acceptanceThread(t *testing.T, pool *pgxpool.Pool, external string) string {
-	t.Helper()
-	var thread string
-	if err := pool.QueryRow(t.Context(), "SELECT id FROM chat_threads WHERE principal='alice' AND external_id=$1", external).Scan(&thread); err != nil {
-		t.Fatal(err)
-	}
-	return thread
 }
 
 // This is the missing process-level regression: all ingress and reconnects use
@@ -160,9 +80,7 @@ func TestAcceptanceThreeServiceHTTPSteeringReconnectAndForcedDrain(t *testing.T)
 		return agentruntime.ModelResponse{Text: "corrected Osaka"}, nil
 	})
 	registry := acceptanceRegistry(t, mcpAPI.URL, "read_only")
-	a := startAcceptanceReplica(t, pool, registry, model)
-	b := startAcceptanceReplica(t, pool, registry, model)
-	c := startAcceptanceReplica(t, pool, registry, model)
+	a, b, c := threeReplicas(t, pool, registry, model)
 
 	first := acceptancePost(t, a.url, aguitypes.RunAgentInput{ThreadID: "steer-thread", RunID: "run-a", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan"}}})
 	defer first.Body.Close()
@@ -270,9 +188,7 @@ func TestAcceptanceThreeServiceHTTPApprovalAndReconnect(t *testing.T) {
 		return agentruntime.ModelResponse{Text: "approved and complete"}, nil
 	})
 	registry := acceptanceRegistry(t, mcpAPI.URL, "effectful")
-	a := startAcceptanceReplica(t, pool, registry, model)
-	b := startAcceptanceReplica(t, pool, registry, model)
-	c := startAcceptanceReplica(t, pool, registry, model)
+	a, b, c := threeReplicas(t, pool, registry, model)
 
 	wait := acceptancePost(t, a.url, aguitypes.RunAgentInput{ThreadID: "approval-thread", RunID: "approval-run", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "change"}}})
 	defer wait.Body.Close()
