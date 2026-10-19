@@ -691,11 +691,6 @@ func TestE2EConversationAgent(t *testing.T) {
 			if targetKey != "travel.lookup" {
 				t.Errorf("tenant %s snapshot target _meta operation_key = %v, want travel.lookup", tn.name, targetKey)
 			}
-
-			latest, ok, err := store.LatestSnapshot(t.Context(), snapTenant, tn.principal)
-			if err != nil || !ok || latest.Digest != digest {
-				t.Errorf("tenant %s LatestSnapshot = %q ok=%v err=%v, want %q", tn.name, latest.Digest, ok, err, digest)
-			}
 		}
 		if firstDigest["A"] == firstDigest["B"] {
 			t.Errorf("tenants share catalog digest %q, want different digests", firstDigest["A"])

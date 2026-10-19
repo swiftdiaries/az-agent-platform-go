@@ -46,7 +46,9 @@ data:
   AGENT_PLATFORM_TENANT_DIRECTORY: /app/tenancy/tenant-directory.yaml
   AGENT_PLATFORM_SETTINGS: /app/tenancy/settings.yaml
   # open (default) or headers. With headers, the enforcement point must accept
-  # the attribution headers only from Agent (mTLS or network policy).
+  # the attribution headers only from Agent (mTLS or network policy). With
+  # headers, apply the model-gateway NetworkPolicy at the end of this file
+  # (or an equivalent control) before enabling it.
   AGENT_PLATFORM_COST_GATE: open
   # key=Header-Name pairs; blank uses the X-Agent-* defaults.
   AGENT_PLATFORM_COST_HEADERS: ""
@@ -234,7 +236,9 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
-        # Stores the bundle in PostgreSQL and makes it current; idempotent.
+        # Stores the bundle in PostgreSQL and makes it current; idempotent and
+        # forward-only. For an explicit rollback Job that mirrors these init
+        # containers with `activate --rollback`, see deploy/README.md.
         - name: activate
           image: az-agent-platform:task-6
           imagePullPolicy: IfNotPresent
@@ -305,3 +309,37 @@ spec:
         - name: tenancy-config
           configMap:
             name: agent-platform-tenancy
+---
+# Model-gateway ingress restriction. The gateway is NOT deployed by this
+# manifest. The gateway trusts the X-Agent-* cost attribution headers when
+# AGENT_PLATFORM_COST_GATE=headers, so only Agent pods may reach it; apply this
+# policy (in the gateway's namespace) whenever the headers gate is enabled until
+# mTLS or a service token exists. ASSUMPTIONS to replace: the gateway runs in
+# namespace `model-gateway` and its pods carry the label
+# `app.kubernetes.io/name: model-gateway`. Takes effect only on a CNI that
+# enforces NetworkPolicy. NetworkPolicy is L3/L4: if the gateway also serves
+# non-model routes to other clients, add a route-level control and/or a port
+# restriction (`ports:` below) matching the gateway's model-route port, which
+# this repository does not define. See deploy/README.md.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: model-gateway-allow-agent-platform
+  namespace: model-gateway
+  labels:
+    app.kubernetes.io/part-of: agent-platform
+    app.kubernetes.io/managed-by: task-6
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: model-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: agent-platform-task-6
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: az-agent-platform

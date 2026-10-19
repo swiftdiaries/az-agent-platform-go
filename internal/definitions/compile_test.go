@@ -45,7 +45,7 @@ func writeCompileTree(t *testing.T, yaml string, extra map[string]string) string
 }
 
 func TestCompileValidConfig(t *testing.T) {
-	set, err := Compile(filepath.Join("testdata", "valid", "journeys.yaml"))
+	set, err := compileFile(filepath.Join("testdata", "valid", "journeys.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestCompileSkipsDotfilesAndReadsOpScalarVsList(t *testing.T) {
 		"skills/planner/.hidden/x.md":   "hidden",
 		"skills/planner/ref/.secret.md": "hidden",
 	})
-	set, err := Compile(path)
+	set, err := compileFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestCompileRejects(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			set, err := Compile(writeCompileTree(t, tc.yaml, tc.extra))
+			set, err := compileFile(writeCompileTree(t, tc.yaml, tc.extra))
 			if err == nil || set != nil {
 				t.Fatalf("Compile accepted the configuration (err=%v)", err)
 			}
@@ -228,7 +228,7 @@ func TestCompileRejectsSymlinks(t *testing.T) {
 		if err := os.Symlink(filepath.Join(root, "real"), filepath.Join(root, "skills", "planner")); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Compile(path); err == nil {
+		if _, err := compileFile(path); err == nil {
 			t.Fatal("accepted a symlinked skill directory")
 		}
 	})
@@ -238,7 +238,7 @@ func TestCompileRejectsSymlinks(t *testing.T) {
 		if err := os.Symlink(filepath.Join(root, "skills", "planner", "guide.md"), filepath.Join(root, "skills", "planner", "link.md")); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Compile(path); err == nil {
+		if _, err := compileFile(path); err == nil {
 			t.Fatal("accepted a symlink inside the bundle")
 		}
 	})
@@ -248,7 +248,7 @@ func TestCompileRejectsSymlinks(t *testing.T) {
 		if err := os.Symlink(root, filepath.Join(root, "skills", "planner", "loop")); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Compile(path); err == nil {
+		if _, err := compileFile(path); err == nil {
 			t.Fatal("accepted a symlinked directory inside the bundle")
 		}
 	})
@@ -256,11 +256,11 @@ func TestCompileRejectsSymlinks(t *testing.T) {
 
 func TestCompileDigestIsContentAddressed(t *testing.T) {
 	yaml := fmt.Sprintf(compileTwoOpsYA, "lookup")
-	a, err := Compile(writeCompileTree(t, yaml, nil))
+	a, err := compileFile(writeCompileTree(t, yaml, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := Compile(writeCompileTree(t, yaml, nil))
+	b, err := compileFile(writeCompileTree(t, yaml, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestCompileDigestIsContentAddressed(t *testing.T) {
 		"supporting": {yaml, map[string]string{"skills/planner/guide.md": "changed\n"}},
 		"catalog":    {strings.Replace(yaml, "op\n", "op2\n", 1), nil},
 	} {
-		changed, err := Compile(writeCompileTree(t, c.yaml, c.extra))
+		changed, err := compileFile(writeCompileTree(t, c.yaml, c.extra))
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -361,7 +361,7 @@ func TestConfinedPathRejectsRawParentComponents(t *testing.T) {
 		{name: "supporting file", declaration: skillDeclaration{Name: "planner", Root: "skills/planner", SupportingFiles: []string{"nested/../guide.md"}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := compileSkill(root, tc.declaration); err == nil || !strings.Contains(err.Error(), "parent components are not allowed") {
+			if _, err := (&source{fsys: os.DirFS(root)}).compileSkill(tc.declaration); err == nil || !strings.Contains(err.Error(), "parent components are not allowed") {
 				t.Fatalf("expected raw parent component rejection, got %v", err)
 			}
 		})
@@ -369,7 +369,7 @@ func TestConfinedPathRejectsRawParentComponents(t *testing.T) {
 }
 
 func TestCompileRepositoryConfig(t *testing.T) {
-	set, err := Compile(filepath.Join("..", "..", "configs", "journeys.yaml"))
+	set, err := compileFile(filepath.Join("..", "..", "configs", "journeys.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +405,7 @@ func TestCompileRepositoryConfig(t *testing.T) {
 func TestCompileConversationPrompt(t *testing.T) {
 	compile := func(t *testing.T, yaml string, extra map[string]string) (*Set, error) {
 		t.Helper()
-		return Compile(writeCompileTree(t, "conversation_prompt: conv.md\n"+yaml, extra))
+		return compileFile(writeCompileTree(t, "conversation_prompt: conv.md\n"+yaml, extra))
 	}
 	t.Run("present", func(t *testing.T) {
 		set, err := compile(t, compileMinimal, map[string]string{"conv.md": "You are the conversation agent.\n"})
@@ -419,7 +419,7 @@ func TestCompileConversationPrompt(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		absent, err := Compile(writeCompileTree(t, compileMinimal, nil))
+		absent, err := compileFile(writeCompileTree(t, compileMinimal, nil))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -437,7 +437,7 @@ func TestCompileConversationPrompt(t *testing.T) {
 		}
 	})
 	t.Run("absent", func(t *testing.T) {
-		set, err := Compile(writeCompileTree(t, compileMinimal, nil))
+		set, err := compileFile(writeCompileTree(t, compileMinimal, nil))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -461,7 +461,7 @@ func TestCompileConversationPrompt(t *testing.T) {
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
 				yaml := "conversation_prompt: " + tc.key + "\n" + compileMinimal
-				set, err := Compile(writeCompileTree(t, yaml, tc.extra))
+				set, err := compileFile(writeCompileTree(t, yaml, tc.extra))
 				if err == nil || set != nil {
 					t.Fatalf("Compile accepted the configuration (err=%v)", err)
 				}
@@ -476,13 +476,13 @@ func TestCompileConversationPrompt(t *testing.T) {
 			if err := os.Symlink(filepath.Join(dir, "skills", "planner", "guide.md"), filepath.Join(dir, "link.md")); err != nil {
 				t.Skipf("symlinks unavailable: %v", err)
 			}
-			if set, err := Compile(path); err == nil || set != nil {
+			if set, err := compileFile(path); err == nil || set != nil {
 				t.Fatalf("Compile accepted a symlinked conversation prompt (err=%v)", err)
 			}
 		})
 		t.Run("empty value", func(t *testing.T) {
 			// An explicit empty path is the same as an absent key.
-			set, err := Compile(writeCompileTree(t, "conversation_prompt: \"\"\n"+compileMinimal, nil))
+			set, err := compileFile(writeCompileTree(t, "conversation_prompt: \"\"\n"+compileMinimal, nil))
 			if err != nil || set.ConversationPrompt() != "" {
 				t.Fatalf("err=%v", err)
 			}
@@ -493,7 +493,7 @@ func TestCompileConversationPrompt(t *testing.T) {
 func TestCompileSkillBodyPrompt(t *testing.T) {
 	t.Run("prompt is the SKILL.md body", func(t *testing.T) {
 		skill := "---\nname: planner\ndescription: Plan time off\n---\n\n  Use the planner.\n\nSecond paragraph.\n\n"
-		set, err := Compile(writeCompileTree(t, compileMinimal, map[string]string{"skills/planner/SKILL.md": skill}))
+		set, err := compileFile(writeCompileTree(t, compileMinimal, map[string]string{"skills/planner/SKILL.md": skill}))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -505,7 +505,7 @@ func TestCompileSkillBodyPrompt(t *testing.T) {
 	t.Run("body changes the journey digest", func(t *testing.T) {
 		build := func(body string) Journey {
 			skill := "---\nname: planner\ndescription: Plan time off\n---\n" + body
-			set, err := Compile(writeCompileTree(t, compileMinimal, map[string]string{"skills/planner/SKILL.md": skill}))
+			set, err := compileFile(writeCompileTree(t, compileMinimal, map[string]string{"skills/planner/SKILL.md": skill}))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -518,7 +518,7 @@ func TestCompileSkillBodyPrompt(t *testing.T) {
 	})
 	t.Run("empty body", func(t *testing.T) {
 		skill := "---\nname: planner\ndescription: Plan time off\n---\n"
-		set, err := Compile(writeCompileTree(t, compileMinimal, map[string]string{"skills/planner/SKILL.md": skill}))
+		set, err := compileFile(writeCompileTree(t, compileMinimal, map[string]string{"skills/planner/SKILL.md": skill}))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -537,7 +537,7 @@ func TestCompileRejectsRemovedKeys(t *testing.T) {
 	} {
 		t.Run(key, func(t *testing.T) {
 			yaml := strings.Replace(compileMinimal, "    skill: skills/planner\n", "    skill: skills/planner\n"+line, 1)
-			set, err := Compile(writeCompileTree(t, yaml, map[string]string{"prompts/p.md": "p\n"}))
+			set, err := compileFile(writeCompileTree(t, yaml, map[string]string{"prompts/p.md": "p\n"}))
 			if err == nil || set != nil {
 				t.Fatalf("Compile accepted %s (err=%v)", key, err)
 			}
@@ -604,7 +604,7 @@ func TestCompilePolicyConflict(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeCompileTree(t, policyConflictYAML(tc.first, tc.second), nil)
-			_, err := Compile(path)
+			_, err := compileFile(path)
 			if err == nil || err.Error() != tc.want {
 				t.Fatalf("Compile error = %v, want %q", err, tc.want)
 			}
@@ -622,7 +622,7 @@ func TestCompilePolicyConflictAcceptsEqualPolicies(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeCompileTree(t, policyConflictYAML(tc.first, tc.second), nil)
-			if _, err := Compile(path); err != nil {
+			if _, err := compileFile(path); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -632,7 +632,7 @@ func TestCompilePolicyConflictAcceptsEqualPolicies(t *testing.T) {
 func TestCompileSelectorAlias(t *testing.T) {
 	yaml := "catalog:\n  operation_meta_key: op\njourneys:\n  - id: j\n    skill: skills/planner\n    tools:\n" +
 		"      - op: a.b\n      - op: c\n        alias: renamed\n      - op: [d, e]\n        alias: pick\n      - tags: [t]\n"
-	set, err := Compile(writeCompileTree(t, yaml, nil))
+	set, err := compileFile(writeCompileTree(t, yaml, nil))
 	if err != nil {
 		t.Fatal(err)
 	}

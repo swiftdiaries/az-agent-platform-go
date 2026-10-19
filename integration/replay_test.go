@@ -18,7 +18,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
@@ -32,7 +31,7 @@ func fixtureRunner(t *testing.T, pool *pgxpool.Pool, model agentruntime.Model) *
 	})
 	endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
 	t.Cleanup(endpoint.Close)
-	registry, err := definitions.Compile(filepath.Join("..", "configs", "journeys.yaml"))
+	registry, err := compileFile(filepath.Join("..", "configs", "journeys.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}

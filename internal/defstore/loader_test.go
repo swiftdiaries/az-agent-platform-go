@@ -27,7 +27,7 @@ func compiled(t *testing.T) *definitions.Set {
 	write("journeys.yaml", "conversation_prompt: conversation.md\ncatalog:\n  operation_meta_key: operation_key\n  call_id_header: X-Platform-Call-ID\njourneys:\n  - id: alpha\n    skill: skills/alpha\n    tools:\n      - op: alpha.lookup\n        class: read_only\n")
 	write("conversation.md", "You are the conversation agent.\n")
 	write("skills/alpha/SKILL.md", "---\nname: alpha\ndescription: Does alpha things\n---\nBody.\n")
-	set, err := definitions.Compile(filepath.Join(dir, "journeys.yaml"))
+	set, err := compileFile(filepath.Join(dir, "journeys.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}

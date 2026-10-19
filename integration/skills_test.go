@@ -64,22 +64,22 @@ func results(t *testing.T, request agentruntime.ModelRequest) map[string]string 
 
 func TestSkillCatalogAndControlledReads(t *testing.T) {
 	// The skill package itself: metadata, immutable bodies, declared files only, and
-	// a file changed after compilation is detected.
+	// compiled bytes that no longer match their digest are detected.
 	t.Run("package", func(t *testing.T) {
 		root := t.TempDir()
 		registry := compileSet(t, writeDefinitionBundle(t, root, "prompt\n"))
 		journey, _ := registry.Journey("planner")
+		// Compiled bytes that no longer match their digest are detected.
+		tampered := journey.Skills[0].Supporting["guide.md"]
+		tampered.Data[0] ^= 1
 		source := platformskills.New(journey)
 
-		if err := os.WriteFile(filepath.Join(root, "skills/planner/guide.md"), []byte("changed\n"), 0600); err != nil {
-			t.Fatal(err)
-		}
 		catalog := source.Catalog()
 		if len(catalog) != 1 || catalog[0].Name != "planner" || catalog[0].Description != "Plan a trip" || catalog[0].Digest == "" {
 			t.Fatalf("metadata catalog = %#v", catalog)
 		}
 		if _, err := source.Read("planner", "guide.md"); !errors.Is(err, platformskills.ErrChanged) {
-			t.Fatalf("mutated resource read = %v", err)
+			t.Fatalf("tampered resource read = %v", err)
 		}
 		if _, err := source.Read("planner", "other.md"); !errors.Is(err, platformskills.ErrUnavailable) {
 			t.Fatalf("undeclared resource read = %v", err)
@@ -186,7 +186,7 @@ func TestSkillCatalogAndControlledReads(t *testing.T) {
 
 	t.Run("a file changed on disk after compilation is ignored by the stored copy", func(t *testing.T) {
 		// The run loads the set from the store, whose copy is immutable and never re-read
-		// from disk; the disk-level ErrChanged check is covered by the "package" subtest.
+		// from disk; the digest-mismatch ErrChanged check is covered by the "package" subtest.
 		if err := os.WriteFile(filepath.Join(root, "skills/planner/guide.md"), []byte("changed\n"), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -249,81 +249,6 @@ func TestSkillPolicyFailsClosed(t *testing.T) {
 	if _, err := source.Read("planner", "guide.md"); !errors.Is(err, platformskills.ErrUnavailable) {
 		t.Fatalf("resource of SKILL.md-only bundle = %v", err)
 	}
-}
-
-func TestSkillReadRejectsReplacedAncestors(t *testing.T) {
-	t.Run("compiled root", func(t *testing.T) {
-		parent := t.TempDir()
-		root := filepath.Join(parent, "bundle")
-		registry := compileSet(t, writeDefinitionBundle(t, root, "prompt\n"))
-		journey, _ := registry.Journey("planner")
-		real := filepath.Join(parent, "bundle-real")
-		if err := os.Rename(root, real); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Symlink(real, root); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := platformskills.New(journey).Read("planner", "SKILL.md"); !errors.Is(err, platformskills.ErrChanged) {
-			t.Fatalf("replaced compiled root read = %v", err)
-		}
-	})
-	t.Run("above compiled root", func(t *testing.T) {
-		parent := t.TempDir()
-		ancestor := filepath.Join(parent, "canonical")
-		root := filepath.Join(ancestor, "bundle")
-		registry := compileSet(t, writeDefinitionBundle(t, root, "prompt\n"))
-		journey, _ := registry.Journey("planner")
-		real := filepath.Join(parent, "canonical-real")
-		if err := os.Rename(ancestor, real); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Symlink(real, ancestor); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := platformskills.New(journey).Read("planner", "SKILL.md"); !errors.Is(err, platformskills.ErrChanged) {
-			t.Fatalf("replaced root ancestor read = %v", err)
-		}
-	})
-	t.Run("package", func(t *testing.T) {
-		root := t.TempDir()
-		registry := compileSet(t, writeDefinitionBundle(t, root, "prompt\n"))
-		journey, _ := registry.Journey("planner")
-		packagePath := filepath.Join(root, "skills/planner")
-		realPath := filepath.Join(root, "skills/planner-real")
-		if err := os.Rename(packagePath, realPath); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Symlink(realPath, packagePath); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := platformskills.New(journey).Read("planner", "SKILL.md"); !errors.Is(err, platformskills.ErrChanged) {
-			t.Fatalf("replaced package read = %v", err)
-		}
-	})
-	t.Run("intermediate", func(t *testing.T) {
-		root := t.TempDir()
-		path := writeDefinitionBundle(t, root, "prompt\n")
-		if err := os.Mkdir(filepath.Join(root, "skills/planner/reference"), 0700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Rename(filepath.Join(root, "skills/planner/guide.md"), filepath.Join(root, "skills/planner/reference/guide.md")); err != nil {
-			t.Fatal(err)
-		}
-		registry := compileSet(t, path)
-		journey, _ := registry.Journey("planner")
-		intermediate := filepath.Join(root, "skills/planner/reference")
-		real := filepath.Join(root, "skills/planner/reference-real")
-		if err := os.Rename(intermediate, real); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Symlink(real, intermediate); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := platformskills.New(journey).Read("planner", "reference/guide.md"); !errors.Is(err, platformskills.ErrChanged) {
-			t.Fatalf("replaced intermediate read = %v", err)
-		}
-	})
 }
 
 // writeTwoJourneyBundle writes two journeys (vacation-planner, shift-swap) whose

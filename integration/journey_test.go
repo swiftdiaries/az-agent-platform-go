@@ -26,7 +26,6 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
@@ -548,7 +547,7 @@ func TestJourneyConfigFailsClosed(t *testing.T) {
 	// caused by its single edit and not by the surrounding fixture.
 	controlRoot := t.TempDir()
 	controlPath := writeBundleConfig(t, controlRoot, "fixture prompt\n", "lookup", "read_only")
-	if _, err := definitions.Compile(controlPath); err != nil {
+	if _, err := compileFile(controlPath); err != nil {
 		t.Fatalf("control config rejected: %v", err)
 	}
 	control, err := os.ReadFile(controlPath)
@@ -566,7 +565,7 @@ func TestJourneyConfigFailsClosed(t *testing.T) {
 			if err := os.WriteFile(path, []byte(edited), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			_, err := definitions.Compile(path)
+			_, err := compileFile(path)
 			if err == nil {
 				t.Fatalf("Compile accepted invalid config:\n%s", edited)
 			}
@@ -591,7 +590,7 @@ func TestJourneyConfigRejectsEndpoint(t *testing.T) {
 		if err := os.WriteFile(path, []byte(edited), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		_, err = definitions.Compile(path)
+		_, err = compileFile(path)
 		return err
 	}
 	if err := load(func(c string) string { return c }); err != nil {

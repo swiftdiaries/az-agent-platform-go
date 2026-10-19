@@ -53,10 +53,6 @@ func bundleDir(t *testing.T) string {
 func TestBundleRoundTripDigest(t *testing.T) {
 	for name, dir := range map[string]string{"configs": filepath.Join("..", "..", "configs"), "temp": bundleDir(t)} {
 		t.Run(name, func(t *testing.T) {
-			disk, err := Compile(filepath.Join(dir, BundleConfig))
-			if err != nil {
-				t.Fatal(err)
-			}
 			b, err := ReadBundle(os.DirFS(dir))
 			if err != nil {
 				t.Fatal(err)
@@ -65,47 +61,20 @@ func TestBundleRoundTripDigest(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			again, err := CompileBundle(disk.Bundle())
+			again, err := CompileBundle(mem.Bundle())
 			if err != nil {
 				t.Fatal(err)
 			}
-			if disk.Digest() == "" || disk.Digest() != mem.Digest() || disk.Digest() != again.Digest() {
-				t.Fatalf("digests differ: %s %s %s", disk.Digest(), mem.Digest(), again.Digest())
+			if mem.Digest() == "" || mem.Digest() != again.Digest() {
+				t.Fatalf("digests differ: %s %s", mem.Digest(), again.Digest())
 			}
-			if !reflect.DeepEqual(disk.Bundle(), again.Bundle()) {
+			if !reflect.DeepEqual(mem.Bundle(), again.Bundle()) {
 				t.Fatal("Bundle() is not stable across a round trip")
 			}
-			if disk.ConversationPrompt() != mem.ConversationPrompt() {
+			if mem.ConversationPrompt() != again.ConversationPrompt() {
 				t.Fatal("conversation prompt differs")
 			}
 		})
-	}
-}
-
-func TestBundleMemorySkillFilesHaveNoDiskLocation(t *testing.T) {
-	mem, err := CompileBundle(Bundle{
-		BundleConfig:              []byte(bundleYAML),
-		"prompts/conv.md":         []byte("p"),
-		"skills/planner/SKILL.md": []byte(compileSkillMD),
-		"skills/planner/guide.md": []byte("g"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	j, _ := mem.Journey("j")
-	files := []SkillFile{j.Skills[0].Instructions, j.Skills[0].Supporting["guide.md"]}
-	for _, f := range files {
-		if f.Root != "" || f.Path != "" || f.Relative == "" || len(f.Data) == 0 {
-			t.Fatalf("memory file = %+v", f)
-		}
-	}
-	disk, err := Compile(filepath.Join(bundleDir(t), BundleConfig))
-	if err != nil {
-		t.Fatal(err)
-	}
-	dj, _ := disk.Journey("j")
-	if f := dj.Skills[0].Instructions; f.Root == "" || f.Path == "" || f.Relative != filepath.FromSlash("skills/planner/SKILL.md") {
-		t.Fatalf("disk file = %+v", f)
 	}
 }
 
@@ -129,11 +98,11 @@ func TestBundleOrderIndependent(t *testing.T) {
 	a, b := t.TempDir(), t.TempDir()
 	writeBundleDir(t, a, sortStrings(names, false), files)
 	writeBundleDir(t, b, sortStrings(names, true), files)
-	setA, err := Compile(filepath.Join(a, BundleConfig))
+	setA, err := compileFile(filepath.Join(a, BundleConfig))
 	if err != nil {
 		t.Fatal(err)
 	}
-	setB, err := Compile(filepath.Join(b, BundleConfig))
+	setB, err := compileFile(filepath.Join(b, BundleConfig))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +130,7 @@ func TestBundleOrderIndependent(t *testing.T) {
 
 func TestBundleExcludesUnreferencedFiles(t *testing.T) {
 	root := bundleDir(t)
-	set, err := Compile(filepath.Join(root, BundleConfig))
+	set, err := compileFile(filepath.Join(root, BundleConfig))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,32 +149,6 @@ func TestBundleExcludesUnreferencedFiles(t *testing.T) {
 	}
 	if !bytes.Equal(set.Bundle()[BundleConfig], []byte(bundleYAML)) {
 		t.Fatal("config bytes not stored under BundleConfig")
-	}
-}
-
-func TestBundleConfigUnderOtherName(t *testing.T) {
-	root := bundleDir(t)
-	other := filepath.Join(root, "other.yaml")
-	if err := os.Rename(filepath.Join(root, "journeys.yaml"), other); err != nil {
-		t.Fatal(err)
-	}
-	set, err := Compile(other)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(set.Bundle()[BundleConfig]) != bundleYAML || set.Bundle()["other.yaml"] != nil {
-		t.Fatal("config must be stored under BundleConfig only")
-	}
-	// A read file named journeys.yaml collides with the stored config.
-	y := strings.Replace(bundleYAML, "prompts/conv.md", "journeys.yaml", 1)
-	if err := os.WriteFile(other, []byte(y), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "journeys.yaml"), []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Compile(other); err == nil {
-		t.Fatal("expected collision error")
 	}
 }
 
@@ -237,9 +180,6 @@ func TestBundleRejectsSymlink(t *testing.T) {
 	}
 	if _, err := ReadBundle(os.DirFS(root)); err == nil || !strings.Contains(err.Error(), "symbolic link") {
 		t.Fatalf("ReadBundle err = %v", err)
-	}
-	if _, err := Compile(filepath.Join(root, BundleConfig)); err == nil {
-		t.Fatal("Compile must keep rejecting symlinks")
 	}
 	// A symlinked directory is rejected too.
 	root2 := bundleDir(t)
@@ -349,7 +289,7 @@ func TestCompileBundleConfinement(t *testing.T) {
 	}
 }
 
-func TestCompileBundleMatchesCompileErrors(t *testing.T) {
+func TestCompileBundleRejectsInvalidConfigs(t *testing.T) {
 	good := map[string]string{
 		"skills/planner/SKILL.md": compileSkillMD,
 		"skills/planner/guide.md": "g",
@@ -368,21 +308,12 @@ func TestCompileBundleMatchesCompileErrors(t *testing.T) {
 		"two documents":  compileMinimal + "---\n" + compileMinimal,
 	} {
 		t.Run(name, func(t *testing.T) {
-			root := t.TempDir()
-			files := map[string]string{"journeys.yaml": cfg}
-			order := []string{"journeys.yaml"}
-			b := Bundle{}
+			b := Bundle{BundleConfig: []byte(cfg)}
 			for n, c := range good {
-				files[n] = c
-				order = append(order, n)
 				b[n] = []byte(c)
 			}
-			b[BundleConfig] = []byte(cfg)
-			writeBundleDir(t, root, order, files)
-			_, diskErr := Compile(filepath.Join(root, "journeys.yaml"))
-			_, memErr := CompileBundle(b)
-			if diskErr == nil || memErr == nil || diskErr.Error() != memErr.Error() {
-				t.Fatalf("disk=%v mem=%v", diskErr, memErr)
+			if set, err := CompileBundle(b); err == nil || set != nil {
+				t.Fatalf("invalid config accepted: set=%v err=%v", set, err)
 			}
 		})
 	}

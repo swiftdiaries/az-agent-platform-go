@@ -81,9 +81,6 @@ func (s *Store) CommitSnapshot(ctx context.Context, o Owner, snap CatalogSnapsho
 		if _, err := tx.Exec(ctx, "INSERT INTO agent_catalog_snapshots(digest,tenant,principal,product_version,endpoint_id,server_version,descriptors) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (digest) DO NOTHING", digest, snap.Tenant, snap.Principal, snap.ProductVersion, snap.EndpointID, snap.ServerVersion, []byte(snap.Descriptors)); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, "INSERT INTO agent_catalog_latest(tenant,principal,digest) VALUES($1,$2,$3) ON CONFLICT (tenant,principal) DO UPDATE SET digest=EXCLUDED.digest,updated_at=clock_timestamp()", snap.Tenant, snap.Principal, digest); err != nil {
-			return err
-		}
 		if _, err := tx.Exec(ctx, "UPDATE agent_conversations SET catalog_digest=$2,product_version=$3,catalog_validated_at=clock_timestamp() WHERE id=$1", c.ThreadID, digest, snap.ProductVersion); err != nil {
 			return err
 		}
@@ -160,19 +157,4 @@ func (s *Store) ConversationPin(ctx context.Context, o Owner) (CatalogPin, bool,
 		return CatalogPin{}, false, err
 	}
 	return pin, ok, nil
-}
-
-// LatestSnapshot returns the most recently committed snapshot for a tenant and principal.
-func (s *Store) LatestSnapshot(ctx context.Context, tenant, principal string) (CatalogSnapshot, bool, error) {
-	var snap CatalogSnapshot
-	var descriptors []byte
-	err := s.pool.QueryRow(ctx, "SELECT s.digest,s.tenant,s.principal,s.product_version,s.endpoint_id,s.server_version,s.descriptors,s.captured_at FROM agent_catalog_latest l JOIN agent_catalog_snapshots s ON s.digest=l.digest WHERE l.tenant=$1 AND l.principal=$2", tenant, principal).Scan(&snap.Digest, &snap.Tenant, &snap.Principal, &snap.ProductVersion, &snap.EndpointID, &snap.ServerVersion, &descriptors, &snap.CapturedAt)
-	if err == pgx.ErrNoRows {
-		return CatalogSnapshot{}, false, nil
-	}
-	if err != nil {
-		return CatalogSnapshot{}, false, err
-	}
-	snap.Descriptors = descriptors
-	return snap, true, nil
 }

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -22,10 +21,6 @@ func skillFootprint(skill SkillPackage) (int, int) {
 		bytes += len(file.Data)
 	}
 	return bytes, 1 + len(skill.Supporting)
-}
-
-func compileSkill(configRoot string, declaration skillDeclaration) (SkillPackage, error) {
-	return (&source{fsys: os.DirFS(configRoot), diskRoot: configRoot}).compileSkill(declaration)
 }
 
 func (src *source) compileSkill(declaration skillDeclaration) (SkillPackage, error) {
@@ -55,7 +50,7 @@ func (src *source) compileSkill(declaration skillDeclaration) (SkillPackage, err
 	compiled := SkillPackage{
 		Name: name, Description: description, Disabled: declaration.Disabled,
 		AllowSupportingFiles: declaration.AllowSupportingFiles,
-		Instructions:         src.snapshot("SKILL.md", instructionPath, instructions),
+		Instructions:         src.snapshot("SKILL.md", instructions),
 		Supporting:           make(map[string]SkillFile, len(declaration.SupportingFiles)),
 	}
 	seen := make(map[string]bool)
@@ -72,7 +67,7 @@ func (src *source) compileSkill(declaration skillDeclaration) (SkillPackage, err
 		if err != nil {
 			return SkillPackage{}, fmt.Errorf("supporting file %q: %w", name, err)
 		}
-		compiled.Supporting[name] = src.snapshot(name, path, data)
+		compiled.Supporting[name] = src.snapshot(name, data)
 	}
 	canonical, err := json.Marshal(struct {
 		Name, Description              string
@@ -149,8 +144,8 @@ type skillDeclaration struct {
 }
 
 type SkillFile struct {
-	Name, Path, Root, Relative, Digest string
-	Data                               []byte
+	Name, Digest string
+	Data         []byte
 }
 
 type SkillPackage struct {

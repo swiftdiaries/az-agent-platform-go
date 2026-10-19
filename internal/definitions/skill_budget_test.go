@@ -42,7 +42,7 @@ func TestSkillSnapshotsAreSharedAndCallerImmutable(t *testing.T) {
 	root := t.TempDir()
 	writeSkillBudgetFiles(t, root)
 	path := writeSkillBudgetConfigWithJourneys(t, root, "journeys.yaml", 0, 64)
-	set, err := Compile(path)
+	set, err := compileFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestCompileRejectsAggregateSkillLimitInOneSet(t *testing.T) {
 	if err := os.WriteFile(path, []byte(config.String()), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if set, err := Compile(path); err == nil || set != nil || !strings.Contains(err.Error(), "exceed aggregate limits") {
+	if set, err := compileFile(path); err == nil || set != nil || !strings.Contains(err.Error(), "exceed aggregate limits") {
 		t.Fatalf("aggregate skill limit not enforced in one set: %v", err)
 	}
 }

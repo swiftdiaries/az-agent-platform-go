@@ -20,7 +20,7 @@ Every message goes to the conversation's one agent, which streams directly to th
 
 ## Journey definitions
 
-Strict YAML, compiled at startup into a digest-addressed set ([Journey definition](docs/design.md#journey-definition)); `configs/journeys.yaml` is a working example.
+Strict YAML, compiled from the bundle by `agent-platform activate` into a digest-addressed set stored in PostgreSQL ([Journey definition](docs/design.md#journey-definition)); `configs/journeys.yaml` is a working example.
 
 ```yaml
 conversation_prompt: conversation.md
@@ -54,7 +54,7 @@ See [Human waits and approvals](docs/design.md#human-waits-and-approvals).
 
 - **Markers:** `requested` (at the wait), `decided` (at the reply, no network I/O), `dispatched` (at the guard, exactly once), `denied`, `superseded` (the catalog, product version, schema, name or definition set changed).
 - **Journey-bound.** An approval is consumed only under the journey it was proposed in. If that journey is no longer available the model sees `{"error":"approval_superseded"}` and nothing is dispatched.
-- **`policy_conflict`.** One operation key or alias carrying different effective policies in two journeys is a compile error for op selectors; for tag matches it is detected at bind time and the affected journey is unavailable.
+- **`policy_conflict`.** One operation key carrying different effective policies in two journeys is a compile error for op selectors (alias consistency is checked first, so an alias conflict is reported as the operation-key conflict); for tag matches an operation key or alias conflict is detected at bind time and the affected journey is unavailable.
 - **Continuation target.** A reply continuation whose target journey is no longer available does not fail the run; the target is simply not activated and the approval guard decides.
 - **Run scope first.** Every `Wait` requires the run's scope to be recorded (`RecordRunScope`: product version, endpoint, settings) beforehand.
 - A clarification supplies information only; it never authorizes an action and it survives a product-version flip.
@@ -92,8 +92,8 @@ See [Rollout](docs/design.md#journey-definition) and [Definitions](docs/design.m
 
 - A conversation pins a definition set by digest. An **idle** conversation (no pending interaction, not a reply continuation, no unresolved operation) re-pins to the current set at its next run start and a `definition_changed` event records the old and new digest. A conversation that is not idle keeps its pin, because approval bindings include the set digest.
 - **Bounded readiness.** A pod is Ready when it serves the current set plus every set referenced by an open wait (a pending interaction, or a consumed one whose continuation has not finished) or by an unresolved operation. Idle conversations do not count. This replaces the older "retain every pinned set" rule.
-- Keep older configs loadable with `AGENT_PLATFORM_RETAINED_CONFIGS` (comma-separated paths to the same YAML schema) for as long as such conversations exist. Any journey or config change must keep the previous config retained until then; otherwise the pod is not Ready or a continuation fails closed. A retained config with an old schema (for example a multi-alternative op selector without `alias:`, or `class:` on a tag selector) no longer compiles.
-- Definitions are loaded once at startup; changing a mounted file needs a restart.
+- Older sets stay in the definition store, so nothing is retained by configuration. A pod loads and compiles any stored digest on demand and never reads local definition files. A stored set with an old schema (for example a multi-alternative op selector without `alias:`, or `class:` on a tag selector) no longer compiles, so the pod is not Ready or a continuation fails closed.
+- Definitions reach the store only through `agent-platform activate --bundle <dir>`, run as an init container, and are forward-only; `activate --rollback --bundle <dir>` is the explicit operator rollback.
 
 ## Configuration
 
@@ -101,11 +101,9 @@ Secrets (`DATABASE_URL`, model credentials) come from Secret references, never c
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `DATABASE_URL` | yes | none | PostgreSQL connection string (migrations run at startup) |
+| `DATABASE_URL` | yes | none | PostgreSQL connection string (migrations run at startup); also holds the definition store |
 | `AGENT_PLATFORM_PORT` | yes | none | Listener port (1 to 65535) |
 | `AGENT_PLATFORM_SHUTDOWN_GRACE` | yes | none | Graceful shutdown duration, for example `25s` |
-| `AGENT_PLATFORM_CONFIG` | yes | none | Current definitions YAML |
-| `AGENT_PLATFORM_RETAINED_CONFIGS` | no | none | Comma-separated older definitions YAML paths |
 | `AGENT_PLATFORM_HISTORY_BUDGET` | yes | none | `model=tokens` pairs; must include the configured model |
 | `AGENT_PLATFORM_TENANT_DIRECTORY` | yes | none | Tenant directory YAML: tenant to `product_version` and `endpoint` ID |
 | `AGENT_PLATFORM_MCP_ENDPOINTS` | yes | none | Endpoint allowlist `id=url[,id2=url2]`; URLs live only here |

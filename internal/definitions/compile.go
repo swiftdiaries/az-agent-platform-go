@@ -7,7 +7,6 @@ import (
 	"io"
 	"io/fs"
 	"net/textproto"
-	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -133,18 +132,8 @@ func sanitizeDecodeError(err error) error {
 	return errors.New("decode journey config: invalid YAML")
 }
 
-// Compile reads a YAML journey configuration and its skill bundles from the
-// OS filesystem and compiles them into a content-addressed Set.
-func Compile(path string) (*Set, error) {
-	root, err := filepath.EvalSymlinks(filepath.Dir(path))
-	if err != nil {
-		return nil, fmt.Errorf("read journey config: %w", err)
-	}
-	return compileSource(&source{fsys: os.DirFS(root), diskRoot: root}, filepath.Base(path))
-}
-
-// CompileBundle compiles a Bundle held in memory with the same rules and
-// error messages as Compile. The result does not alias b.
+// CompileBundle compiles a Bundle held in memory into a content-addressed
+// Set. The result does not alias b.
 func CompileBundle(b Bundle) (*Set, error) {
 	if err := validateBundle(b); err != nil {
 		return nil, err
@@ -152,12 +141,12 @@ func CompileBundle(b Bundle) (*Set, error) {
 	if _, ok := b[BundleConfig]; !ok {
 		return nil, fmt.Errorf("bundle requires %s", BundleConfig)
 	}
-	return compileSource(&source{fsys: bundleFS(b)}, BundleConfig)
+	return compileSource(&source{fsys: bundleFS(b)})
 }
 
-// compileSource compiles the configuration file configName at the root of src.
-func compileSource(src *source, configName string) (*Set, error) {
-	data, err := src.readConfig(configName)
+// compileSource compiles the BundleConfig file at the root of src.
+func compileSource(src *source) (*Set, error) {
+	data, err := src.readConfig(BundleConfig)
 	if err != nil {
 		return nil, fmt.Errorf("read journey config: %w", err)
 	}
@@ -229,7 +218,7 @@ func compileSource(src *source, configName string) (*Set, error) {
 	if set.digest, err = setDigest(catalog, conversationPrompt, digests); err != nil {
 		return nil, err
 	}
-	if set.bundle, err = src.bundle(configName, data); err != nil {
+	if set.bundle, err = src.bundle(data); err != nil {
 		return nil, err
 	}
 	return set, nil
@@ -513,15 +502,6 @@ func policyClassRank(c Class) int {
 	return 2
 }
 
-func selectorPolicy(s Selector) effectivePolicy {
-	p := effectivePolicy{class: s.Class, approval: s.ApprovalRequired}
-	if p.class == "" {
-		p.class = ClassEffectful
-	}
-	p.approval = p.approval || p.class != ClassReadOnly
-	return p
-}
-
 // journeyPolicies merges the op selectors of a journey per key the way
 // catalog resolution does: strictest class, approval OR-ed.
 func journeyPolicies(j Journey) map[string]effectivePolicy {
@@ -571,14 +551,15 @@ func checkAliasOps(set *Set) error {
 	return nil
 }
 
-// checkPolicyConflicts rejects one operation key, or one alias, carrying
-// different effective policies in different journeys. Tag selectors are
+// checkPolicyConflicts rejects one operation key carrying different effective
+// policies in different journeys. Alias consistency (checkAliasOps) runs
+// first, so an alias names the same operation keys everywhere and an alias
+// policy conflict is always an operation-key conflict. Tag selectors are
 // checked at bind time.
 func checkPolicyConflicts(set *Set) error {
 	ids := append([]string(nil), set.order...)
 	sort.Strings(ids)
 	byKey := map[string]map[string]effectivePolicy{}
-	byAlias := map[string]map[string]effectivePolicy{}
 	for _, id := range ids {
 		for key, p := range journeyPolicies(set.journeys[id]) {
 			if byKey[key] == nil {
@@ -586,37 +567,23 @@ func checkPolicyConflicts(set *Set) error {
 			}
 			byKey[key][id] = p
 		}
-		for _, s := range set.journeys[id].Tools {
-			if s.Alias == "" {
+	}
+	keys := make([]string, 0, len(byKey))
+	for key := range byKey {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		var first string
+		for _, id := range ids {
+			p, ok := byKey[key][id]
+			if !ok {
 				continue
 			}
-			if byAlias[s.Alias] == nil {
-				byAlias[s.Alias] = map[string]effectivePolicy{}
-			}
-			byAlias[s.Alias][id] = selectorPolicy(s)
-		}
-	}
-	for _, group := range []struct {
-		kind string
-		m    map[string]map[string]effectivePolicy
-	}{{"operation", byKey}, {"alias", byAlias}} {
-		names := make([]string, 0, len(group.m))
-		for name := range group.m {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			var first string
-			for _, id := range ids {
-				p, ok := group.m[name][id]
-				if !ok {
-					continue
-				}
-				if first == "" {
-					first = id
-				} else if p != group.m[name][first] {
-					return fmt.Errorf("definitions: %s %q has conflicting policies in journeys %s, %s", group.kind, name, first, id)
-				}
+			if first == "" {
+				first = id
+			} else if p != byKey[key][first] {
+				return fmt.Errorf("definitions: operation %q has conflicting policies in journeys %s, %s", key, first, id)
 			}
 		}
 	}

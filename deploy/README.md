@@ -176,8 +176,8 @@ The app reads these variables (see `config/agent-platform.env.example`):
   `X-Agent-Run`, `X-Agent-Journey`, `X-Agent-Cost-Profile`.
 
 Trust rule: with the `headers` gate the enforcement point must accept these
-attribution headers only from Agent (mTLS or network policy); never from
-end-user traffic. The tenancy files sit under `/app/tenancy`. In
+attribution headers only from Agent (mTLS or network policy, see the model
+gateway NetworkPolicy under Kubernetes); never from end-user traffic. The tenancy files sit under `/app/tenancy`. In
 Kubernetes they come from the `agent-platform-tenancy` ConfigMap and
 the definition bundle comes from the per-agent bundle image (see Definition
 rollout).
@@ -269,6 +269,102 @@ bundle source; they do not scale to many agents.
   alone does not move `current`: the old pods return but their init containers
   are forward-only no-ops.
 
+Rollback Job. Example one-off Job (not in `kubernetes.yaml`, because it would
+run on apply). It mirrors the Deployment's `bundle` and `activate` init
+containers with the old bundle image and `--rollback`; the old digest must have
+been activated before. Delete the Job before re-running it.
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: agent-platform-rollback
+  namespace: agent-platform-task-6
+  labels:
+    app.kubernetes.io/name: az-agent-platform
+    app.kubernetes.io/managed-by: task-6
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: az-agent-platform-rollback
+        app.kubernetes.io/managed-by: task-6
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: bundle
+          image: <old-bundle-image>
+          imagePullPolicy: IfNotPresent
+          command: ["cp", "-R", "/bundle/.", "/work/"]
+          volumeMounts:
+            - name: bundle
+              mountPath: /work
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      containers:
+        - name: activate
+          image: az-agent-platform:task-6
+          imagePullPolicy: IfNotPresent
+          args: ["activate", "--rollback", "--bundle", "/bundle"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agent-platform-postgres
+                  key: database-url
+          volumeMounts:
+            - name: bundle
+              mountPath: /bundle
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: bundle
+          emptyDir: {}
+```
+
+Note: the Job's pod label differs from the Deployment's, so the Service does
+not route to it. Its pods are not Agent-labelled either, so the model-gateway
+NetworkPolicy below does not admit them, which is intended since they make no
+model calls.
+
+Model gateway NetworkPolicy. `kubernetes.yaml` ends with a NetworkPolicy
+(`model-gateway-allow-agent-platform`) that restricts ingress to the model
+gateway so only Agent pods can reach it. It exists because, with
+`AGENT_PLATFORM_COST_GATE=headers`, the gateway trusts the `X-Agent-*`
+attribution headers; any other client able to reach the gateway could forge
+them. It is required whenever the headers gate is enabled, until mTLS or a
+service token provides a stronger control.
+
+- The gateway is not deployed by this manifest. The policy assumes it runs in
+  namespace `model-gateway` and its pods are labelled
+  `app.kubernetes.io/name: model-gateway`. Replace both to match your gateway.
+- The `from` element combines a `namespaceSelector`
+  (`kubernetes.io/metadata.name: agent-platform-task-6`) with a `podSelector`
+  (`app.kubernetes.io/name: az-agent-platform`, the Deployment's pod label), so
+  only Agent pods in the task namespace are allowed.
+- It selects the gateway pods, not the Agent pods, so it lives in the
+  gateway's namespace, which must already exist for `kubectl apply` of this file
+  to succeed (this manifest does not create it).
+- It has effect only on a CNI that enforces NetworkPolicy. On one that does not,
+  the object is accepted and silently does nothing.
+- No `ports:` are set because the gateway's model-route port is not defined in
+  this repository; add one to limit ingress to it.
+- NetworkPolicy is L3/L4. If the gateway also serves non-model routes to other
+  clients, this policy cannot separate routes: either give those clients a
+  different gateway instance, or add a route-level control at the gateway.
+
 Cleanup is explicit and task-scoped. Verify the target first, then remove only
 resources labelled `app.kubernetes.io/managed-by=task-6` in the task namespace:
 
@@ -277,7 +373,9 @@ kubectl -n agent-platform-task-6 get all,pvc,configmap,secret -l app.kubernetes.
 kubectl delete namespace agent-platform-task-6
 ```
 
-Deleting the namespace also deletes its task-6 PVC and Secret. Never substitute
+Deleting the namespace also deletes its task-6 PVC and Secret. It does not delete
+the model-gateway NetworkPolicy, which lives in the gateway's namespace; remove it
+with `kubectl -n <gateway-namespace> delete networkpolicy model-gateway-allow-agent-platform`. Never substitute
 the current namespace or a broad cluster-wide selector.
 
 Cluster acceptance still requires real Keycloak, Foundry, Java, image registry,

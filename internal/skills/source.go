@@ -5,11 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
 	"sort"
-	"strings"
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 )
@@ -75,57 +71,9 @@ func (s *Source) Read(name, resource string) (Material, error) {
 			return Material{}, ErrUnavailable
 		}
 	}
-	if file.Root == "" {
-		// Compiled from memory: the compiled bytes are the only copy.
-		if fmt.Sprintf("%x", sha256.Sum256(file.Data)) != file.Digest {
-			return Material{}, ErrChanged
-		}
-		return Material{Name: skill.Name, Resource: resource, SkillDigest: skill.Digest, FileDigest: file.Digest, Body: bytes.Clone(file.Data)}, nil
-	}
-	current, err := secureRead(file)
-	if err != nil || fmt.Sprintf("%x", sha256.Sum256(current)) != file.Digest {
+	// The compiled bytes are the only copy; they must still match their digest.
+	if fmt.Sprintf("%x", sha256.Sum256(file.Data)) != file.Digest {
 		return Material{}, ErrChanged
 	}
 	return Material{Name: skill.Name, Resource: resource, SkillDigest: skill.Digest, FileDigest: file.Digest, Body: bytes.Clone(file.Data)}, nil
-}
-
-func secureRead(file definitions.SkillFile) ([]byte, error) {
-	if !unchangedRoot(file.Root) {
-		return nil, ErrChanged
-	}
-	current := file.Root
-	for _, part := range strings.Split(filepath.Clean(file.Relative), string(filepath.Separator)) {
-		current = filepath.Join(current, part)
-		info, err := os.Lstat(current)
-		if err != nil || info.Mode()&os.ModeSymlink != 0 {
-			return nil, ErrChanged
-		}
-	}
-	root, err := os.OpenRoot(file.Root)
-	if err != nil {
-		return nil, err
-	}
-	defer root.Close()
-	opened, err := root.Open(file.Relative)
-	if err != nil {
-		return nil, err
-	}
-	defer opened.Close()
-	info, err := opened.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() != int64(len(file.Data)) {
-		return nil, ErrChanged
-	}
-	data := make([]byte, info.Size())
-	if _, err := io.ReadFull(opened, data); err != nil {
-		return nil, err
-	}
-	if !unchangedRoot(file.Root) {
-		return nil, ErrChanged
-	}
-	return data, nil
-}
-
-func unchangedRoot(root string) bool {
-	resolved, err := filepath.EvalSymlinks(root)
-	return err == nil && resolved == filepath.Clean(root)
 }

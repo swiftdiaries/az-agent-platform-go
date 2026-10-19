@@ -64,7 +64,7 @@ func compileSet(t *testing.T, journeys ...journeySpec) *definitions.Set {
 	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	set, err := definitions.Compile(path)
+	set, err := compileFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,7 +571,7 @@ func compileTagSet(t *testing.T, specs map[string]string) *definitions.Set {
 	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	set, err := definitions.Compile(path)
+	set, err := compileFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -183,7 +183,7 @@ func activeSet(t *testing.T, pool *pgxpool.Pool, thread string) []string {
 // compileSet compiles the bundle at path.
 func compileSet(t *testing.T, path string) *definitions.Set {
 	t.Helper()
-	set, err := definitions.Compile(path)
+	set, err := compileFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -861,7 +861,7 @@ func TestDefinitionCompilationRejectsUnsafePackages(t *testing.T) {
 			root := t.TempDir()
 			path := writeDefinitionBundle(t, root, "prompt\n")
 			test.edit(t, root)
-			if _, err := definitions.Compile(path); err == nil {
+			if _, err := compileFile(path); err == nil {
 				t.Fatalf("accepted %s", test.name)
 			}
 		})
@@ -924,7 +924,7 @@ func TestDefinitionRejectsAggregateSkillLimits(t *testing.T) {
 			if err := os.WriteFile(path, []byte(config), 0600); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := definitions.Compile(path); err == nil {
+			if _, err := compileFile(path); err == nil {
 				t.Fatal("aggregate skill limit accepted")
 			}
 		})

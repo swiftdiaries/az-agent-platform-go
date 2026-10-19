@@ -188,7 +188,7 @@ func compileHarnessSet(t *testing.T) *definitions.Set {
 		writeFile(t, filepath.Join(dir, "skills", id, "SKILL.md"), "---\nname: "+id+"\ndescription: Does "+id+" things\n---\nBody of "+id+".\n")
 	}
 	writeFile(t, filepath.Join(dir, "skills", "alpha", "guide.md"), "alpha guide\n")
-	set, err := definitions.Compile(filepath.Join(dir, "journeys.yaml"))
+	set, err := compileFile(filepath.Join(dir, "journeys.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}

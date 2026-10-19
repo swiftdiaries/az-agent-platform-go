@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
-
-	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 )
 
 const (
@@ -63,7 +61,7 @@ func aliasesOf(res Resolution) []string {
 }
 
 func TestJourneysResolveAgainstSupportedVersions(t *testing.T) {
-	set, err := definitions.Compile(journeysPath)
+	set, err := compileFile(journeysPath)
 	if err != nil {
 		t.Fatalf("compile journeys: %v", err)
 	}
@@ -122,7 +120,7 @@ func TestJourneysResolveAgainstSupportedVersions(t *testing.T) {
 // TestJourneysResolveAgainstSupportedVersionsDetectsBreakage proves the guard
 // above can fail: breaking a fixture in memory must make Resolve report it.
 func TestJourneysResolveAgainstSupportedVersionsDetectsBreakage(t *testing.T) {
-	set, err := definitions.Compile(journeysPath)
+	set, err := compileFile(journeysPath)
 	if err != nil {
 		t.Fatalf("compile journeys: %v", err)
 	}

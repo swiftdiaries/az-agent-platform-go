@@ -151,15 +151,14 @@ func (r *bundleReader) file(full string) error {
 	return nil
 }
 
-// source is the file tree a compile reads: the OS (diskRoot set) or memory.
-// It records every file read so a Set can reproduce its Bundle.
+// source is the in-memory file tree a compile reads. It records every file
+// read so a Set can reproduce its Bundle.
 type source struct {
-	fsys     fs.FS
-	diskRoot string
-	reads    map[string][]byte
+	fsys  fs.FS
+	reads map[string][]byte
 }
 
-// confine validates relative lexically and (on disk) against symbolic links,
+// confine validates relative lexically and against symbolic links,
 // returning the slash path below base.
 func (src *source) confine(base, relative string) (string, error) {
 	if filepath.IsAbs(relative) || strings.HasPrefix(relative, "/") {
@@ -231,10 +230,7 @@ func (src *source) readConfig(name string) ([]byte, error) {
 }
 
 // bundle assembles the files the compile read plus the config under BundleConfig.
-func (src *source) bundle(configName string, config []byte) (Bundle, error) {
-	if _, clash := src.reads[BundleConfig]; clash && configName != BundleConfig {
-		return nil, fmt.Errorf("a referenced file collides with %s", BundleConfig)
-	}
+func (src *source) bundle(config []byte) (Bundle, error) {
 	out := make(Bundle, len(src.reads)+1)
 	for name, data := range src.reads {
 		out[name] = data
@@ -243,18 +239,9 @@ func (src *source) bundle(configName string, config []byte) (Bundle, error) {
 	return out, nil
 }
 
-// snapshot captures a file read from full. Disk files keep their location so
-// they can be re-checked; memory files carry only the bundle path.
-func (src *source) snapshot(name, full string, data []byte) SkillFile {
-	file := SkillFile{Name: name, Digest: fmt.Sprintf("%x", sha256.Sum256(data)), Data: bytes.Clone(data)}
-	if src.diskRoot == "" {
-		file.Relative = full
-		return file
-	}
-	file.Root = src.diskRoot
-	file.Relative = filepath.FromSlash(full)
-	file.Path = filepath.Join(src.diskRoot, file.Relative)
-	return file
+// snapshot captures the bytes read for a skill file with their digest.
+func (src *source) snapshot(name string, data []byte) SkillFile {
+	return SkillFile{Name: name, Digest: fmt.Sprintf("%x", sha256.Sum256(data)), Data: bytes.Clone(data)}
 }
 
 // bundleFS is a read-only in-memory fs.FS over a validated Bundle.

@@ -436,7 +436,7 @@ flowchart LR
     H6b --> H7["H7 outcome_unknown pin, telemetry,<br/>deploy, docs, CI · S9"]
 ```
 
-Each hop adds at most one forward-only SQL migration. **Numbers are positional:** a migration's version is its index in `migrationNames` (`journal/migrate.go:17`), so a new file takes the next free number when it lands, and a duplicate or skipped number is a silent error. Landed: `000007` H2, `000008` H3, `000009` H4a, `000010` H4b, `000011` H5, `000012` H6 (`000012_usage_limit.sql`); H6b added none. Planned: `000013` F1 (definition store), then `000014` for F3 only if a card needs one.
+Each hop adds at most one forward-only SQL migration. **Numbers are positional:** a migration's version is its index in `migrationNames` (`journal/migrate.go:17`), so a new file takes the next free number when it lands, and a duplicate or skipped number is a silent error. Landed: `000007` H2, `000008` H3, `000009` H4a, `000010` H4b, `000011` H5, `000012` H6 (`000012_usage_limit.sql`); H6b added none. F1 `000013` (`000013_definition_store.sql`); F2 and F3 added none; F4 `000014` (`000014_drop_catalog_latest.sql`, drops the reader-less `agent_catalog_latest`).
 
 ### P0: Prerequisites (orchestrator, before H0)
 

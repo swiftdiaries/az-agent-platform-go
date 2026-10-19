@@ -155,9 +155,6 @@ func TestSnapshotCommitAndPin(t *testing.T) {
 	if _, ok, err := s.ConversationPin(ctx, o); err != nil || ok {
 		t.Fatalf("unpinned: ok=%v err=%v", ok, err)
 	}
-	if _, ok, err := s.LatestSnapshot(ctx, "tenant-a", "p"); err != nil || ok {
-		t.Fatalf("latest before commit: ok=%v err=%v", ok, err)
-	}
 	digest, err := s.CommitSnapshot(ctx, o, sampleSnapshot("2026.2", descsA))
 	if err != nil {
 		t.Fatal(err)
@@ -189,15 +186,9 @@ func TestSnapshotCommitAndPin(t *testing.T) {
 	if ev := catalogEvents(t, s, "t1"); len(ev) != 0 {
 		t.Fatalf("first capture emitted %+v", ev)
 	}
-	latest, ok, err := s.LatestSnapshot(ctx, "tenant-a", "p")
-	if err != nil || !ok || latest.Digest != digest || latest.Tenant != "tenant-a" || latest.ProductVersion != "2026.2" {
-		t.Fatalf("latest = %+v ok=%v err=%v", latest, ok, err)
-	}
-	if _, ok, err := s.LatestSnapshot(ctx, "tenant-a", "other"); err != nil || ok {
-		t.Fatalf("other principal latest: ok=%v err=%v", ok, err)
-	}
-	if _, ok, err := s.LatestSnapshot(ctx, "other", "p"); err != nil || ok {
-		t.Fatalf("other tenant latest: ok=%v err=%v", ok, err)
+	var snaps int
+	if err := s.pool.QueryRow(ctx, "SELECT count(*) FROM agent_catalog_snapshots WHERE digest=$1 AND tenant='tenant-a' AND principal='p' AND product_version='2026.2'", digest).Scan(&snaps); err != nil || snaps != 1 {
+		t.Fatalf("snapshot row count = %d %v", snaps, err)
 	}
 }
 
@@ -307,9 +298,9 @@ func TestSnapshotPinIsPerConversation(t *testing.T) {
 	if err != nil || d1 == d2 {
 		t.Fatalf("d2 = %s %v", d2, err)
 	}
-	latest, ok, err := s.LatestSnapshot(ctx, "tenant-a", "p")
-	if err != nil || !ok || latest.Digest != d2 {
-		t.Fatalf("latest = %+v ok=%v err=%v", latest, ok, err)
+	pin2, ok, err := s.ConversationPin(ctx, o2)
+	if err != nil || !ok || pin2.Digest != d2 || pin2.ProductVersion != "2026.3" {
+		t.Fatalf("t2 pin: %+v ok=%v err=%v", pin2, ok, err)
 	}
 	pin, ok, err := s.ConversationPin(ctx, o1)
 	if err != nil || !ok || pin.Digest != d1 || pin.ProductVersion != "2026.2" {
