@@ -18,6 +18,22 @@ services:
     volumes:
       - agent-platform-task-6-pgdata:/var/lib/postgresql/data
 
+  # One-shot: stores the bundle in PostgreSQL and makes it current, then exits.
+  activate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: az-agent-platform:task-6
+    command: ["activate", "--bundle", "/bundle"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+    volumes:
+      - ../configs:/bundle:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   agent-platform:
     build:
       context: ..
@@ -28,13 +44,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      activate:
+        condition: service_completed_successfully
     expose:
       - "8080"
     environment:
       AGENT_PLATFORM_PORT: "8080"
       AGENT_PLATFORM_SHUTDOWN_GRACE: 25s
-      AGENT_PLATFORM_CONFIG: /app/configs/journeys.yaml
-      AGENT_PLATFORM_RETAINED_CONFIGS: ""
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
       AGENT_PLATFORM_MCP_ENDPOINTS: ${AGENT_PLATFORM_MCP_ENDPOINTS:?set AGENT_PLATFORM_MCP_ENDPOINTS}
       AGENT_PLATFORM_CREDENTIAL_HEADERS: ${AGENT_PLATFORM_CREDENTIAL_HEADERS:-Cookie,Authorization}

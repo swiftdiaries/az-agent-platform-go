@@ -129,10 +129,15 @@ type acceptanceReplica struct {
 	stop func()
 }
 
+// startAcceptanceReplica starts one replica. A non-nil set is installed in the
+// store first (the first installed set becomes current); a nil set installs nothing.
 func startAcceptanceReplica(t *testing.T, pool *pgxpool.Pool, set *definitions.Set, model agentruntime.Model, tenancy agentruntime.Tenancy) acceptanceReplica {
 	t.Helper()
+	if set != nil {
+		installSets(t, pool, set)
+	}
 	app, err := service.New(service.Dependencies{
-		Pool: pool, Definitions: set, Authenticator: acceptanceTokens, Model: model,
+		Pool: pool, Authenticator: acceptanceTokens, Model: model,
 		CredentialHeaders: acceptanceCredentialHeaders, CostGate: tenancy.Cost,
 		Directory: tenancy.Directory, Endpoints: tenancy.Endpoints, Settings: tenancy.Settings,
 		HistoryBudget: tenancy.HistoryBudget,
@@ -224,7 +229,8 @@ func acceptanceThreadFor(t *testing.T, pool *pgxpool.Pool, principal, external s
 }
 
 // threeReplicas starts replicas A, B and C as separate in-process Service
-// instances sharing one database, definition set and model.
+// instances sharing one database, definition set and model. A non-nil set is
+// installed in the store before the replicas start; a nil set installs nothing.
 func threeReplicas(t *testing.T, pool *pgxpool.Pool, set *definitions.Set, model agentruntime.Model, tenancy agentruntime.Tenancy) (a, b, c acceptanceReplica) {
 	t.Helper()
 	a = startAcceptanceReplica(t, pool, set, model, tenancy)

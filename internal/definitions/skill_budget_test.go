@@ -73,43 +73,6 @@ func TestSkillSnapshotsAreSharedAndCallerImmutable(t *testing.T) {
 	}
 }
 
-func TestSkillBudgetRejectsTooManyRetainedBundles(t *testing.T) {
-	root := t.TempDir()
-	writeSkillBudgetFiles(t, root)
-	bundleCount := MaxCompiledSkillFiles / 2
-	sets := make([]*Set, bundleCount+1)
-	for i := range sets {
-		path := writeSkillBudgetConfigWithJourneys(t, root, fmt.Sprintf("journeys-%03d.yaml", i), i, 1)
-		set, err := Compile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		sets[i] = set
-	}
-
-	retained, err := Retain(sets[0], sets[1:bundleCount]...)
-	if err != nil {
-		t.Fatalf("rejected retained bundles at aggregate file limit: %v", err)
-	}
-	if retained.skillFiles != MaxCompiledSkillFiles {
-		t.Fatalf("retained skill file budget = %d, want %d", retained.skillFiles, MaxCompiledSkillFiles)
-	}
-	retained, err = Retain(sets[0], sets[1:]...)
-	if err == nil {
-		t.Fatal("accepted retained skill bundles beyond aggregate file limit")
-	}
-	if !strings.Contains(err.Error(), "retained skill bundles exceed aggregate limits") {
-		t.Fatalf("unexpected aggregate limit error: %v", err)
-	}
-	if retained != nil {
-		t.Fatal("returned a set after exceeding the retained budget")
-	}
-
-	if _, err := Retain(sets[0], sets[1], sets[1]); err != nil {
-		t.Fatalf("reloading an already retained bundle consumed budget: %v", err)
-	}
-}
-
 func TestCompileRejectsAggregateSkillLimitInOneSet(t *testing.T) {
 	root := t.TempDir()
 	writeSkillBudgetFiles(t, root)

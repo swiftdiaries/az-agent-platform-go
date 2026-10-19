@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/defstore"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
@@ -179,30 +180,49 @@ func activeSet(t *testing.T, pool *pgxpool.Pool, thread string) []string {
 	return ids
 }
 
-// compileSet compiles path and, when retained paths are given, retains their
-// journey versions in the returned set.
-func compileSet(t *testing.T, path string, retained ...string) *definitions.Set {
+// compileSet compiles the bundle at path.
+func compileSet(t *testing.T, path string) *definitions.Set {
 	t.Helper()
-	current, err := definitions.Compile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(retained) == 0 {
-		return current
-	}
-	var old []*definitions.Set
-	for _, p := range retained {
-		set, err := definitions.Compile(p)
-		if err != nil {
-			t.Fatal(err)
-		}
-		old = append(old, set)
-	}
-	set, err := definitions.Retain(current, old...)
+	set, err := definitions.Compile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return set
+}
+
+// installSets stores each set's bundle under its digest. When no set is current
+// yet, the first one becomes current (what the activate entry point does in
+// production; there is no implicit bootstrap).
+func installSets(t *testing.T, pool *pgxpool.Pool, sets ...*definitions.Set) {
+	t.Helper()
+	store := journal.New(pool)
+	for _, set := range sets {
+		if err := store.PutDefinitionSet(t.Context(), set.Digest(), set.Bundle()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(sets) == 0 {
+		return
+	}
+	if _, err := store.CurrentDefinition(t.Context()); errors.Is(err, journal.ErrDefinition) {
+		if err := store.ActivateDefinition(t.Context(), "", sets[0].Digest(), func(string) bool { return true }); err != nil {
+			t.Fatal(err)
+		}
+	} else if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// storedDefinitions installs sets and returns a loader over the pool's store.
+func storedDefinitions(t *testing.T, pool *pgxpool.Pool, sets ...*definitions.Set) agentruntime.Definitions {
+	t.Helper()
+	installSets(t, pool, sets...)
+	return defstore.NewLoader(journal.New(pool))
+}
+
+// servedOnly is a served predicate that accepts exactly the given digests.
+func servedOnly(digests ...string) func(string) bool {
+	return func(d string) bool { return slices.Contains(digests, d) }
 }
 
 func TestVersionActivationRepinsIdleSessions(t *testing.T) {
@@ -211,16 +231,14 @@ func TestVersionActivationRepinsIdleSessions(t *testing.T) {
 	oldPath := writeDefinitionBundle(t, oldRoot, "old prompt\n")
 	newPath := writeDefinitionBundle(t, newRoot, "new prompt\n")
 	oldRegistry := compileSet(t, oldPath)
-	registry := compileSet(t, newPath, oldPath)
+	registry := compileSet(t, newPath)
 	oldDigest, newDigest := oldRegistry.Digest(), registry.Digest()
 	if oldDigest == newDigest {
 		t.Fatal("old and new set digests must differ")
 	}
 	pool := database(t)
 	store := journal.New(pool)
-	if err := store.ActivateDefinition(ctx, "", oldDigest, oldRegistry.Serves); err != nil {
-		t.Fatal(err)
-	}
+	defs := storedDefinitions(t, pool, oldRegistry, registry) // the old set becomes current
 	changes := func(thread string) (count int, oldSeen, newSeen string) {
 		t.Helper()
 		if err := pool.QueryRow(ctx, "SELECT count(*), COALESCE(min(detail->>'old_digest'),''), COALESCE(min(detail->>'new_digest'),'') FROM agent_events WHERE thread_id=$1 AND kind='definition_changed'", thread).Scan(&count, &oldSeen, &newSeen); err != nil {
@@ -232,9 +250,9 @@ func TestVersionActivationRepinsIdleSessions(t *testing.T) {
 	// The first run resolves before the activation and the activation lands while it
 	// runs: the run stays on the set it resolved.
 	model := &scriptedModel{}
-	runner := agentruntime.NewRunner(registry, model, testTenancy(t, keyedEndpoint(t, "lookup")))
+	runner := agentruntime.NewRunner(defs, model, testTenancy(t, keyedEndpoint(t, "lookup")))
 	model.script(func(r agentruntime.ModelRequest) agentruntime.ModelResponse {
-		if err := store.ActivateDefinition(ctx, oldDigest, newDigest, registry.Serves); err != nil {
+		if err := store.ActivateDefinition(ctx, oldDigest, newDigest, servedOnly(oldDigest, newDigest)); err != nil {
 			t.Errorf("activation during the run: %v", err)
 		}
 		return textStep("done")(r)
@@ -296,20 +314,19 @@ func TestVersionActivationRepinsIdleSessions(t *testing.T) {
 	if got := activeSet(t, pool, "old-thread"); !slices.Equal(got, []string{"planner"}) {
 		t.Fatalf("old session active set = %v", got)
 	}
-	if err := store.ActivateDefinition(ctx, oldDigest, oldDigest, registry.Serves); !errors.Is(err, journal.ErrDefinition) {
-		t.Fatalf("stale activation = %v", err)
+	if err := store.ActivateDefinition(ctx, oldDigest, oldDigest, servedOnly(oldDigest, newDigest)); !errors.Is(err, journal.ErrDefinitionSuperseded) {
+		t.Fatalf("stale activation of the already-activated old set = %v, want ErrDefinitionSuperseded", err)
 	}
 	if current, err := store.CurrentDefinition(ctx); err != nil || current != newDigest {
 		t.Fatalf("failed activation changed current = %q, %v", current, err)
 	}
 
 	// No conversation is non-idle, so the old bundle is no longer needed.
-	candidateOnly := compileSet(t, newPath)
-	if ready, err := store.DefinitionsReady(ctx, candidateOnly.Serves); err != nil || !ready {
+	if ready, err := store.DefinitionsReady(ctx, servedOnly(newDigest)); err != nil || !ready {
 		t.Fatalf("readiness with only the new set and no non-idle conversation = %v, %v", ready, err)
 	}
-	if ready, err := store.DefinitionsReady(ctx, registry.Serves); err != nil || !ready {
-		t.Fatalf("complete retained bundle readiness = %v, %v", ready, err)
+	if ready, err := store.DefinitionsReady(ctx, servedOnly(oldDigest, newDigest)); err != nil || !ready {
+		t.Fatalf("readiness serving both sets = %v, %v", ready, err)
 	}
 	if ready, err := store.DefinitionsReady(ctx, func(string) bool { return false }); err != nil || ready {
 		t.Fatalf("readiness serving nothing = %v, %v", ready, err)
@@ -323,15 +340,13 @@ func TestVersionActivationNonIdleSessionNeedsOldSet(t *testing.T) {
 	oldPath := writeDefinitionBundle(t, t.TempDir(), "old prompt\n")
 	newPath := writeDefinitionBundle(t, t.TempDir(), "new prompt\n")
 	oldRegistry := compileSet(t, oldPath)
-	registry := compileSet(t, newPath, oldPath)
+	registry := compileSet(t, newPath)
 	oldDigest, newDigest := oldRegistry.Digest(), registry.Digest()
 	pool := database(t)
 	store := journal.New(pool)
-	if err := store.ActivateDefinition(ctx, "", oldDigest, oldRegistry.Serves); err != nil {
-		t.Fatal(err)
-	}
+	defs := storedDefinitions(t, pool, oldRegistry, registry) // the old set becomes current
 	model := &scriptedModel{}
-	runner := agentruntime.NewRunner(registry, model, testTenancy(t, keyedEndpoint(t, "lookup")))
+	runner := agentruntime.NewRunner(defs, model, testTenancy(t, keyedEndpoint(t, "lookup")))
 	model.script(callStep("ask", "request_user_input", `{"questions":[{"id":"q","header":"Where","question":"Which city?","options":[{"label":"A","description":"a"},{"label":"B","description":"b"}]}]}`))
 	command := journal.Command{ThreadID: "waiting-thread", RunID: "waiting-run", CommunicationID: "waiting-command", Principal: "alice", Tenant: testTenant, Text: "plan", TargetJourney: "planner"}
 	if _, _, err := store.Admit(ctx, command); err != nil {
@@ -350,15 +365,14 @@ func TestVersionActivationNonIdleSessionNeedsOldSet(t *testing.T) {
 	if output, err := runner.Run(ctx, input); err != nil || !output.Waiting {
 		t.Fatalf("run = %#v, %v", output, err)
 	}
-	if err := store.ActivateDefinition(ctx, oldDigest, newDigest, registry.Serves); err != nil {
+	if err := store.ActivateDefinition(ctx, oldDigest, newDigest, servedOnly(oldDigest, newDigest)); err != nil {
 		t.Fatal(err)
 	}
-	candidateOnly := compileSet(t, newPath)
-	if ready, err := store.DefinitionsReady(ctx, candidateOnly.Serves); err != nil || ready {
+	if ready, err := store.DefinitionsReady(ctx, servedOnly(newDigest)); err != nil || ready {
 		t.Fatalf("readiness with only the new set while a conversation is non-idle on the old one = %v, %v", ready, err)
 	}
-	if ready, err := store.DefinitionsReady(ctx, registry.Serves); err != nil || !ready {
-		t.Fatalf("complete retained bundle readiness = %v, %v", ready, err)
+	if ready, err := store.DefinitionsReady(ctx, servedOnly(oldDigest, newDigest)); err != nil || !ready {
+		t.Fatalf("readiness serving both sets = %v, %v", ready, err)
 	}
 }
 
@@ -370,18 +384,14 @@ func TestCrossJourneyActivationCannotMutateCurrentOrPin(t *testing.T) {
 	secondJourneyPath := writeTwoJourneyBundle(t, secondJourneyRoot)
 	oldRegistry := compileSet(t, oldPath)
 	secondJourneyRegistry := compileSet(t, secondJourneyPath)
-	// This replica retains the old bundle but not the two-journey bundle.
-	registry := compileSet(t, currentPath, oldPath)
+	registry := compileSet(t, currentPath)
 	oldDigest, currentDigest, unservedDigest := oldRegistry.Digest(), registry.Digest(), secondJourneyRegistry.Digest()
-	if registry.Serves(unservedDigest) {
-		t.Fatal("replica unexpectedly serves the two-journey set")
-	}
+	// This replica serves the old and current bundles but not the two-journey bundle.
+	serves := servedOnly(oldDigest, currentDigest)
 	pool := database(t)
 	store := journal.New(pool)
-	if err := store.ActivateDefinition(ctx, "", oldDigest, registry.Serves); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.ActivateDefinition(ctx, oldDigest, unservedDigest, registry.Serves); !errors.Is(err, journal.ErrDefinition) {
+	installSets(t, pool, oldRegistry, registry) // the old set becomes current
+	if err := store.ActivateDefinition(ctx, oldDigest, unservedDigest, serves); !errors.Is(err, journal.ErrDefinition) {
 		t.Fatalf("unserved activation = %v", err)
 	}
 	var current string
@@ -392,7 +402,7 @@ func TestCrossJourneyActivationCannotMutateCurrentOrPin(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_conversations WHERE definition_digest IS NOT NULL").Scan(&pins); err != nil || pins != 0 {
 		t.Fatalf("unserved activation created pins = %d, %v", pins, err)
 	}
-	if err := store.ActivateDefinition(ctx, oldDigest, currentDigest, registry.Serves); err != nil {
+	if err := store.ActivateDefinition(ctx, oldDigest, currentDigest, serves); err != nil {
 		t.Fatalf("retained activation = %v", err)
 	}
 	if err := pool.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current").Scan(&current); err != nil || current != currentDigest {
@@ -402,7 +412,7 @@ func TestCrossJourneyActivationCannotMutateCurrentOrPin(t *testing.T) {
 	if _, err := pool.Exec(ctx, "UPDATE agent_definition_current SET definition_digest=$1", unservedDigest); err != nil {
 		t.Fatal(err)
 	}
-	if ready, err := store.DefinitionsReady(ctx, registry.Serves); err != nil || ready {
+	if ready, err := store.DefinitionsReady(ctx, serves); err != nil || ready {
 		t.Fatalf("unserved current readiness = %v, %v", ready, err)
 	}
 	command := journal.Command{ThreadID: "mismatched-current", RunID: "mismatched-current", CommunicationID: "mismatched-current", Principal: "alice", Tenant: testTenant, Text: "plan"}
@@ -410,7 +420,7 @@ func TestCrossJourneyActivationCannotMutateCurrentOrPin(t *testing.T) {
 		t.Fatal(err)
 	}
 	owner := claimForTest(t, store, command, false)
-	if _, err := store.ResolveDefinition(ctx, owner, currentDigest, registry.Serves); !errors.Is(err, journal.ErrDefinition) {
+	if _, err := store.ResolveDefinition(ctx, owner, serves); !errors.Is(err, journal.ErrDefinition) {
 		t.Fatalf("unserved current resolution = %v", err)
 	}
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM agent_conversations WHERE id=$1 AND definition_digest IS NOT NULL", command.ThreadID).Scan(&pins); err != nil || pins != 0 {
@@ -422,11 +432,9 @@ func TestCrossJourneyActivationCannotMutateCurrentOrPin(t *testing.T) {
 	two := compileSet(t, secondJourneyPath)
 	twoPool := database(t)
 	twoStore := journal.New(twoPool)
-	if err := twoStore.ActivateDefinition(ctx, "", two.Digest(), two.Serves); err != nil {
-		t.Fatal(err)
-	}
+	twoDefs := storedDefinitions(t, twoPool, two)
 	model := &scriptedModel{}
-	runner := agentruntime.NewRunner(two, model, testTenancy(t, keyedEndpoint(t, "lookup_destination", "lookup_shift")))
+	runner := agentruntime.NewRunner(twoDefs, model, testTenancy(t, keyedEndpoint(t, "lookup_destination", "lookup_shift")))
 	pinOf := func(thread string) string {
 		t.Helper()
 		var pin *string
@@ -499,7 +507,8 @@ func TestDeclarativeJourneyActivation(t *testing.T) {
 	pool := database(t)
 	store := journal.New(pool)
 	model := &scriptedModel{}
-	runner := agentruntime.NewRunner(registry, model, testTenancy(t, keyedEndpoint(t, "lookup_destination", "lookup_shift")))
+	defs := storedDefinitions(t, pool, registry)
+	runner := agentruntime.NewRunner(defs, model, testTenancy(t, keyedEndpoint(t, "lookup_destination", "lookup_shift")))
 	builtins := []string{"request_user_input", "activate_journey"}
 
 	t.Run("no target offers only activation", func(t *testing.T) {
@@ -681,7 +690,7 @@ func TestDeclarativeJourneyActivation(t *testing.T) {
 
 	t.Run("unavailable journeys are hidden and cannot be targeted", func(t *testing.T) {
 		// This endpoint publishes only alpha's operation.
-		partial := agentruntime.NewRunner(registry, model, testTenancy(t, keyedEndpoint(t, "lookup_destination")))
+		partial := agentruntime.NewRunner(defs, model, testTenancy(t, keyedEndpoint(t, "lookup_destination")))
 		model.script(activateStep("beta"), textStep("ok"))
 		if _, err := converse(t, store, partial, "partial", "partial-1", "hello", ""); err != nil {
 			t.Fatal(err)
@@ -706,6 +715,7 @@ func TestDeclarativeJourneyActivation(t *testing.T) {
 func TestResolveDefinitionRejectsOwnerExpiredWhileWaitingForRollout(t *testing.T) {
 	pool := database(t)
 	store := journal.New(pool)
+	installSets(t, pool, compileSet(t, writeDefinitionBundle(t, t.TempDir(), "prompt\n"))) // a current set exists
 	command := journal.Command{ThreadID: "definition-owner", RunID: "definition-owner", CommunicationID: "definition-owner", Principal: "alice", Tenant: testTenant, Text: "plan"}
 	if _, _, err := store.Admit(t.Context(), command); err != nil {
 		t.Fatal(err)
@@ -724,7 +734,7 @@ func TestResolveDefinitionRejectsOwnerExpiredWhileWaitingForRollout(t *testing.T
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := store.ResolveDefinition(context.Background(), owner, strings.Repeat("a", 64), func(string) bool { return true })
+		_, err := store.ResolveDefinition(context.Background(), owner, func(string) bool { return true })
 		done <- err
 	}()
 	waitDatabase(t, pool, "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted)")
@@ -764,26 +774,29 @@ func TestDefinitionCompilationIsImmutableAndContentAddressed(t *testing.T) {
 	first.Tools[0].Ops[0] = "mutated"
 	first.Tools[0].Class = definitions.ClassEffectful
 	first.Skills[0].Instructions.Data[0] = 'X'
-	pinnedSet, ok := old.Version(old.Digest())
-	if !ok {
-		t.Fatal("compiled set does not serve its own digest")
-	}
-	again, ok := pinnedSet.Journey("planner")
+	again, ok := old.Journey("planner")
 	if !ok || again.Tools[0].Ops[0] != "lookup" || again.Tools[0].Class != definitions.ClassReadOnly || string(again.Skills[0].Instructions.Data) != "---\nname: planner\ndescription: Plan a trip\n---\nold prompt\n" {
 		t.Fatalf("caller mutation changed compiled definition: %#v", again)
 	}
 
+	// Sets with different content stay distinct side by side in the store, and
+	// each loads back to its own content.
 	newRoot := t.TempDir()
 	newPath := writeDefinitionBundle(t, newRoot, "new prompt\n")
-	registry := compileSet(t, newPath, oldPath)
+	registry := compileSet(t, newPath)
+	if registry.Digest() == old.Digest() {
+		t.Fatal("old and new sets share a digest")
+	}
+	pool := database(t)
+	defs := storedDefinitions(t, pool, old, registry)
 	current, _ := registry.Journey("planner")
-	retainedSet, ok := registry.Version(old.Digest())
-	if !ok || !registry.Serves(old.Digest()) || registry.Digest() == old.Digest() {
-		t.Fatalf("old set not retained distinctly: ok=%v", ok)
+	retainedSet, err := defs.Load(t.Context(), old.Digest())
+	if err != nil {
+		t.Fatal(err)
 	}
 	retained, ok := retainedSet.Journey("planner")
 	if !ok || retained.Prompt != "old prompt" || current.Digest == retained.Digest {
-		t.Fatalf("retained versions: current=%#v old=%#v", current, retained)
+		t.Fatalf("stored versions: current=%#v old=%#v", current, retained)
 	}
 }
 
@@ -855,33 +868,30 @@ func TestDefinitionCompilationRejectsUnsafePackages(t *testing.T) {
 	}
 }
 
-// TestDefinitionRetainsVersionCatalogBinding checks that a retained journey
+// TestDefinitionRetainsVersionCatalogBinding checks that a stored older journey
 // version keeps its own tool selection and class, not the current set's.
 func TestDefinitionRetainsVersionCatalogBinding(t *testing.T) {
 	oldPath := writeBundleConfig(t, t.TempDir(), "old prompt\n", "legacy_lookup", "read_only")
 	newPath := writeBundleConfig(t, t.TempDir(), "new prompt\n", "current_lookup", "")
 	old := compileSet(t, oldPath)
 	oldJourney, _ := old.Journey("planner")
-	registry := compileSet(t, newPath, oldPath)
-	retainedSet, ok := registry.Version(old.Digest())
-	if !ok || !registry.Serves(old.Digest()) {
-		t.Fatal("old set not retained")
+	registry := compileSet(t, newPath)
+	defs := storedDefinitions(t, database(t), old, registry)
+	retainedSet, err := defs.Load(t.Context(), old.Digest())
+	if err != nil {
+		t.Fatal(err)
 	}
 	retained, ok := retainedSet.Journey("planner")
 	if !ok || retained.Digest != oldJourney.Digest || len(retained.Tools) != 1 || retained.Tools[0].Ops[0] != "legacy_lookup" || retained.Tools[0].Class != definitions.ClassReadOnly {
-		t.Fatalf("retained binding = %#v, %v", retained.Tools, ok)
+		t.Fatalf("stored old binding = %#v, %v", retained.Tools, ok)
 	}
-	current, _ := registry.Journey("planner")
-	if current.Tools[0].Ops[0] != "current_lookup" || current.Tools[0].Class != "" {
+	currentSet, err := defs.Load(t.Context(), registry.Digest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, ok := currentSet.Journey("planner")
+	if !ok || current.Tools[0].Ops[0] != "current_lookup" || current.Tools[0].Class != "" {
 		t.Fatalf("current tools = %#v", current.Tools)
-	}
-	currentSet, ok := registry.Version(registry.Digest())
-	if !ok || !registry.Serves(registry.Digest()) {
-		t.Fatal("current set not served")
-	}
-	pinnedCurrent, ok := currentSet.Journey("planner")
-	if !ok || pinnedCurrent.Tools[0].Ops[0] != "current_lookup" {
-		t.Fatalf("current pinned = %#v, %v", pinnedCurrent.Tools, ok)
 	}
 }
 

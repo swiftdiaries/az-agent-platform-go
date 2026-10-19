@@ -28,7 +28,7 @@ func TestServiceDrainRejectsNewAdmissionAndInterruptsExpiredOwner(t *testing.T) 
 	defer mcpHandler.Close()
 
 	root := t.TempDir()
-	registry := compileSet(t, writeDefinitionBundle(t, root, "prompt\n"))
+	installSets(t, pool, compileSet(t, writeDefinitionBundle(t, root, "prompt\n")))
 
 	started := make(chan struct{})
 	cancelled := make(chan struct{})
@@ -41,7 +41,6 @@ func TestServiceDrainRejectsNewAdmissionAndInterruptsExpiredOwner(t *testing.T) 
 	tenancy := testTenancy(t, mcpHandler.URL)
 	app, err := service.New(service.Dependencies{
 		Pool:              pool,
-		Definitions:       registry,
 		Authenticator:     acceptanceTokens,
 		Model:             model,
 		CredentialHeaders: []string{"Authorization"},
@@ -150,10 +149,10 @@ func TestServiceShutdownBoundsBlockedAdmissionAndClaim(t *testing.T) {
 		t.Run(barrier.name, func(t *testing.T) {
 			pool := database(t)
 			root := t.TempDir()
-			registry := compileSet(t, writeDefinitionBundle(t, root, "prompt\n"))
+			installSets(t, pool, compileSet(t, writeDefinitionBundle(t, root, "prompt\n")))
 			tenancy := testTenancy(t, "http://127.0.0.1:1")
 			app, err := service.New(service.Dependencies{
-				Pool: pool, Definitions: registry, Authenticator: acceptanceTokens,
+				Pool: pool, Authenticator: acceptanceTokens,
 				Directory: tenancy.Directory, Endpoints: tenancy.Endpoints, Settings: tenancy.Settings,
 				Model: modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 					return agentruntime.ModelResponse{}, nil

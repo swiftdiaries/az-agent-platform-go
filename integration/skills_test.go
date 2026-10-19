@@ -113,7 +113,7 @@ func TestSkillCatalogAndControlledReads(t *testing.T) {
 	pool := database(t)
 	store := journal.New(pool)
 	model := &scriptedModel{}
-	runner := agentruntime.NewRunner(registry, model, testTenancy(t, keyedEndpoint(t, "lookup_destination", "lookup_shift", "lookup_plain")))
+	runner := agentruntime.NewRunner(storedDefinitions(t, pool, registry), model, testTenancy(t, keyedEndpoint(t, "lookup_destination", "lookup_shift", "lookup_plain")))
 	builtins := []string{"request_user_input", "activate_journey"}
 	read := func(id, journey, resource string) func(agentruntime.ModelRequest) agentruntime.ModelResponse {
 		return callStep(id, "read_skill_resource", `{"journey":"`+journey+`","resource":"`+resource+`"}`)
@@ -184,18 +184,23 @@ func TestSkillCatalogAndControlledReads(t *testing.T) {
 		}
 	})
 
-	t.Run("a file changed after compilation fails the run", func(t *testing.T) {
+	t.Run("a file changed on disk after compilation is ignored by the stored copy", func(t *testing.T) {
+		// The run loads the set from the store, whose copy is immutable and never re-read
+		// from disk; the disk-level ErrChanged check is covered by the "package" subtest.
 		if err := os.WriteFile(filepath.Join(root, "skills/planner/guide.md"), []byte("changed\n"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		model.script(read("guide", "vacation-planner", "guide.md"), textStep("never"))
-		_, err := converse(t, store, runner, "changed", "changed-1", "plan", "vacation-planner")
-		if !errors.Is(err, platformskills.ErrChanged) {
-			t.Fatalf("changed resource run = %v", err)
+		model.script(read("guide", "vacation-planner", "guide.md"), textStep("done"))
+		output, err := converse(t, store, runner, "changed", "changed-1", "plan", "vacation-planner")
+		if err != nil || output.Answer != "done" {
+			t.Fatalf("run over a stored set whose disk file changed = %#v, %v", output, err)
 		}
 		requests := model.taken()
-		if len(requests) != 1 {
-			t.Fatalf("model requests after a failed read = %d", len(requests))
+		if len(requests) != 2 {
+			t.Fatalf("model requests = %d, want 2", len(requests))
+		}
+		if got := results(t, requests[1])["guide"]; got != `"Prefer direct routes.\n"` {
+			t.Fatalf("read returned %s, want the stored content", got)
 		}
 		// The instructions come from the compiled definition, not the disk.
 		if !strings.Contains(requests[0].Instructions, "vacation system") {
@@ -368,11 +373,12 @@ func TestJourneyDefinitionTargetsAndMaterializesContext(t *testing.T) {
 	vacation, _ := registry.Journey("vacation-planner")
 	shift, _ := registry.Journey("shift-swap")
 	var requests []agentruntime.ModelRequest
-	runner := agentruntime.NewRunner(registry, modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	pool := database(t)
+	runner := agentruntime.NewRunner(storedDefinitions(t, pool, registry), modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		requests = append(requests, request)
 		return agentruntime.ModelResponse{Text: strings.Join(request.ActiveJourneys, "+") + " answer"}, nil
 	}), testTenancy(t, keyedEndpoint(t, "lookup_destination", "lookup_shift")))
-	store := journal.New(database(t))
+	store := journal.New(pool)
 	run := func(id, text, target string) {
 		t.Helper()
 		command := journal.Command{ThreadID: "thread", RunID: id, CommunicationID: id, Principal: "alice", Tenant: testTenant, Text: text, TargetJourney: target}
@@ -477,7 +483,7 @@ func TestJourneyDefinitionTargetsAndMaterializesContext(t *testing.T) {
 	}
 }
 
-func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
+func TestVersionAwaitingSessionUsesStoredProviderBundle(t *testing.T) {
 	sdk := mcp.NewServer(&mcp.Implementation{Name: "versions", Version: "1"}, nil)
 	mcp.AddTool(sdk, keyedTool("lookup", "lookup"), func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
 		return nil, struct{}{}, nil
@@ -489,13 +495,12 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 	}
 	oldPath, newPath := makeVersion("old skill body"), makeVersion("new skill body")
 	oldRegistry := compileSet(t, oldPath)
-	registry := compileSet(t, newPath, oldPath)
+	registry := compileSet(t, newPath)
 	oldJourney, _ := oldRegistry.Journey("planner")
 	newJourney, _ := registry.Journey("planner")
-	store := journal.New(database(t))
-	if err := store.ActivateDefinition(t.Context(), "", oldRegistry.Digest(), registry.Serves); err != nil {
-		t.Fatal(err)
-	}
+	pool := database(t)
+	store := journal.New(pool)
+	defs := storedDefinitions(t, pool, oldRegistry, registry) // the old set becomes current
 	var requests []agentruntime.ModelRequest
 	model := modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		requests = append(requests, request)
@@ -504,7 +509,7 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 		}
 		return agentruntime.ModelResponse{Text: "done"}, nil
 	})
-	service := platform.New(agentruntime.NewRunner(registry, model, testTenancy(t, endpoint.URL)), store)
+	service := platform.New(agentruntime.NewRunner(defs, model, testTenancy(t, endpoint.URL)), store)
 	command := platform.Command{ThreadID: "retained", RunID: "wait", CommunicationID: "wait", Principal: "alice", Tenant: testTenant, Text: "ask", TargetJourney: "planner"}
 	if _, err := service.Submit(t.Context(), command, credential.Credential{}); err != nil {
 		t.Fatal(err)
@@ -520,11 +525,11 @@ func TestVersionAwaitingSessionUsesRetainedProviderBundle(t *testing.T) {
 		t.Fatal("missing clarification")
 	}
 	service.Close()
-	if err := store.ActivateDefinition(t.Context(), oldRegistry.Digest(), registry.Digest(), registry.Serves); err != nil {
+	if err := store.ActivateDefinition(t.Context(), oldRegistry.Digest(), registry.Digest(), servedOnly(oldRegistry.Digest(), registry.Digest())); err != nil {
 		t.Fatal(err)
 	}
 
-	replacement := platform.New(agentruntime.NewRunner(registry, model, testTenancy(t, endpoint.URL)), store)
+	replacement := platform.New(agentruntime.NewRunner(defs, model, testTenancy(t, endpoint.URL)), store)
 	t.Cleanup(replacement.Close)
 	reply := platform.Command{ThreadID: "retained", RunID: "reply", CommunicationID: "reply", Principal: "alice", Tenant: testTenant, InteractionID: interaction.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
 	if _, err := replacement.Submit(t.Context(), reply, credential.Credential{}); err != nil {
@@ -566,7 +571,7 @@ func TestSkillRuntimeLoadsOnlySelectedMaterial(t *testing.T) {
 	pool := database(t)
 	store := journal.New(pool)
 	model := &scriptedModel{}
-	runner := agentruntime.NewRunner(registry, model, testTenancy(t, keyedEndpoint(t, "lookup_destination", "lookup_shift", "lookup_plain")))
+	runner := agentruntime.NewRunner(storedDefinitions(t, pool, registry), model, testTenancy(t, keyedEndpoint(t, "lookup_destination", "lookup_shift", "lookup_plain")))
 	// The model activates three journeys in turn; the limit is 2, so the third
 	// activation evicts the least recently used one.
 	model.script(activateStep("vacation-planner"), activateStep("shift-swap"), activateStep("plain"), textStep("done"))

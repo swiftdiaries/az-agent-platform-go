@@ -89,7 +89,7 @@ func TestHITLQuestionShape(t *testing.T) {
 func TestHITLDurableWaitReply(t *testing.T) {
 	pool := database(t)
 	store := journal.New(pool)
-	runner := fixtureRunner(t, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	runner := fixtureRunner(t, pool, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		if len(r.ToolResults) == 0 {
 			return agentruntime.ModelResponse{ToolCall: questionCall("question")}, nil
 		}
@@ -285,7 +285,7 @@ func TestHITLSeparateProcessAfterWaitAndReplyCommit(t *testing.T) {
 			}
 			return
 		}
-		p := platform.New(fixtureRunner(t, modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+		p := platform.New(fixtureRunner(t, pool, modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 			return agentruntime.ModelResponse{ToolCall: questionCall("process-call")}, nil
 		})), store)
 		defer p.Close()
@@ -338,7 +338,7 @@ func TestHITLSeparateProcessAfterWaitAndReplyCommit(t *testing.T) {
 		t.Fatal("reaper destroyed never-started continuation", state, epoch, continuations, commands, err)
 	}
 	var models atomic.Int32
-	p := platform.New(fixtureRunner(t, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	p := platform.New(fixtureRunner(t, pool, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		models.Add(1)
 		if len(r.ToolResults) != 1 || r.ToolResults[0].CallID != "process-call" {
 			t.Errorf("lost correlated result: %+v", r.ToolResults)
@@ -363,7 +363,7 @@ func TestReplyChatProjectionAndOutstandingOrdering(t *testing.T) {
 	pool := database(t)
 	const providerCallID = "provider-only-sentinel"
 	var models atomic.Int32
-	runner := fixtureRunner(t, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	runner := fixtureRunner(t, pool, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		if models.Add(1) == 1 {
 			return agentruntime.ModelResponse{ToolCalls: []agentruntime.ToolCall{*questionCall(providerCallID), {CallID: "sibling", Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}}, nil
 		}
@@ -459,7 +459,7 @@ func TestHITLCompletedToolNotReplayed(t *testing.T) {
 			return agentruntime.ModelResponse{Text: "resumed without replay"}, nil
 		}
 	})
-	p := platform.New(policyRunner(t, backend.URL, "read_only", model), journal.New(pool))
+	p := platform.New(policyRunner(t, pool, backend.URL, "read_only", model), journal.New(pool))
 	c := platform.Command{ThreadID: "replay", RunID: "replay", CommunicationID: "replay", Principal: "alice", Tenant: testTenant, Text: "go", TargetJourney: "planner"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
@@ -467,7 +467,7 @@ func TestHITLCompletedToolNotReplayed(t *testing.T) {
 	s := awaitState(t, p, c.ThreadID, c.RunID, journal.RunAwaitingInput)
 	i := s.Runs[0].Interaction
 	p.Close()
-	p2 := platform.New(policyRunner(t, backend.URL, "read_only", model), journal.New(pool))
+	p2 := platform.New(policyRunner(t, pool, backend.URL, "read_only", model), journal.New(pool))
 	defer p2.Close()
 	reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", Tenant: testTenant, InteractionID: i.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
 	if _, err := p2.Submit(t.Context(), reply, credential.Credential{}); err != nil {
@@ -541,18 +541,19 @@ func TestApprovalSupersededOnDefinitionSetChange(t *testing.T) {
 	xPath := writeBundleConfig(t, t.TempDir(), "prompt X\n", lookupAlias, "")
 	yPath := writeBundleConfig(t, t.TempDir(), "prompt Y\n", lookupAlias, "")
 	setX := compileSet(t, xPath)
-	setY := compileSet(t, yPath, xPath)
+	setY := compileSet(t, yPath)
 	if setX.Digest() == setY.Digest() {
 		t.Fatal("sets must differ")
 	}
-	runnerX := agentruntime.NewRunner(setX, lookupModel(), testTenancy(t, backend.URL))
-	runnerY := agentruntime.NewRunner(setY, lookupModel(), testTenancy(t, backend.URL))
+	defs := storedDefinitions(t, pool, setX, setY) // X becomes current
+	runnerX := agentruntime.NewRunner(defs, lookupModel(), testTenancy(t, backend.URL))
+	runnerY := agentruntime.NewRunner(defs, lookupModel(), testTenancy(t, backend.URL))
 	i := waitForApproval(t, runnerX, pool, "rollout")
 	// The configuration rolls to Y. A reply continuation never idle-re-pins (M6), so the
 	// re-pin is forced here by clearing the conversation pin: the continuation then pins
 	// to current Y, and the approval granted under X must be superseded, not dispatched.
 	store := journal.New(pool)
-	if err := store.ActivateDefinition(t.Context(), setX.Digest(), setY.Digest(), setY.Serves); err != nil {
+	if err := store.ActivateDefinition(t.Context(), setX.Digest(), setY.Digest(), servedOnly(setX.Digest(), setY.Digest())); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(t.Context(), "UPDATE agent_conversations SET definition_digest=NULL WHERE id='rollout'"); err != nil {
@@ -584,22 +585,22 @@ func TestApprovalKeepsPinOnReplyContinuation(t *testing.T) {
 	xPath := writeBundleConfig(t, t.TempDir(), "prompt X\n", lookupAlias, "")
 	yPath := writeBundleConfig(t, t.TempDir(), "prompt Y\n", lookupAlias, "")
 	setX := compileSet(t, xPath)
-	setXY := compileSet(t, yPath, xPath)
 	setY := compileSet(t, yPath)
-	if setX.Digest() == setXY.Digest() {
+	if setX.Digest() == setY.Digest() {
 		t.Fatal("sets must differ")
 	}
-	runnerX := agentruntime.NewRunner(setX, lookupModel(), testTenancy(t, backend.URL))
+	defs := storedDefinitions(t, pool, setX, setY) // X becomes current
+	runnerX := agentruntime.NewRunner(defs, lookupModel(), testTenancy(t, backend.URL))
 	i := waitForApproval(t, runnerX, pool, "rollout")
 	store := journal.New(pool)
 	// The pending approval pins the conversation to X: Y alone cannot be activated.
-	if err := store.ActivateDefinition(t.Context(), setX.Digest(), setXY.Digest(), setY.Serves); !errors.Is(err, journal.ErrDefinition) {
+	if err := store.ActivateDefinition(t.Context(), setX.Digest(), setY.Digest(), servedOnly(setY.Digest())); !errors.Is(err, journal.ErrDefinition) {
 		t.Fatalf("activation serving only Y = %v, want ErrDefinition", err)
 	}
-	if err := store.ActivateDefinition(t.Context(), setX.Digest(), setXY.Digest(), setXY.Serves); err != nil {
+	if err := store.ActivateDefinition(t.Context(), setX.Digest(), setY.Digest(), servedOnly(setX.Digest(), setY.Digest())); err != nil {
 		t.Fatal(err)
 	}
-	runnerXY := agentruntime.NewRunner(setXY, lookupModel(), testTenancy(t, backend.URL))
+	runnerXY := agentruntime.NewRunner(defs, lookupModel(), testTenancy(t, backend.URL))
 	p := platform.New(runnerXY, store)
 	defer p.Close()
 	approve(t, p, "rollout", i, "reply")
@@ -642,7 +643,7 @@ func TestApprovalSupersededWhenJourneyUnavailable(t *testing.T) {
 	tenancy := testTenancy(t, backend.URL)
 	directory := tenancy.Directory.(*tenantdir.Mutable)
 	directory.Set(testTenant, tenantdir.Entry{ProductVersion: "2026.2", EndpointID: testEndpointID})
-	runner := agentruntime.NewRunner(compileSet(t, path), lookupModel(), tenancy)
+	runner := agentruntime.NewRunner(storedDefinitions(t, pool, compileSet(t, path)), lookupModel(), tenancy)
 	i := waitForApproval(t, runner, pool, "moved")
 	// The tenant moves to a product version that excludes the journey.
 	directory.Set(testTenant, tenantdir.Entry{ProductVersion: "2026.5", EndpointID: testEndpointID})

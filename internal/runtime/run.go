@@ -98,7 +98,7 @@ type Model interface {
 }
 
 type Runner struct {
-	set     *definitions.Set
+	defs    Definitions
 	model   Model
 	tenancy Tenancy
 }
@@ -163,8 +163,14 @@ type RunOutput struct {
 	ToolName  string
 }
 
-func NewRunner(set *definitions.Set, model Model, tenancy Tenancy) *Runner {
-	return &Runner{set: set, model: model, tenancy: tenancy}
+// Definitions serves compiled definition sets by set digest (defstore.Loader in production).
+type Definitions interface {
+	Load(ctx context.Context, digest string) (*definitions.Set, error)
+	Served(digest string) bool // no I/O: called inside journal transactions
+}
+
+func NewRunner(defs Definitions, model Model, tenancy Tenancy) *Runner {
+	return &Runner{defs: defs, model: model, tenancy: tenancy}
 }
 
 // Scope resolves directory, then allowlist, then settings, and records them on
@@ -228,27 +234,64 @@ func unavailable(ctx context.Context, err error) error {
 // Ready verifies only durable definition availability. It deliberately does
 // not contact a provider or MCP server.
 func (r *Runner) Ready(ctx context.Context, store *journal.Store) (bool, error) {
-	if r == nil || r.set == nil || store == nil {
+	if r == nil || r.defs == nil || store == nil {
 		return false, journal.ErrDefinition
 	}
-	return store.DefinitionsReady(ctx, r.set.Serves)
+	digests, err := store.ReferencedDefinitions(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, digest := range digests {
+		if _, err := r.defs.Load(ctx, digest); err != nil {
+			if errors.Is(err, journal.ErrDefinition) {
+				return false, nil
+			}
+			return false, err
+		}
+	}
+	return store.DefinitionsReady(ctx, r.defs.Served)
 }
+
+// bindingAttempts bounds the load-and-retry loop of Binding.
+const bindingAttempts = 3
 
 // Binding resolves the conversation's pinned definition set (or the database
 // current pointer for a new one). There is no routing: the journey it returns is
 // the explicit target when one is given and present in the pinned set, and ""
 // otherwise (the conversation's active set decides what the model can use).
 func (r *Runner) Binding(ctx context.Context, in RunInput) (string, string, error) {
-	if r == nil || r.set == nil || in.Store == nil {
+	if r == nil || r.defs == nil || in.Store == nil {
 		return "", "", journal.ErrDefinition
 	}
-	digest, err := in.Store.ResolveDefinition(ctx, in.Owner, r.set.Digest(), r.set.Serves)
+	var digest string
+	for attempt := 1; ; attempt++ {
+		// The served predicate runs inside a journal transaction, so it only
+		// records what is missing; the loads happen between attempts.
+		var missing []string
+		served := func(d string) bool {
+			if r.defs.Served(d) {
+				return true
+			}
+			missing = append(missing, d)
+			return false
+		}
+		var err error
+		digest, err = in.Store.ResolveDefinition(ctx, in.Owner, served)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, journal.ErrDefinition) || len(missing) == 0 || attempt >= bindingAttempts {
+			return "", "", err
+		}
+		for _, d := range missing {
+			if _, err := r.defs.Load(ctx, d); err != nil {
+				return "", "", err
+			}
+		}
+	}
+	set, err := r.defs.Load(ctx, digest)
 	if err != nil {
 		return "", "", err
-	}
-	set, ok := r.set.Version(digest)
-	if !ok {
-		return "", "", journal.ErrDefinition
 	}
 	if in.TargetJourney == "" {
 		return "", digest, nil
@@ -263,8 +306,8 @@ func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
 	if !input.Endpoint.Valid() {
 		return RunOutput{}, fmt.Errorf("%w: no allowlisted endpoint", ErrDependencyUnavailable)
 	}
-	set, ok := r.set.Version(input.DefinitionDigest)
-	if !ok {
+	set, err := r.defs.Load(ctx, input.DefinitionDigest)
+	if err != nil {
 		return RunOutput{}, journal.ErrDefinition
 	}
 	if input.TargetJourney != "" {

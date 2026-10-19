@@ -17,6 +17,7 @@ import (
 
 	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/defstore"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/pgtest"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/settings"
@@ -238,7 +239,13 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	h.owner = owner
-	h.runner = NewRunner(h.set, h.model, Tenancy{})
+	if err := h.store.PutDefinitionSet(ctx, h.set.Digest(), h.set.Bundle()); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.ActivateDefinition(ctx, "", h.set.Digest(), func(string) bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+	h.runner = NewRunner(defstore.NewLoader(h.store), h.model, Tenancy{})
 	return h
 }
 

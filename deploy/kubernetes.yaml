@@ -30,10 +30,6 @@ metadata:
 data:
   AGENT_PLATFORM_PORT: "8080"
   AGENT_PLATFORM_SHUTDOWN_GRACE: 25s
-  AGENT_PLATFORM_CONFIG: /app/configs/journeys.yaml
-  # Retained configs must be the YAML schema and mounted alongside the current
-  # journeys.yaml; conversations stay pinned to older digests.
-  AGENT_PLATFORM_RETAINED_CONFIGS: ""
   KEYCLOAK_JWT_ISSUER: <required-keycloak-issuer>
   KEYCLOAK_JWKS_URL: <required-keycloak-jwks-url>
   KEYCLOAK_JWT_AUDIENCE: <required-keycloak-audience>
@@ -59,34 +55,6 @@ data:
   OTEL_SERVICE_NAME: az-agent-platform
   OTEL_SERVICE_VERSION: <required-release-version>
   OTEL_EXPORTER_OTLP_ENDPOINT: ""
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: agent-platform-journeys
-  namespace: agent-platform-task-6
-  labels:
-    app.kubernetes.io/name: az-agent-platform
-    app.kubernetes.io/managed-by: task-6
-immutable: true
-data:
-  journeys.yaml: |
-    conversation_prompt: conversation.md
-    catalog:
-      operation_meta_key: operation_key
-      call_id_header: X-Platform-Call-ID
-    journeys:
-      - id: vacation-planner
-        skill: skills/planner
-        tools:
-          - op: lookup_destination
-            class: read_only
-      - id: shift-swap
-        skill: skills/shift-swap
-        tools:
-          - op: lookup_shift
-            class: read_only
-          - op: request_shift_swap
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -249,6 +217,42 @@ spec:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
+      initContainers:
+        # Copies this release's definition bundle out of the bundle image
+        # (docker build --target bundle). Alternative: a Kubernetes image
+        # volume mounts the bundle image directly and replaces this copy step.
+        - name: bundle
+          image: <required-bundle-image>
+          imagePullPolicy: IfNotPresent
+          command: ["cp", "-R", "/bundle/.", "/work/"]
+          volumeMounts:
+            - name: bundle
+              mountPath: /work
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+        # Stores the bundle in PostgreSQL and makes it current; idempotent.
+        - name: activate
+          image: az-agent-platform:task-6
+          imagePullPolicy: IfNotPresent
+          args: ["activate", "--bundle", "/bundle"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agent-platform-postgres
+                  key: database-url
+          volumeMounts:
+            - name: bundle
+              mountPath: /bundle
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
       containers:
         - name: agent-platform
           image: az-agent-platform:task-6
@@ -272,10 +276,6 @@ spec:
                   key: headers
                   optional: true
           volumeMounts:
-            - name: journey-config
-              mountPath: /app/configs/journeys.yaml
-              subPath: journeys.yaml
-              readOnly: true
             - name: tenancy-config
               mountPath: /app/tenancy
               readOnly: true
@@ -299,12 +299,8 @@ spec:
             capabilities:
               drop: ["ALL"]
       volumes:
-        - name: journey-config
-          configMap:
-            name: agent-platform-journeys
-            items:
-              - key: journeys.yaml
-                path: journeys.yaml
+        - name: bundle
+          emptyDir: {}
         - name: tenancy-config
           configMap:
             name: agent-platform-tenancy

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
@@ -23,7 +24,7 @@ import (
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
-func fixtureRunner(t *testing.T, model agentruntime.Model) *agentruntime.Runner {
+func fixtureRunner(t *testing.T, pool *pgxpool.Pool, model agentruntime.Model) *agentruntime.Runner {
 	t.Helper()
 	server := mcp.NewServer(&mcp.Implementation{Name: "persistent-fixture", Version: "1"}, nil)
 	mcp.AddTool(server, keyedTool(remoteLookup, lookupAlias), func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
@@ -35,7 +36,7 @@ func fixtureRunner(t *testing.T, model agentruntime.Model) *agentruntime.Runner 
 	if err != nil {
 		t.Fatal(err)
 	}
-	return agentruntime.NewRunner(registry, model, testTenancy(t, endpoint.URL))
+	return agentruntime.NewRunner(storedDefinitions(t, pool, registry), model, testTenancy(t, endpoint.URL))
 }
 
 // A request-scoped run context would cancel the model here. A process-local ID map
@@ -60,7 +61,7 @@ func TestPersistenceDisconnectAndReplacement(t *testing.T) {
 		}
 		return agentruntime.ModelResponse{Text: "Kyoto is remembered"}, nil
 	})
-	runner := fixtureRunner(t, model)
+	runner := fixtureRunner(t, pool, model)
 	service := platform.New(runner, journal.New(pool))
 	t.Cleanup(service.Close)
 	auth := chat.StaticBearerTokens{"token": testPrincipal, "other": "tenant-a/bob"}
@@ -90,7 +91,7 @@ func TestPersistenceDisconnectAndReplacement(t *testing.T) {
 	waitCompleted(t, service, thread, testPrincipal)
 	service.Close()
 	api.Close()
-	replacement := platform.New(fixtureRunner(t, model), journal.New(pool))
+	replacement := platform.New(fixtureRunner(t, pool, model), journal.New(pool))
 	t.Cleanup(replacement.Close)
 	api2 := httptest.NewServer(chat.NewHandler(auth, replacement, pool, []string{"Authorization", "Cookie"}))
 	defer api2.Close()
@@ -303,7 +304,7 @@ func TestReplaySnapshotConcurrentCommit(t *testing.T) {
 func TestReplayHTTPReconnectCursor(t *testing.T) {
 	pool := database(t)
 	var calls atomic.Int64
-	runner := fixtureRunner(t, modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	runner := fixtureRunner(t, pool, modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		calls.Add(1)
 		return agentruntime.ModelResponse{Text: "durable answer"}, nil
 	}))

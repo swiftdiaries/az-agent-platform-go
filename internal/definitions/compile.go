@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/textproto"
 	"os"
 	"path"
@@ -135,7 +136,28 @@ func sanitizeDecodeError(err error) error {
 // Compile reads a YAML journey configuration and its skill bundles from the
 // OS filesystem and compiles them into a content-addressed Set.
 func Compile(path string) (*Set, error) {
-	data, err := readLimited(path, MaxConfigBytes)
+	root, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return nil, fmt.Errorf("read journey config: %w", err)
+	}
+	return compileSource(&source{fsys: os.DirFS(root), diskRoot: root}, filepath.Base(path))
+}
+
+// CompileBundle compiles a Bundle held in memory with the same rules and
+// error messages as Compile. The result does not alias b.
+func CompileBundle(b Bundle) (*Set, error) {
+	if err := validateBundle(b); err != nil {
+		return nil, err
+	}
+	if _, ok := b[BundleConfig]; !ok {
+		return nil, fmt.Errorf("bundle requires %s", BundleConfig)
+	}
+	return compileSource(&source{fsys: bundleFS(b)}, BundleConfig)
+}
+
+// compileSource compiles the configuration file configName at the root of src.
+func compileSource(src *source, configName string) (*Set, error) {
+	data, err := src.readConfig(configName)
 	if err != nil {
 		return nil, fmt.Errorf("read journey config: %w", err)
 	}
@@ -160,18 +182,13 @@ func Compile(path string) (*Set, error) {
 	if len(raw.Journeys) == 0 {
 		return nil, errors.New("at least one journey is required")
 	}
-	root, err := filepath.EvalSymlinks(filepath.Dir(path))
-	if err != nil {
-		return nil, fmt.Errorf("resolve config directory: %w", err)
-	}
-
 	var conversationPrompt string
 	if raw.ConversationPrompt != "" {
-		promptPath, err := confinedPath(root, raw.ConversationPrompt)
+		promptPath, err := src.confine("", raw.ConversationPrompt)
 		if err != nil {
 			return nil, fmt.Errorf("conversation_prompt: %v", err)
 		}
-		data, err := readLimited(promptPath, MaxPromptBytes)
+		data, err := src.read(promptPath, MaxPromptBytes)
 		if err != nil {
 			return nil, fmt.Errorf("conversation_prompt: %v", err)
 		}
@@ -186,7 +203,7 @@ func Compile(path string) (*Set, error) {
 	var digests []string
 	for i, rj := range raw.Journeys {
 		n := i + 1
-		journey, err := compileJourney(root, catalog, n, rj, skills, set)
+		journey, err := compileJourney(src, catalog, n, rj, skills, set)
 		if err != nil {
 			return nil, err
 		}
@@ -210,6 +227,9 @@ func Compile(path string) (*Set, error) {
 		return nil, err
 	}
 	if set.digest, err = setDigest(catalog, conversationPrompt, digests); err != nil {
+		return nil, err
+	}
+	if set.bundle, err = src.bundle(configName, data); err != nil {
 		return nil, err
 	}
 	return set, nil
@@ -240,7 +260,7 @@ func validHeaderToken(s string) bool {
 	return s != ""
 }
 
-func compileJourney(root string, catalog CatalogConfig, n int, rj rawJourney, skills map[string]SkillPackage, set *Set) (Journey, error) {
+func compileJourney(src *source, catalog CatalogConfig, n int, rj rawJourney, skills map[string]SkillPackage, set *Set) (Journey, error) {
 	fail := func(format string, args ...any) (Journey, error) {
 		return Journey{}, fmt.Errorf("journey %d: %s", n, fmt.Sprintf(format, args...))
 	}
@@ -269,7 +289,7 @@ func compileJourney(root string, catalog CatalogConfig, n int, rj rawJourney, sk
 	key := filepath.Clean(rj.Skill)
 	pkg, ok := skills[key]
 	if !ok {
-		if pkg, err = compileBundle(root, rj.Skill); err != nil {
+		if pkg, err = src.compileSkillDir(rj.Skill); err != nil {
 			return fail("skill: %v", err)
 		}
 		bytesUsed, filesUsed := skillFootprint(pkg)
@@ -405,24 +425,24 @@ func compileTools(catalog CatalogConfig, rj rawJourney) ([]Selector, []string, e
 	return tools, deny, nil
 }
 
-// compileBundle compiles the skill bundle rooted at the config-relative path.
-func compileBundle(root, relative string) (SkillPackage, error) {
+// compileSkillDir compiles the skill bundle rooted at the config-relative path.
+func (src *source) compileSkillDir(relative string) (SkillPackage, error) {
 	if clean := filepath.Clean(relative); clean == "." {
 		return SkillPackage{}, errors.New("path must name a bundle directory")
 	}
-	packageRoot, err := confinedPath(root, relative)
+	packageRoot, err := src.confine("", relative)
 	if err != nil {
 		return SkillPackage{}, err
 	}
-	info, err := os.Stat(packageRoot)
+	info, err := fs.Stat(src.fsys, packageRoot)
 	if err != nil || !info.IsDir() {
 		return SkillPackage{}, errors.New("package root is not a directory")
 	}
-	instructionPath, err := confinedPath(packageRoot, "SKILL.md")
+	instructionPath, err := src.confine(packageRoot, "SKILL.md")
 	if err != nil {
 		return SkillPackage{}, err
 	}
-	instructions, err := readLimited(instructionPath, MaxSkillBytes)
+	instructions, err := src.read(instructionPath, MaxSkillBytes)
 	if err != nil {
 		return SkillPackage{}, err
 	}
@@ -431,39 +451,37 @@ func compileBundle(root, relative string) (SkillPackage, error) {
 		return SkillPackage{}, err
 	}
 	var supporting []string
-	if err := enumerateBundle(packageRoot, "", &supporting); err != nil {
+	if err := src.enumerate(packageRoot, "", &supporting); err != nil {
 		return SkillPackage{}, err
 	}
 	sort.Strings(supporting)
-	return compileSkill(root, skillDeclaration{Name: name, Root: relative, SupportingFiles: supporting, AllowSupportingFiles: len(supporting) > 0})
+	return src.compileSkill(skillDeclaration{Name: name, Root: relative, SupportingFiles: supporting, AllowSupportingFiles: len(supporting) > 0})
 }
 
-// enumerateBundle lists regular files below dir (slash-relative), skipping
-// dot-prefixed entries and the top-level SKILL.md, and rejecting symlinks.
-func enumerateBundle(dir, rel string, files *[]string) error {
-	entries, err := os.ReadDir(filepath.Join(dir, filepath.FromSlash(rel)))
+// enumerate lists regular files below dir (slash-relative to dir via rel),
+// skipping dot-prefixed entries and the top-level SKILL.md, and rejecting
+// symlinks.
+func (src *source) enumerate(dir, rel string, files *[]string) error {
+	entries, err := fs.ReadDir(src.fsys, path.Join(dir, rel))
 	if err != nil {
 		return err
 	}
 	for _, entry := range entries {
 		name := entry.Name()
 		relName := path.Join(rel, name)
-		info, err := os.Lstat(filepath.Join(dir, filepath.FromSlash(relName)))
-		if err != nil {
-			return err
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
+		typ := entry.Type()
+		if typ&fs.ModeSymlink != 0 {
 			return errors.New("symbolic links are not allowed in a skill bundle")
 		}
 		if strings.HasPrefix(name, ".") {
 			continue
 		}
 		switch {
-		case info.IsDir():
-			if err := enumerateBundle(dir, relName, files); err != nil {
+		case typ.IsDir():
+			if err := src.enumerate(dir, relName, files); err != nil {
 				return err
 			}
-		case info.Mode().IsRegular():
+		case typ.IsRegular():
 			if relName == "SKILL.md" {
 				continue
 			}

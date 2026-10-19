@@ -75,6 +75,13 @@ func (s *Source) Read(name, resource string) (Material, error) {
 			return Material{}, ErrUnavailable
 		}
 	}
+	if file.Root == "" {
+		// Compiled from memory: the compiled bytes are the only copy.
+		if fmt.Sprintf("%x", sha256.Sum256(file.Data)) != file.Digest {
+			return Material{}, ErrChanged
+		}
+		return Material{Name: skill.Name, Resource: resource, SkillDigest: skill.Digest, FileDigest: file.Digest, Body: bytes.Clone(file.Data)}, nil
+	}
 	current, err := secureRead(file)
 	if err != nil || fmt.Sprintf("%x", sha256.Sum256(current)) != file.Digest {
 		return Material{}, ErrChanged

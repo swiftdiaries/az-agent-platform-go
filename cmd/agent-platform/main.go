@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/textproto"
 	"net/url"
@@ -19,7 +21,7 @@ import (
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/defstore"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/provider/foundry"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/provider/litellm"
@@ -32,8 +34,6 @@ import (
 
 const (
 	envDatabaseURL   = "DATABASE_URL"
-	envConfig        = "AGENT_PLATFORM_CONFIG"
-	envRetained      = "AGENT_PLATFORM_RETAINED_CONFIGS"
 	envPort          = "AGENT_PLATFORM_PORT"
 	envShutdownGrace = "AGENT_PLATFORM_SHUTDOWN_GRACE"
 	envModelProvider = "AZ_AGENT_MODEL_PROVIDER"
@@ -55,8 +55,6 @@ const (
 
 type config struct {
 	databaseURL       string
-	definitionPath    string
-	retainedConfigs   []string
 	port              int
 	grace             time.Duration
 	keycloak          chat.KeycloakConfig
@@ -76,6 +74,11 @@ type config struct {
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	if len(os.Args) > 1 && os.Args[1] == "activate" {
+		code := runActivate(ctx, os.Args[2:], os.Getenv, os.Stdout, os.Stderr)
+		stop()
+		os.Exit(code)
+	}
 	defer stop()
 	if err := run(ctx, os.Getenv); err != nil {
 		// Startup errors intentionally do not expose ConfigMap or Secret values.
@@ -105,10 +108,6 @@ func run(ctx context.Context, lookup func(string) string) error {
 			_ = shutdownTelemetry(shutdownCtx)
 		}
 	}()
-	defs, err := compileDefinitions(config.definitionPath, config.retainedConfigs)
-	if err != nil {
-		return errors.New("invalid definitions")
-	}
 	directory, endpoints, settingsSource, err := loadTenancy(config)
 	if err != nil {
 		return err
@@ -133,7 +132,7 @@ func run(ctx context.Context, lookup func(string) string) error {
 		return errors.New("invalid model configuration")
 	}
 	app, err := service.New(service.Dependencies{
-		Pool: pool, Definitions: defs, Authenticator: authenticator, Model: model,
+		Pool: pool, Authenticator: authenticator, Model: model,
 		CredentialHeaders: config.credentialHeaders, CostGate: config.costGate,
 		Directory: directory, Endpoints: endpoints, Settings: settingsSource,
 		HistoryBudget: config.historyBudget,
@@ -205,10 +204,6 @@ func loadConfig(lookup func(string) string) (config, error) {
 		return value, nil
 	}
 	databaseURL, err := require(envDatabaseURL)
-	if err != nil {
-		return config{}, err
-	}
-	definitionPath, err := require(envConfig)
 	if err != nil {
 		return config{}, err
 	}
@@ -294,8 +289,7 @@ func loadConfig(lookup func(string) string) (config, error) {
 	}
 	return config{
 		tenantDirectoryPath: tenantDirectoryPath, mcpEndpoints: mcpEndpoints, settingsPath: settingsPath,
-		databaseURL: databaseURL, definitionPath: definitionPath,
-		retainedConfigs: splitValues(lookup(envRetained)), port: port, grace: grace, keycloak: keycloak,
+		databaseURL: databaseURL, port: port, grace: grace, keycloak: keycloak,
 		foundryEndpoint: foundryEndpoint, foundryDeployment: foundryDeployment,
 		modelProvider: modelProvider, litellm: litellmConfig,
 		telemetry: telemetryConfig, credentialHeaders: credentialHeaders, costGate: costGate,
@@ -423,20 +417,57 @@ func telemetryHeaders(value string) (map[string]string, error) {
 	return headers, nil
 }
 
-// compileDefinitions compiles the current configuration and every retained one
-// and returns the current set that can also serve the retained journey versions.
-func compileDefinitions(current string, retained []string) (*definitions.Set, error) {
-	set, err := definitions.Compile(current)
+// runActivate implements `agent-platform activate [--rollback] --bundle <dir>`. It is safe to run repeatedly and concurrently
+// (it is the init container of every Agent pod). Failures print one fixed line naming a category; bundle
+// content and the database URL are never printed.
+func runActivate(ctx context.Context, args []string, lookup func(string) string, stdout, stderr io.Writer) int {
+	fail := func(category string) int {
+		fmt.Fprintf(stderr, "agent platform activation failed: %s\n", category)
+		return 1
+	}
+	flags := flag.NewFlagSet("activate", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	bundle := flags.String("bundle", "", "directory holding the definition bundle")
+	rollback := flags.Bool("rollback", false, "move current back to a set activated before")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || strings.TrimSpace(*bundle) == "" {
+		return fail("usage")
+	}
+	databaseURL := strings.TrimSpace(lookup(envDatabaseURL))
+	if databaseURL == "" {
+		return fail("configuration")
+	}
+	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
-		return nil, err
+		return fail("database")
 	}
-	old := make([]*definitions.Set, 0, len(retained))
-	for _, path := range retained {
-		oldSet, err := definitions.Compile(path)
-		if err != nil {
-			return nil, err
-		}
-		old = append(old, oldSet)
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		return fail("database")
 	}
-	return definitions.Retain(set, old...)
+	res, err := defstore.Activate(ctx, pool, *bundle, defstore.Options{Rollback: *rollback})
+	if err != nil {
+		return fail(activateCategory(err))
+	}
+	switch res.Outcome {
+	case defstore.AlreadyCurrent:
+		fmt.Fprintf(stdout, "already current %s\n", res.Digest)
+	case defstore.Superseded:
+		fmt.Fprintf(stdout, "not activated %s: activated before (use --rollback); current %s\n", res.Digest, res.Current)
+	default:
+		fmt.Fprintf(stdout, "activated %s\n", res.Digest)
+	}
+	return 0
+}
+
+// activateCategory names the one fixed stderr category for an Activate failure.
+func activateCategory(err error) string {
+	switch {
+	case errors.Is(err, defstore.ErrDatabase):
+		return "database"
+	case errors.Is(err, defstore.ErrBundle):
+		return "bundle"
+	case errors.Is(err, journal.ErrDefinition):
+		return "unavailable definition"
+	}
+	return "other"
 }

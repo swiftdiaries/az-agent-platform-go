@@ -22,6 +22,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/defstore"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journeys"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/mcptest"
@@ -1556,6 +1557,11 @@ func TestE2EConversationAgent(t *testing.T) {
 		// An apply-then-drop-response effect yields outcome_unknown with no retry and a pinned journey, and the trace carries no content, tool descriptions or remote names.
 		e2eS9(t)
 	})
+	t.Run("S10", func(t *testing.T) {
+		stage(t, 10, "F1")
+		// Definition rollout only through defstore.Activate: D1 then D2 (and D2 again) with no local definition files, every replica Ready, a pending approval finishing on D1, an idle conversation re-pinning to D2 and a new one running on D2.
+		e2eS10(t)
+	})
 }
 
 // e2eOp is one operation both E2E MCP endpoints serve under different remote names.
@@ -2059,10 +2065,10 @@ func e2eS8Repin(t *testing.T) {
 		{"booking", "      - op: book.reserve\n"}, // effectful: needs approval
 	}
 	d1Path, d2Path := e2eS8Path(t, "PROMPT-D1", journeys...), e2eS8Path(t, "PROMPT-D2", journeys...)
-	d1Only, d2Only, both := compileSet(t, d1Path), compileSet(t, d2Path), compileSet(t, d2Path, d1Path)
-	d1, d2 := d1Only.Digest(), d2Only.Digest()
-	if d1 == d2 || both.Digest() != d2 || !both.Serves(d1) || d2Only.Serves(d1) {
-		t.Fatalf("definition sets: d1 %s d2 %s both %s", d1, d2, both.Digest())
+	d1Set, d2Set := compileSet(t, d1Path), compileSet(t, d2Path)
+	d1, d2 := d1Set.Digest(), d2Set.Digest()
+	if d1 == d2 {
+		t.Fatalf("definition sets: d1 %s d2 %s", d1, d2)
 	}
 
 	pool := database(t)
@@ -2076,7 +2082,7 @@ func e2eS8Repin(t *testing.T) {
 		modeltest.Text("x2 done"),                  // 3: the idle conversation after the flip (D2)
 	)
 	const threadX, threadY = "e2e-s8-repin-x", "e2e-s8-repin-y"
-	a, b, _ := threeReplicas(t, pool, d1Only, model, tenancy)
+	a, b, _ := threeReplicas(t, pool, d1Set, model, tenancy)
 
 	e2eS8Finished(t, "X1", e2eS8Chat(t, a, "token", threadX, "e2e-s8-repin-x1", e2eS8Say("plan", "planner")), "x1 done")
 	body := e2eS8Chat(t, b, "token", threadY, "e2e-s8-repin-y1", e2eS8Say("book", "booking"))
@@ -2111,23 +2117,30 @@ func e2eS8Repin(t *testing.T) {
 	}
 
 	// D2 cannot become current from a replica that does not serve D1: Y's pending approval references it.
-	if err := store.ActivateDefinition(ctx, d1, d2, d2Only.Serves); !errors.Is(err, journal.ErrDefinition) {
-		t.Fatalf("activation D1 -> D2 with a D2-only set = %v, want ErrDefinition", err)
+	installSets(t, pool, d2Set) // D1 is already current; D2 is only stored
+	if err := store.ActivateDefinition(ctx, d1, d2, func(d string) bool { return d == d2 }); !errors.Is(err, journal.ErrDefinition) {
+		t.Fatalf("activation D1 -> D2 serving only D2 = %v, want ErrDefinition", err)
 	}
-	if err := store.ActivateDefinition(ctx, d1, d2, both.Serves); err != nil {
+	if err := store.ActivateDefinition(ctx, d1, d2, func(d string) bool { return d == d1 || d == d2 }); err != nil {
 		t.Fatalf("activation D1 -> D2 with D1 and D2 served: %v", err)
 	}
 	if current, err := store.CurrentDefinition(ctx); err != nil || current != d2 {
 		t.Fatalf("current definition = %q, %v, want D2", current, err)
 	}
 
-	// Replicas that serve only D2 are not Ready while the D1 approval is pending.
-	for _, replica := range []acceptanceReplica{a, b} {
-		replica.stop()
+	// The replicas load D1 from the store, so they stay Ready while the D1 approval is pending.
+	if !e2eS8Ready(t, a) || !e2eS8Ready(t, b) {
+		t.Fatal("a replica is not Ready while an approval pinned to D1 is pending, although D1 is stored")
 	}
-	a, b, _ = threeReplicas(t, pool, d2Only, model, tenancy)
-	if e2eS8Ready(t, a) || e2eS8Ready(t, b) {
-		t.Fatal("a D2-only replica is Ready while an approval pinned to D1 is pending")
+	// A set missing from the store keeps a replica not Ready: current is a digest that was never stored.
+	missingPool := database(t)
+	missing := strings.Repeat("e", 64)
+	if err := journal.New(missingPool).ActivateDefinition(ctx, "", missing, func(string) bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+	orphan := startAcceptanceReplica(t, missingPool, nil, model, tenancy)
+	if e2eS8Ready(t, orphan) {
+		t.Fatal("a replica is Ready although the current definition set is missing from the store")
 	}
 	if pinOf(internalY) != d1 {
 		t.Errorf("Y pin while pending = %q, want D1", pinOf(internalY))
@@ -2136,11 +2149,7 @@ func e2eS8Repin(t *testing.T) {
 		t.Errorf("definition_changed events on Y while pending = %d, want 0", count)
 	}
 
-	// Settle the approval on replicas that serve D1 and D2: the continuation still runs on D1.
-	for _, replica := range []acceptanceReplica{a, b} {
-		replica.stop()
-	}
-	a, b, _ = threeReplicas(t, pool, both, model, tenancy)
+	// Settle the approval: the continuation still runs on D1.
 	reply := aguitypes.RunAgentInput{ForwardedProps: map[string]any{"interactionReply": map[string]any{
 		"interactionId": interaction, "kind": "approval",
 		"answer": map[string]any{"decision": "approve", "binding": binding},
@@ -2156,13 +2165,9 @@ func e2eS8Repin(t *testing.T) {
 		t.Errorf("definition_changed events on Y after its continuation = %d, want 0 (a continuation never re-pins)", count)
 	}
 
-	// Nothing is pending any more: D2-only replicas are Ready.
-	for _, replica := range []acceptanceReplica{a, b} {
-		replica.stop()
-	}
-	a, b, _ = threeReplicas(t, pool, d2Only, model, tenancy)
+	// Nothing is pending any more: the replicas are Ready.
 	if !e2eS8Ready(t, a) || !e2eS8Ready(t, b) {
-		t.Fatal("a D2-only replica is not Ready after the approval settled")
+		t.Fatal("a replica is not Ready after the approval settled")
 	}
 
 	// The idle conversation's next message re-pins to D2 with one definition_changed event.
@@ -2427,4 +2432,176 @@ func e2eS9(t *testing.T) {
 	if hits := sentinelSpanHits(spans, needles...); len(hits) > 0 {
 		t.Errorf("spans leaked content: %v", hits)
 	}
+}
+
+// e2eS10 is F1: definitions roll out only through defstore.Activate and replicas serve them from PostgreSQL alone.
+func e2eS10(t *testing.T) {
+	ctx := t.Context()
+	journeys := []e2eS8Journey{
+		{"planner", e2eS8ReadOnly("travel.lookup")},
+		{"booking", "      - op: book.reserve\n"}, // effectful: needs approval
+	}
+	d1Path, d2Path := e2eS8Path(t, "PROMPT-D1", journeys...), e2eS8Path(t, "PROMPT-D2", journeys...)
+	d1Dir, d2Dir := filepath.Dir(d1Path), filepath.Dir(d2Path)
+
+	pool := database(t)
+	store := journal.New(pool)
+	endpoint := mcptest.New(t, mcptest.Options{Name: "e2e-s10", Version: "vN"}, e2eCatalog(func(o e2eOp) string { return o.remoteA }))
+	tenancy := testTenancy(t, endpoint.URL())
+	model := modeltest.New(
+		modeltest.Text("i1 done"),                  // 0: idle conversation on D1
+		modeltest.Call("book_reserve", struct{}{}), // 1: effectful, waits for approval
+		modeltest.Text("booked"),                   // 2: the approved continuation (D1)
+		modeltest.Text("i2 done"),                  // 3: the idle conversation after D2 (re-pinned)
+		modeltest.Text("n1 done"),                  // 4: a new conversation on D2
+	)
+	a, b, c := threeReplicas(t, pool, nil, model, tenancy)
+	replicas := []acceptanceReplica{a, b, c}
+	allReady := func(when string) {
+		t.Helper()
+		for i, replica := range replicas {
+			if !e2eS8Ready(t, replica) {
+				t.Fatalf("replica %d is not Ready %s", i, when)
+			}
+		}
+	}
+	for i, replica := range replicas {
+		if e2eS8Ready(t, replica) {
+			t.Fatalf("replica %d is Ready before any definition set is current", i)
+		}
+	}
+
+	r1, err := defstore.Activate(ctx, pool, d1Dir, defstore.Options{})
+	if err != nil {
+		t.Fatalf("activate D1: %v", err)
+	}
+	if r1.Outcome != defstore.Activated {
+		t.Fatalf("first activation of D1 outcome = %v, want Activated", r1.Outcome)
+	}
+	d1 := r1.Digest
+	if err := os.RemoveAll(d1Dir); err != nil {
+		t.Fatal(err)
+	}
+	allReady("after activating D1 with its directory deleted")
+
+	const threadI, threadW, threadN = "e2e-s10-i", "e2e-s10-w", "e2e-s10-n"
+	e2eS8Finished(t, "I1", e2eS8Chat(t, a, "token", threadI, "e2e-s10-i1", e2eS8Say("plan", "planner")), "i1 done")
+	body := e2eS8Chat(t, b, "token", threadW, "e2e-s10-w1", e2eS8Say("book", "booking"))
+	if !strings.Contains(body, "interaction.requested") {
+		t.Fatalf("W1 lacks the approval request: %s", body)
+	}
+	internalI, internalW := acceptanceThread(t, pool, threadI), acceptanceThread(t, pool, threadW)
+	pinOf := func(thread string) string {
+		t.Helper()
+		var pin string
+		if err := pool.QueryRow(ctx, `SELECT COALESCE(definition_digest,'') FROM agent_conversations WHERE id=$1`, thread).Scan(&pin); err != nil {
+			t.Fatal(err)
+		}
+		return pin
+	}
+	changes := func(thread string) (count int, from, to string) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `SELECT count(*), COALESCE(min(detail->>'old_digest'),''), COALESCE(min(detail->>'new_digest'),'') FROM agent_events WHERE thread_id=$1 AND kind='definition_changed'`, thread).Scan(&count, &from, &to); err != nil {
+			t.Fatal(err)
+		}
+		return count, from, to
+	}
+	if pinOf(internalI) != d1 || pinOf(internalW) != d1 {
+		t.Fatalf("pins before D2: I %q W %q, want both D1 %q", pinOf(internalI), pinOf(internalW), d1)
+	}
+	var interaction, binding string
+	if err := pool.QueryRow(ctx, `SELECT id, COALESCE(artifact->'call'->>'binding','') FROM agent_interactions WHERE thread_id=$1 AND state='pending'`, internalW).Scan(&interaction, &binding); err != nil {
+		t.Fatalf("no pending approval on W: %v", err)
+	}
+	if endpoint.Calls("book/reserve") != 0 {
+		t.Fatal("book/reserve called before approval")
+	}
+
+	r2, err := defstore.Activate(ctx, pool, d2Dir, defstore.Options{})
+	if err != nil {
+		t.Fatalf("activate D2: %v", err)
+	}
+	if r2.Outcome != defstore.Activated {
+		t.Fatalf("activation of D2 outcome = %v, want Activated", r2.Outcome)
+	}
+	d2 := r2.Digest
+	if d2 == d1 {
+		t.Fatalf("D2 digest equals D1 %s", d1)
+	}
+	if current, err := store.CurrentDefinition(ctx); err != nil || current != d2 {
+		t.Fatalf("current after activating D2 = %q, %v, want D2 %q", current, err, d2)
+	}
+	again, err := defstore.Activate(ctx, pool, d2Dir, defstore.Options{})
+	if err != nil || again.Digest != d2 || again.Outcome != defstore.AlreadyCurrent {
+		t.Fatalf("second activate of D2 = %+v, %v, want digest %q AlreadyCurrent", again, err, d2)
+	}
+	if current, err := store.CurrentDefinition(ctx); err != nil || current != d2 {
+		t.Fatalf("current after the second activate = %q, %v, want D2", current, err)
+	}
+	if err := os.RemoveAll(d2Dir); err != nil {
+		t.Fatal(err)
+	}
+	allReady("after activating D2 with both directories deleted")
+
+	// R6 forward-only: re-activating the earlier D1 (same content, same digest) without rollback is reported, not applied.
+	d1Again := filepath.Dir(e2eS8Path(t, "PROMPT-D1", journeys...))
+	stale, err := defstore.Activate(ctx, pool, d1Again, defstore.Options{})
+	if err != nil {
+		t.Fatalf("re-activating D1 without rollback: %v", err)
+	}
+	if stale.Outcome != defstore.Superseded || stale.Digest != d1 || stale.Current != d2 {
+		t.Fatalf("re-activating D1 = %+v, want Superseded digest %q current %q", stale, d1, d2)
+	}
+	if current, err := store.CurrentDefinition(ctx); err != nil || current != d2 {
+		t.Fatalf("current after the superseded D1 activation = %q, %v, want D2 %q", current, err, d2)
+	}
+	if err := os.RemoveAll(d1Again); err != nil {
+		t.Fatal(err)
+	}
+	allReady("after the superseded D1 activation")
+
+	// The pending approval completes on D1 from the store.
+	reply := aguitypes.RunAgentInput{ForwardedProps: map[string]any{"interactionReply": map[string]any{
+		"interactionId": interaction, "kind": "approval",
+		"answer": map[string]any{"decision": "approve", "binding": binding},
+	}}}
+	e2eS8Finished(t, "W2", e2eS8Chat(t, c, "token", threadW, "e2e-s10-w2", reply), "booked")
+	if endpoint.Calls("book/reserve") != 1 {
+		t.Errorf("book/reserve calls after approval = %d, want 1", endpoint.Calls("book/reserve"))
+	}
+	if request := model.Requests()[2]; request.DefinitionDigest != d1 || !strings.Contains(request.Instructions, "PROMPT-D1") {
+		t.Errorf("approved continuation ran on %q, instructions lack PROMPT-D1: %.200q", request.DefinitionDigest, request.Instructions)
+	}
+	if pinOf(internalW) != d1 {
+		t.Errorf("W pin after its continuation = %q, want D1", pinOf(internalW))
+	}
+	if count, _, _ := changes(internalW); count != 0 {
+		t.Errorf("definition_changed events on W = %d, want 0", count)
+	}
+
+	// The idle conversation re-pins to D2 with one definition_changed event.
+	e2eS8Finished(t, "I2", e2eS8Chat(t, a, "token", threadI, "e2e-s10-i2", e2eS8Say("again", "")), "i2 done")
+	if count, from, to := changes(internalI); count != 1 || from != d1 || to != d2 {
+		t.Errorf("definition_changed on I = %d %q -> %q, want 1 %q -> %q", count, from, to, d1, d2)
+	}
+	if request := model.Requests()[3]; request.DefinitionDigest != d2 || !strings.Contains(request.Instructions, "PROMPT-D2") || strings.Contains(request.Instructions, "PROMPT-D1") {
+		t.Errorf("I2 request definition %q, instructions lack PROMPT-D2 or carry PROMPT-D1: %.200q", request.DefinitionDigest, request.Instructions)
+	}
+	if pinOf(internalI) != d2 {
+		t.Errorf("I pin after re-pin = %q, want D2", pinOf(internalI))
+	}
+
+	// A new conversation runs on D2 with no re-pin.
+	e2eS8Finished(t, "N1", e2eS8Chat(t, b, "token", threadN, "e2e-s10-n1", e2eS8Say("plan", "planner")), "n1 done")
+	internalN := acceptanceThread(t, pool, threadN)
+	if request := model.Requests()[4]; request.DefinitionDigest != d2 || !strings.Contains(request.Instructions, "PROMPT-D2") || strings.Contains(request.Instructions, "PROMPT-D1") {
+		t.Errorf("N1 request definition %q, instructions lack PROMPT-D2 or carry PROMPT-D1: %.200q", request.DefinitionDigest, request.Instructions)
+	}
+	if pinOf(internalN) != d2 {
+		t.Errorf("N pin = %q, want D2", pinOf(internalN))
+	}
+	if count, _, _ := changes(internalN); count != 0 {
+		t.Errorf("definition_changed events on N = %d, want 0", count)
+	}
+	allReady("at the end")
 }

@@ -10,7 +10,7 @@ paths, Foundry project endpoint/deployment, Java MCP endpoint, and Azure
 workload identity client ID before starting the service. The Java MCP URL is
 supplied by `AGENT_PLATFORM_MCP_ENDPOINTS`, and the forwarded headers by
 `AGENT_PLATFORM_CREDENTIAL_HEADERS`, not by the journey file. Raw header values
-and database credentials stay outside the journey file and ConfigMap.
+and database credentials stay outside the bundle and ConfigMap.
 
 ## Compose
 
@@ -137,23 +137,21 @@ continue; `RUN_ERROR` means failure. If Langfuse export is enabled, inspect
 received traces for the run's generic spans; trace receipt alone does not prove
 a tool call or business outcome.
 
-The app loads and digests `journeys.yaml`, prompts, and skills at process
-startup; changing a mounted file does not reload a running process. `restart`
-loads changed files, but existing sessions stay pinned to their old digest.
-If a pinned bundle is absent after restart, startup fails closed. For a
-reviewed definition rollout, retain the old immutable bundle and set
-`AGENT_PLATFORM_RETAINED_CONFIGS`; do not overwrite retained files in place.
-The overlay changes only the mount, not activation or retention rules.
+Definitions (`journeys.yaml`, `conversation.md`, `skills/`) are not read by the
+serving process. `agent-platform activate --bundle <dir>` (needs `DATABASE_URL`)
+migrates the database, compiles the bundle, stores the set in PostgreSQL by
+digest, and makes it current. It is idempotent (repeat and concurrent runs for
+the same candidate succeed) and forward-only: it never moves `current` to a set
+that was activated before. It prints `activated <digest>`, `already current
+<digest>` or `not activated <digest>: activated before (use --rollback)`
+(digests only), and exit 0 with the first two means the candidate is current. The base file runs it as the one-shot `activate` service,
+mounting the checkout's `configs/` at `/bundle` read-only; `agent-platform`
+starts only after it completes. The overlay's `configs/` mount is therefore no
+longer used by the app. To roll out a change in Compose, edit `configs/` and
+run `up --build -d`: `activate` re-runs and the replicas keep serving.
 
-Current behaviour, which supersedes the wording above where they differ: the
-conversation prompt (`conversation_prompt`) and each journey's skill package
-are loaded and digested with `journeys.yaml` at startup. Every retained set in
-`AGENT_PLATFORM_RETAINED_CONFIGS` must use the same YAML schema and be mounted
-alongside the current one. Idle conversations re-pin to the current set at
-their next run (`definition_changed`), so a previous set must stay retained only
-while some conversation referencing it has an open wait (a pending interaction
-or an unfinished reply continuation) or an unresolved operation; until then a
-replica without it is not Ready (bounded readiness).
+The serving process loads any stored digest on demand. `/readyz` is 503 until a
+current set exists and every referenced set loads from the store.
 
 ### Tenancy, settings, credentials and cost gate
 
@@ -179,11 +177,10 @@ The app reads these variables (see `config/agent-platform.env.example`):
 
 Trust rule: with the `headers` gate the enforcement point must accept these
 attribution headers only from Agent (mTLS or network policy); never from
-end-user traffic. The tenancy files sit under `/app/tenancy`, not
-`/app/configs`, so the overlay's `configs/` mount does not hide them. In
+end-user traffic. The tenancy files sit under `/app/tenancy`. In
 Kubernetes they come from the `agent-platform-tenancy` ConfigMap and
-`journeys.yaml` from `agent-platform-journeys` (its `conversation.md` and
-`skills/` are baked into the image).
+the definition bundle comes from the per-agent bundle image (see Definition
+rollout).
 
 ### agentgateway profile (BLOCKED)
 
@@ -245,11 +242,32 @@ buffer. A graceful stop fails readiness before draining owned work. A forced
 stop leaves the existing lease/reaper semantics to mark work interrupted; the
 manifest does not add handoff or replay behavior.
 
-Definition rollout is additive: mount a retained, immutable journey ConfigMap
-key at a second `/app/configs/...` subPath and add its path to
-`AGENT_PLATFORM_RETAINED_CONFIGS` before activating the new candidate. Keep old
-keys until no database row references their digest. Do not overwrite a retained
-bundle in place.
+Definition rollout. Build the per-agent bundle image, which holds the repo's
+`configs/` at `/bundle` (`docker build --target bundle -t <bundle-image> .`),
+and set it as the `bundle` init container image (`<required-bundle-image>`).
+Then roll the Deployment. Each new pod's init containers run in order: `bundle`
+copies the bundle into a shared `emptyDir`, and `activate` (agent image, same
+`DATABASE_URL`) stores it and makes it current. (A Kubernetes image volume can
+mount the bundle image directly instead of the copy step.) ConfigMaps are not a
+bundle source; they do not scale to many agents.
+
+- Old pods keep serving their pinned sets from the store and stay Ready while
+  `current` moves, because they can load the new set from the store.
+- Idle conversations re-pin to the new current set at their next run
+  (`definition_changed`). Conversations waiting on an approval finish on their
+  pinned set.
+- A stored digest never changes. The digest covers the compiled meaning, so a
+  comment or formatting edit to `journeys.yaml` keeps the digest; storing it is
+  a no-op that keeps the first stored bytes, not an error.
+- Activation is forward-only. Recreating an older pod re-runs its init
+  containers: `activate` stores nothing new, leaves `current` alone, prints
+  `not activated <digest>: activated before (use --rollback)` and exits 0. The
+  pod still serves its older set from the store.
+- Rollback is an explicit operator action: run a one-off Job that runs
+  `agent-platform activate --rollback --bundle <dir>` with the old bundle
+  (agent image, same `DATABASE_URL`, old bundle image). `kubectl rollout undo`
+  alone does not move `current`: the old pods return but their init containers
+  are forward-only no-ops.
 
 Cleanup is explicit and task-scoped. Verify the target first, then remove only
 resources labelled `app.kubernetes.io/managed-by=task-6` in the task namespace:

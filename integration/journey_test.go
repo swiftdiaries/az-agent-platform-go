@@ -146,8 +146,8 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 		}
 		return agentruntime.ModelResponse{Text: "Kyoto is available"}, nil
 	})
-	runner := agentruntime.NewRunner(registry, model, testTenancy(t, httpMCP.URL))
 	pool := database(t)
+	runner := agentruntime.NewRunner(storedDefinitions(t, pool, registry), model, testTenancy(t, httpMCP.URL))
 	service := platform.New(runner, journal.New(pool))
 	t.Cleanup(service.Close)
 	handler := chat.NewHandler(chat.StaticBearerTokens{"alice-token": testPrincipal, "bob-token": "tenant-a/bob"}, service, pool, []string{"Authorization", "Cookie"})
@@ -632,7 +632,7 @@ func TestJourneyUnavailableRunFailsWithoutModelCall(t *testing.T) {
 			})
 			backend := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
 			defer backend.Close()
-			p := platform.New(policyRunner(t, backend.URL, "read_only", modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+			p := platform.New(policyRunner(t, pool, backend.URL, "read_only", modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 				models.Add(1)
 				return agentruntime.ModelResponse{Text: "must not be asked"}, nil
 			})), journal.New(pool))

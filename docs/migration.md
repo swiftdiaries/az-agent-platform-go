@@ -301,7 +301,7 @@ Denial, timeout, custom text and changed arguments never authorize anything.
 ### Effects, retry, telemetry
 
 - **Effects and retry.** `outcome_unknown` gets no retry and no model re-issue; the run ends and the journey is pinned. Model SDK retry stays disabled. The run has one retry budget, one logical operation ID and distinct attempt IDs. A directory or endpoint failure before dispatch is `dependency_unavailable`.
-- **Trace shape.** Spans are `chat.accept`, `agent.start_turn`, `catalog.resolve`, `model.call` and `mcp.call`. `hub.route` and `journey.run` are removed. Activation is a span event.
+- **Trace shape.** Spans are `chat.accept`, `agent.start_turn`, `catalog.resolve`, `model.call` and `mcp.call`. `hub.route` is removed; `journey.run` is kept (user decision). Activation is a span event.
 - **Attributes.** Opaque IDs, journey IDs, operation key, alias, product version, endpoint ID, catalog digest, active-journey limit, outcome, latency and retries. **No** dynamic tool names, descriptions, content or credentials. A span processor drops `gen_ai.tool.description`.
 
 ### Settings and cost seams
@@ -413,6 +413,7 @@ It runs as ordered subtests:
 | S7 | Runs the **real `litellm` provider** over HTTP against `modeltest.ResponsesServer`, a scripted OpenAI-Responses-compatible stub acting as the enforcement point. It receives `Headers` attribution on every model request (no credential in it). Its 429 `budget_exceeded` → run `limit_exceeded` with `Retry-After`, no retry, no `outcome_unknown`. A `Scripted` `Admit` denial → `limit_exceeded` with zero model requests. `agent_usage` rows match the stub's reported tokens | H6 |
 | S8 | Design corrections (see H6b): one alias for a `[k.v2, k]` selector across two tenants on different alternatives and across a version flip, each tenant's own remote name at MCP; history truncation with a `history_truncated` event; idle definition re-pin with `definition_changed`; dispatch keeps a journey from eviction; 403 → `not_permitted` result, run continues | H6b |
 | S9 | An apply-then-drop-response effect → `outcome_unknown`, no retry, the journey pinned. The trace has no content, tool descriptions or remote names | H7 |
+| S10 | Definition rollout only through `agent-platform activate`: D1 then D2 are activated by the entry point (never `Store.ActivateDefinition` directly); a second `activate` of D2 succeeds; every replica stays Ready with no local definition files; a conversation waiting on an approval under D1 completes on D1; an idle one re-pins to D2 with `definition_changed`; a new one runs on D2 | F1 |
 
 The ratchet is `integration/e2e_progress_test.go`, which declares `const e2eReachedStage = N`:
 
@@ -435,7 +436,7 @@ flowchart LR
     H6b --> H7["H7 outcome_unknown pin, telemetry,<br/>deploy, docs, CI · S9"]
 ```
 
-Each hop adds at most one forward-only SQL migration. **Numbers are positional:** a migration's version is its index in `migrationNames` (`journal/migrate.go:17`), so a new file takes the next free number when it lands, and a duplicate or skipped number is a silent error. Landed: `000007` H2, `000008` H3, `000009` H4a, `000010` H4b, `000011` H5. Planned: `000012` H6 (`000012_usage_limit.sql`), then `000013` for H6b only if a card needs one.
+Each hop adds at most one forward-only SQL migration. **Numbers are positional:** a migration's version is its index in `migrationNames` (`journal/migrate.go:17`), so a new file takes the next free number when it lands, and a duplicate or skipped number is a silent error. Landed: `000007` H2, `000008` H3, `000009` H4a, `000010` H4b, `000011` H5, `000012` H6 (`000012_usage_limit.sql`); H6b added none. Planned: `000013` F1 (definition store), then `000014` for F3 only if a card needs one.
 
 ### P0: Prerequisites (orchestrator, before H0)
 
@@ -631,6 +632,56 @@ Lands the arena-review amendments (2026-10-18) after H6 and before H7. The decis
   - add `.github/workflows/test.yaml`, running the race suite with a `postgres:16` service.
 - **E2E.** S9, with N=9.
 
+### Review-fix round (F1–F4)
+
+Two read-only reviews of `57e895a` (2026-10-19) found that no production path activates a definition set, that a retained set cannot be assembled from shipped artifacts, that an approved effectful call is re-sent once after a business rejection, and that the wait cap is a hard-coded 24 h. The user decided (2026-10-19):
+
+- **R1, rollout entry point.** `agent-platform activate` is a CLI subcommand, run as an **init container** of every Agent pod, so it must be idempotent.
+- **R2, definition storage.** ConfigMaps do not scale to 15–20 agents. Definition-set content lives in **PostgreSQL, content-addressed by set digest**. A pod serves any digest the store holds, so a retained set always exists and old pods stay Ready while `current` moves. Assumption: one Agent deployment per database (the singleton `agent_definition_current` stays); sharing a database between agents is out of scope.
+- **R6, forward-only activation (2026-10-19, after the F1 review).** `activate` never moves `current` to a set that was activated before: a recreated old pod's init container stores nothing new, leaves `current` alone and exits 0 (its pod still serves the older set from the store). Only `activate --rollback` moves `current` back to an earlier-activated set. The activation history lives in `000013`.
+- **R7, same digest, different bytes.** The digest covers the compiled meaning, so storing a digest that already exists with different bytes (a comment or formatting edit) is a no-op that keeps the first stored bytes; it is not an error.
+- **R3, effectful calls.** An approved effectful call is **never** re-sent, including after a business rejection (decision 1 stands; the code and tests change).
+- **R4, wait cap.** The interaction TTL is a setting through `settings.Source` with a **5 m default**; the design's "hours or days" wording changes to match.
+- **R5, in scope:** typed Chat codes for client-caused failures and approval expiry; the snapshot TTL counts from the last validation; the docs and deploy cleanups.
+
+The hops run in order F1 → F2 → F3 → F4, one commit each, with the same gate and execution model as H0–H7.
+
+### F1: Definition store and the `activate` entry point
+
+- **Migration `000013`** (`000013_definition_store.sql`). An append-only table of definition-set bundles keyed by set digest (64 hex), holding each bundle file (relative path → bytes: `journeys.yaml`, `conversation.md`, every `SKILL.md` and skill resource) and a `created_at`. A digest's content never changes: storing a digest again is a no-op that keeps the first stored bytes (R7). The first activation of each set is recorded, for the forward-only rule (R6).
+- **Journal.**
+  - `PutDefinitionSet(ctx, digest, files)` (idempotent as above) and `DefinitionSet(ctx, digest) (files, error)`, `ErrDefinition` when absent.
+  - `ActivateDefinition` succeeds without a write when the candidate is already `current` (repeat init containers), and still requires `expected` otherwise.
+  - The `served` predicate checks keep their meaning, but "served" now means "stored and compiles to that digest".
+- **Definitions.** `ReadBundle(fsys) (Bundle, error)` reads a bundle directory, and `CompileBundle(Bundle) (*Set, error)` compiles from memory. A bundle read from disk and one read back from the store compile to the same digest. `Retain` and the retained-set plumbing are deleted once nothing calls them.
+- **Serving pods** load and compile sets from the store on demand, cache them by digest, and never read local definition files. `served` must not query the database inside a journal transaction: referenced digests are loaded before the journal call that checks them. Readiness is `DefinitionsReady` over that loader, and a pod is not Ready until a `current` set exists. `AGENT_PLATFORM_CONFIG` / `AGENT_PLATFORM_RETAINED_CONFIGS` and the `ResolveDefinition` bootstrap leave serve mode.
+- **`agent-platform activate --bundle <dir>`.** It reads and compiles the bundle, stores it, loads and compiles every referenced digest from the store (failing if any does not), then calls `ActivateDefinition(expected=current, candidate)`. A conflict with a concurrent activation re-reads `current` and retries a bounded number of times. Exit 0 means the candidate is current. Errors never print bundle content.
+- **Deploy.** `deploy/kubernetes.yaml` runs `activate` as an init container reading the bundle from a volume (an image volume or a copy step from a per-agent bundle image; never a ConfigMap). `deploy/compose.yaml` runs a one-shot `activate` service that the server waits on (`service_completed_successfully`). The image no longer needs `configs/` on the serve path. `deploy/README.md` documents the rollout: build the bundle, roll the Deployment, the init container activates, old pods keep serving pinned sets.
+- **Docs.** `docs/design.md` (Definitions, Rollout, Journey definition) and `CONTEXT.md` (definition store, bundle, activate) describe R1 and R2.
+- **S8 interaction.** S8 M6's "a replica without D1 is not Ready" no longer arises once D1 is stored. F1 may rewrite that assertion as "a set missing from the store keeps the replica not Ready" and must report it; no other S0–S9 assertion changes.
+- **E2E.** S10 (see the stage table), with N=10.
+
+### F2: Effectful calls are never re-sent; configurable wait cap
+
+- **R3, test first.** `guardedCall`'s second-attempt rule (`runtime/tool_policy.go:47`, `safe := outcome == "rejected" || …`) and `BeginAttempt` (`journal/operations.go:103`) allow a second attempt after `rejected` only when the policy is not `effectful`. Red first: the outcomes matrix (`integration/outcomes_test.go:254`) and `TestBusinessErrorChangedActionRequiresNewApproval` expect exactly **one** MCP call for an approved effectful operation that is rejected; a changed action still needs a new approval.
+- **R4, test first.** `journal.InteractionTTL` becomes `Settings.InteractionTTL` (default 5 m, layered default → tenant → user where the user layer only narrows, bounds checked). `Wait` takes the TTL from the run's recorded settings. A unit test proves that an interaction created with a 5 m setting expires at 5 m and that a tenant value overrides the default. `docs/design.md` and `CONTEXT.md` lose "hours or days".
+
+### F3: Chat contract fixes
+
+- **Typed client codes.** An unknown or unavailable target, `policy_conflict` and a refused activation (`runtime/run.go:257,334-343` → `platform.go:271-280` → `chat/http.go:236-247`) reach Chat as their own code, not `internal_error`. An expired approval is projected as an expiry (a denial with its own code), not `internal_error` (`journal/interactions.go:209,245`; `chat/http.go:288-290`). A new terminal state touches the four places listed in H2 and takes migration `000014`.
+- **Snapshot TTL from validation.** `RecordRunCatalog` refreshes `catalog_validated_at` (`journal/catalog.go:87`) when a run revalidates a snapshot, so the TTL counts from the last validation.
+- **Reconnect after `limit_exceeded`** keeps `retryAfterSeconds` (`chat/http.go:297-299`).
+- **E2E.** Extend S7 (or a stage that already covers HTTP) to assert `tool_not_active`/`activation_refused` and the expiry code over HTTP; N stays 10.
+
+### F4: Docs and deploy cleanups
+
+- `deploy/kubernetes.yaml:35-36` and `deploy/README.md`: drop the pre-M6 rollout rule (F1 has replaced it).
+- `deploy/kubernetes.yaml`: a NetworkPolicy so that only Agent reaches the model gateway's routes (attribution-header trust, Risk 6).
+- `docs/acceptance.md`: BLOCKED rows for "the real model follows the activation and approval protocol with the composed prompt", "the real model activates the expected journey on the router-baseline utterance set, with `main` as the floor" and "definition rollout through the operator procedure on a real cluster"; drop the dependency on the uncommitted `deploy/compose.local.yaml` (`docs/acceptance.md:157`).
+- Doc mismatches: `journey.run` is kept by user decision (`docs/design.md:627`); `docs/task-6-process.md:31` retention rule; the redundant `byAlias` group in `checkPolicyConflicts` (`definitions/compile.go`) is removed.
+- `agent_catalog_latest` / `LatestSnapshot`: cut it if no production reader appears, otherwise document the reader.
+- `docs/design.md`: the cost journey dimension is empty for model-activated runs (`run.go:204`, `interactions.go:306`), a V1 limitation; the H7.1 `outcome_unknown` journey pin is inert while the thread-level stop exists.
+
 ## Execution model
 
 ```mermaid
@@ -785,6 +836,43 @@ flowchart TD
 | H7.4 ∥ | CI workflow | `.github/workflows/test.yaml` | — | `actionlint` if available; the job command matches `gt ./...` |
 | H7.5 | S9 body; N=9 | `integration/e2e_test.go`, `integration/e2e_progress_test.go` | H7.1, H7.2 | hop gate with N=9 |
 | H7.6 | `docs/acceptance.md` and `README.md` | `docs/acceptance.md`, `README.md` | H7.1–H7.5 | links resolve; every case names an existing test |
+
+**F1: Definition store and the `activate` entry point**
+
+| ID | Task | Files | Depends | Verify |
+|---|---|---|---|---|
+| F1.1 ∥ | Migration `000013`; `PutDefinitionSet` / `DefinitionSet` (idempotent, conflicting content rejected); `ActivateDefinition` no-op when the candidate is current | `internal/journal/**` | — | `gt ./internal/journal -run 'TestMigration000013|TestDefinitionSet.*|TestConversationActivateDefinition.*'` |
+| F1.2 ∥ | `ReadBundle` / `CompileBundle`; round-trip digest equality (disk vs memory, file order independent) | `internal/definitions/*` | — | `gt ./internal/definitions -run 'TestBundle.*|TestCompile.*'` |
+| F1.3 | Store-backed set loader with a digest cache; `served` never queries inside a journal transaction; readiness through `DefinitionsReady`; not Ready without `current` | the loader's package (lead picks; not `journal`), `internal/{platform,runtime}/*` | F1.1, F1.2 | `go build ./... && gt ./internal/...` |
+| F1.4 | `activate --bundle` subcommand (see F1); serve mode drops `AGENT_PLATFORM_CONFIG` / `AGENT_PLATFORM_RETAINED_CONFIGS` and the bootstrap; delete `Retain` and `compileDefinitions` | `cmd/agent-platform/*`, `internal/definitions/set.go`, `internal/journal/definitions.go` (bootstrap only) | F1.3 | `gt ./cmd/agent-platform -run 'TestActivate.*'` (fresh DB, repeat run, concurrent run, a referenced digest that does not compile) |
+| F1.5 | Integration call sites that call `ActivateDefinition`, `Retain` or pass local configs; S8 M6 readiness assertion per F1 | `integration/*_test.go` | F1.4 | `gt ./integration` |
+| F1.6 ∥ | Deploy: init container plus bundle volume, compose one-shot `activate` service, Dockerfile, `deploy/README.md` rollout. Preserve `deploy/compose.local.yaml` untouched | `deploy/**` except `compose.local.yaml`, `Dockerfile` | F1.4 | compose `config -q` with a dummy env file |
+| F1.7 ∥ | Docs: `docs/design.md`, `CONTEXT.md` (R1, R2) | `docs/design.md`, `CONTEXT.md` | F1.4 | links resolve |
+| F1.8 | S10 body through the entry point's exported run function; N=10 | `integration/e2e_test.go`, `integration/harness_test.go`, `integration/e2e_progress_test.go` | F1.5 | hop gate with N=10 |
+
+**F2: Effectful calls never re-sent; configurable wait cap**
+
+| ID | Task | Files | Depends | Verify |
+|---|---|---|---|---|
+| F2.1 | R3 red first, then `tool_policy.go` and `BeginAttempt`; matrix and `TestBusinessErrorChangedActionRequiresNewApproval` expect one call | `internal/runtime/tool_policy.go`, `internal/journal/operations.go` (+tests), `integration/outcomes_test.go` | — | `gt ./internal/runtime ./internal/journal -run 'TestGuardedCall.*|TestBeginAttemptPolicy.*'`; `gt ./integration -run 'TestBusinessError.*|TestOutcome.*'` |
+| F2.2 ∥ | `Settings.InteractionTTL` (default 5 m, bounds, narrow-only user layer) | `internal/settings/*` | — | `gt ./internal/settings -run 'TestInteractionTTL.*|TestLayering|TestBounds|TestDigest'` |
+| F2.3 | `Wait` takes the TTL from the run's settings; remove `journal.InteractionTTL`; docs wording | `internal/{journal,runtime}/*`, `docs/design.md`, `CONTEXT.md` | F2.1, F2.2 | `gt ./internal/... -run 'TestWait.*|TestInteraction.*'`; hop gate with N=10 |
+
+**F3: Chat contract fixes**
+
+| ID | Task | Files | Depends | Verify |
+|---|---|---|---|---|
+| F3.1 | Typed codes for client-caused failures and approval expiry through all four state places (migration `000014` if a terminal state is added) | `internal/{runtime,platform,chat,journal}/*` | — | `gt ./internal/chat ./internal/platform ./internal/journal -run 'TestCode.*|TestExpir.*|TestMigration000014'` |
+| F3.2 ∥ | `RecordRunCatalog` refreshes `catalog_validated_at` | `internal/journal/catalog.go` (+test) | — | `gt ./internal/journal -run 'TestRecordRunCatalog.*|TestSnapshot.*'` |
+| F3.3 | Reconnect keeps `retryAfterSeconds`; E2E HTTP assertions (see F3) | `internal/chat/*`, `integration/e2e_test.go` | F3.1, F3.2 | hop gate with N=10 |
+
+**F4: Docs and deploy cleanups**
+
+| ID | Task | Files | Depends | Verify |
+|---|---|---|---|---|
+| F4.1 ∥ | Deploy comments and NetworkPolicy | `deploy/**` except `compose.local.yaml` | — | compose `config -q`; `kubectl apply --dry-run=client` if available |
+| F4.2 ∥ | `docs/acceptance.md` BLOCKED rows, doc mismatches, V1 limitations | `docs/**` except `docs/migration.md` | — | links resolve |
+| F4.3 ∥ | Remove the redundant `byAlias` group; cut or document `LatestSnapshot` | `internal/definitions/compile.go`, `internal/journal/catalog.go` (+tests) | — | `gt ./internal/definitions ./internal/journal`; hop gate with N=10 |
 
 ## Verification
 

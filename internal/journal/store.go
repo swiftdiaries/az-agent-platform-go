@@ -17,6 +17,9 @@ var (
 	ErrBusy       = errors.New("conversation already has a live run")
 	ErrState      = errors.New("run state does not permit operation")
 	ErrDefinition = errors.New("pinned journey definition is unavailable")
+	// ErrDefinitionSuperseded: forward-only activation refused a set that was activated
+	// before; only RollbackDefinition may move current back to it. Not an ErrDefinition.
+	ErrDefinitionSuperseded = errors.New("definition set was activated before")
 )
 
 type RunState string

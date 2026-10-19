@@ -38,6 +38,15 @@ An optional stable journey identifier supplied with a user message that activate
 **Definition version**:
 An immutable compiled set of journeys (a `definitions.Set`, identified by its digest), pinned by a conversation and re-pinned to the current set at a run start when the conversation is idle (no open wait, no unresolved operation). It identifies instructions, tool selectors, and policy overlays, but not the tools a given user can reach, which come from that user's catalog snapshot.
 
+**Definition store**:
+The PostgreSQL tables that hold definition-set content, addressed by set digest and append-only. Storing a digest that already exists, even with different bytes (a comment or formatting edit), is a no-op that keeps the first stored bytes. Each set's first activation is recorded. A pod loads and compiles any stored digest on demand and never reads local definition files.
+
+**Bundle**:
+The directory of files one definition set is compiled from: `journeys.yaml`, the conversation prompt, every referenced `SKILL.md` and its supporting files. It ships in a per-agent bundle image.
+
+**Activate**:
+The `agent-platform activate --bundle <dir>` subcommand, run as an init container of every Agent pod. It stores the bundle's set in the definition store and makes it current. It is idempotent and forward-only: it never moves current to a set that was activated before (it prints `not activated <digest>: activated before (use --rollback)` and exits 0), and only `activate --rollback --bundle <dir>`, an explicit operator action, moves current back to an earlier-activated set. Exit 0 with `activated` or `already current` means the candidate is current.
+
 ### Tools and products
 
 **Operation key**:

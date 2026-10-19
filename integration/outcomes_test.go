@@ -44,7 +44,7 @@ func lookupTool(description string) *mcp.Tool {
 // tool is operation key lookup_destination with the class under test: "read_only",
 // "idempotent", "effectful" (explicit) or "unclassified" (no class key, which
 // resolves to effectful).
-func policyRunner(t *testing.T, url, class string, model agentruntime.Model) *agentruntime.Runner {
+func policyRunner(t *testing.T, pool *pgxpool.Pool, url, class string, model agentruntime.Model) *agentruntime.Runner {
 	t.Helper()
 	const prompt = "You help the user plan a vacation. Use only the configured read-only destination lookup.\nNever claim an action was taken and never expose credentials or internal errors.\n"
 	written, want := class, definitions.Class(class)
@@ -73,7 +73,7 @@ func policyRunner(t *testing.T, url, class string, model agentruntime.Model) *ag
 	if !ok || len(journey.Tools) != 1 || journey.Tools[0].Class != want {
 		t.Fatalf("compiled %q journey tools = %#v, %v", class, journey.Tools, ok)
 	}
-	return agentruntime.NewRunner(set, model, testTenancy(t, url))
+	return agentruntime.NewRunner(storedDefinitions(t, pool, set), model, testTenancy(t, url))
 }
 
 // requireAliasOffered fails the test (without stopping the model goroutine) unless
@@ -133,7 +133,7 @@ func TestToolCallLostAfterEffectNoRetry(t *testing.T) {
 		}
 		return agentruntime.ModelResponse{ToolCalls: []agentruntime.ToolCall{{CallID: "effect", Name: "lookup_destination", Arguments: json.RawMessage(`{"city":"A"}`)}, {CallID: "sibling", Name: "lookup_destination", Arguments: json.RawMessage(`{"city":"B"}`)}}}, nil
 	})
-	p := platform.New(policyRunner(t, backend.URL, "unclassified", model), journal.New(pool))
+	p := platform.New(policyRunner(t, pool, backend.URL, "unclassified", model), journal.New(pool))
 	defer p.Close()
 	c := platform.Command{ThreadID: "effect-thread", RunID: "effect-run", CommunicationID: "effect-comm", Principal: "alice", Tenant: testTenant, Text: "change", TargetJourney: "planner"}
 	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
@@ -355,7 +355,7 @@ func TestToolCallVerifiedRetryStableID(t *testing.T) {
 				}
 				return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "provider", Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
 			})
-			p := platform.New(policyRunner(t, backend.URL, class, model), journal.New(pool))
+			p := platform.New(policyRunner(t, pool, backend.URL, class, model), journal.New(pool))
 			defer p.Close()
 			c := platform.Command{ThreadID: "retry-thread", RunID: "retry", CommunicationID: "retry", Principal: "alice", Tenant: testTenant, Text: "go", TargetJourney: "planner"}
 			if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
@@ -407,7 +407,7 @@ func TestToolCallPredispatchPersistenceFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	var models atomic.Int32
-	p := platform.New(agentruntime.NewRunner(registry, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	p := platform.New(agentruntime.NewRunner(storedDefinitions(t, pool, registry), modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		models.Add(1)
 		requireAliasOffered(t, r)
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "pre", Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
@@ -442,7 +442,7 @@ func TestToolCallCompletionPersistenceFailurePublishesUnknownBeforeRunFailure(t 
 	defer backend.Close()
 	const providerCallID = "provider-completion-sentinel"
 	var models atomic.Int32
-	runner := policyRunner(t, backend.URL, "read_only", modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	runner := policyRunner(t, pool, backend.URL, "read_only", modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		models.Add(1)
 		requireAliasOffered(t, r)
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: providerCallID, Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
@@ -509,7 +509,7 @@ func TestToolCallZeroOneMultipleAndDelayed(t *testing.T) {
 				}
 				return agentruntime.ModelResponse{Text: "done"}, nil
 			})
-			p := platform.New(policyRunner(t, backend.URL, "read_only", model), journal.New(pool))
+			p := platform.New(policyRunner(t, pool, backend.URL, "read_only", model), journal.New(pool))
 			defer p.Close()
 			c := platform.Command{ThreadID: "multi", RunID: "multi", CommunicationID: "multi", Principal: "alice", Tenant: testTenant, Text: "go", TargetJourney: "planner"}
 			if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
@@ -549,7 +549,7 @@ func TestApprovalFreshCredentialsAndRejectedReplies(t *testing.T) {
 			backend := httptest.NewServer(mock)
 			defer backend.Close()
 			var resumed *agentruntime.ModelRequest
-			p := platform.New(policyRunner(t, backend.URL, "effectful", modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+			p := platform.New(policyRunner(t, pool, backend.URL, "effectful", modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 				requireAliasOffered(t, r)
 				if len(r.ToolResults) > 0 {
 					copy := r
@@ -676,7 +676,7 @@ func TestBusinessErrorChangedActionRequiresNewApproval(t *testing.T) {
 	})
 	backend := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return sdk }, nil))
 	defer backend.Close()
-	p := platform.New(policyRunner(t, backend.URL, "effectful", modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	p := platform.New(policyRunner(t, pool, backend.URL, "effectful", modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		round := models.Add(1)
 		requireAliasOffered(t, r)
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: fmt.Sprintf("call-%d", round), Name: "lookup_destination", Arguments: json.RawMessage(fmt.Sprintf(`{"attempt":%d}`, round))}}, nil
@@ -747,7 +747,7 @@ func TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted(t *testing.T) {
 	})
 	backend := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return sdk }, nil))
 	defer backend.Close()
-	p := platform.New(policyRunner(t, backend.URL, "read_only", modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	p := platform.New(policyRunner(t, pool, backend.URL, "read_only", modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		models.Add(1)
 		requireAliasOffered(t, r)
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: providerCallID, Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
@@ -791,7 +791,7 @@ func TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted(t *testing.T) {
 	if _, err := pool.Exec(t.Context(), "INSERT INTO chat_threads(principal,external_id,id) VALUES('tenant-a/alice','external-loss-thread','loss'); INSERT INTO chat_runs(thread_id,external_id,id,communication_id) VALUES('loss','external-loss-run','loss','loss')"); err != nil {
 		t.Fatal(err)
 	}
-	observer := platform.New(fixtureRunner(t, modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	observer := platform.New(fixtureRunner(t, pool, modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		t.Fatal("reconnect executed provider")
 		return agentruntime.ModelResponse{}, nil
 	})), journal.New(pool))
@@ -822,7 +822,7 @@ func TestToolCallOwnerDatabaseLossRecordsUnknownAndInterrupted(t *testing.T) {
 func TestToolCallPartialProviderFailureIsNotVisible(t *testing.T) {
 	pool := database(t)
 	var models atomic.Int32
-	p := platform.New(fixtureRunner(t, modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	p := platform.New(fixtureRunner(t, pool, modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		models.Add(1)
 		return agentruntime.ModelResponse{Text: "private partial output", ToolCall: &agentruntime.ToolCall{CallID: "partial", Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, errors.New("private stream failure")
 	})), journal.New(pool))

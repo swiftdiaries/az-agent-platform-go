@@ -230,7 +230,7 @@ func TestOwnershipLossDuringModelRejectsResultAndRequiresFreshIngress(t *testing
 	pool := database(t)
 	started, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var calls atomic.Int64
-	runner := fixtureRunner(t, modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	runner := fixtureRunner(t, pool, modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		if calls.Add(1) == 1 {
 			close(started)
 			<-release

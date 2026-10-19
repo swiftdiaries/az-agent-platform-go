@@ -230,7 +230,7 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 		}
 		return agentruntime.ModelResponse{Text: "corrected Kyoto"}, nil
 	})
-	runner := agentruntime.NewRunner(registry, model, testTenancy(t, endpoint.URL))
+	runner := agentruntime.NewRunner(storedDefinitions(t, pool, registry), model, testTenancy(t, endpoint.URL))
 	auth := chat.StaticBearerTokens{"token": testPrincipal}
 	var apis []*httptest.Server
 	for range 3 {
@@ -377,7 +377,7 @@ func TestSteeringInclusionFailureStopsDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	var calls atomic.Int64
-	runner := fixtureRunner(t, modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	runner := fixtureRunner(t, pool, modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		calls.Add(1)
 		if len(request.PendingCommands) != 1 {
 			return agentruntime.ModelResponse{}, errors.New("missing boundary command")
@@ -438,7 +438,7 @@ func TestSteeringFinalDrainUsesLiveOwner(t *testing.T) {
 	pool := database(t)
 	started, release := make(chan struct{}), make(chan struct{})
 	var calls atomic.Int64
-	runner := fixtureRunner(t, modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	runner := fixtureRunner(t, pool, modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		if calls.Add(1) == 1 {
 			close(started)
 			<-release
@@ -506,7 +506,7 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 		contexts <- ctx
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
 	})
-	runner := agentruntime.NewRunner(registry, model, testTenancy(t, endpoint.URL))
+	runner := agentruntime.NewRunner(storedDefinitions(t, pool, registry), model, testTenancy(t, endpoint.URL))
 	a := platform.New(runner, journal.New(pool))
 	defer a.Close()
 	b := platform.New(runner, journal.New(pool))
@@ -745,7 +745,7 @@ func TestSteeringTerminalCommandCorrelationAcrossReplicas(t *testing.T) {
 			pool := database(t)
 			started, release := make(chan struct{}), make(chan struct{})
 			var calls atomic.Int64
-			runner := fixtureRunner(t, modelFunc(func(_ context.Context, _ agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+			runner := fixtureRunner(t, pool, modelFunc(func(_ context.Context, _ agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 				calls.Add(1)
 				close(started)
 				<-release
