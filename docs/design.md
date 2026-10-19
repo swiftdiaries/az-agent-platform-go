@@ -188,7 +188,7 @@ Chat owns:
 - AG-UI request validation, the authentication and authorization handoff, and mapping external IDs to internal opaque IDs;
 - the user-facing projection of accepted user messages, visible agent messages and Agent-owned execution states;
 - delivery cursors and a rebuildable event replay projection for reconnecting to a still-running turn;
-- translating Agent events into AG-UI events, including `dependency_unavailable` and `limit_exceeded`;
+- translating Agent events into AG-UI events, including `dependency_unavailable` and `limit_exceeded`, and the typed failure codes in [Effects, retry and errors](#effects-retry-and-errors); a reconnect projects the same codes and `limit_exceeded` details (`retryAfterSeconds`) as the live stream;
 - validating every submit, steer and reconnect request against the thread principal, and building the `Credential` from the configured header names.
 
 Because live reconnect is required, Chat owns the hosting and re-attachment policy while Agent keeps the run alive independently of any HTTP connection.
@@ -255,8 +255,9 @@ stateDiagram-v2
     running --> completed: Finish
     running --> awaiting_input: Wait (history + call IDs saved, owner released)
     awaiting_input --> pending: Reply (decided + continuation admitted)
+    awaiting_input --> failed: expiry (interaction_expired)
     running --> interrupted: lease lost / owner died
-    running --> failed: outcome_unknown / internal
+    running --> failed: outcome_unknown / internal / typed client reason
     running --> auth_required
     running --> dependency_unavailable: directory / allowlist / endpoint / settings
     running --> limit_exceeded: Admit denied / enforcement 429
@@ -359,7 +360,7 @@ Binding maps each alias to the user's remote name at call time, using the **remo
 - **Contents:** raw descriptors (name, description, schemas, `_meta`, annotations), a digest, the product version and the endpoint ID. Never bound tool objects. The rows are nonsecret.
 - **Scope:** immutable and addressed by digest, stored per `(tenant, principal, product version, endpoint ID)`, with a per-principal "latest" pointer. Each conversation pins one digest. One conversation's revalidation moves "latest" but never another conversation's pin. A per-tenant key would leak tools across users with different entitlements.
 - **Capture:** on the first message, by paging `tools/list` to completion with the go-sdk's `ClientSession.Tools` iterator. MAF's single-page `ListTools` is not used.
-- **Revalidation:** at each run start. It re-lists only when the product version, the server version from `initialize`, or the endpoint changed, or the TTL expired.
+- **Revalidation:** at each run start. It re-lists only when the product version, the server version from `initialize`, or the endpoint changed, or the TTL expired. The TTL counts from the last validation: a run that reuses the pin refreshes the conversation's validation time, so the TTL bounds idle time, and an active conversation re-lists on a version, server or endpoint change.
 - **On change:** the run is claimed first, then `Catalog.Open` runs. One fenced commit then records the new snapshot, the conversation's new pin and a `catalog_changed` event (old and new digest and version) before the first dispatch.
 - **Never authorization.** A revoked tool that is still in the snapshot fails at Java as an auth or business rejection, never `outcome_unknown`.
 
@@ -482,7 +483,7 @@ The policy overlay assigns each operation a class. The class is authoritative fo
 
 ## Human waits and approvals
 
-- **Expiry.** Every wait (clarification or approval) expires after `interaction_ttl`, resolved from settings at run start and recorded on the run. The default is 5 minutes. An expired interaction can no longer be answered.
+- **Expiry.** Every wait (clarification or approval) expires after `interaction_ttl`, resolved from settings at run start and recorded on the run. The default is 5 minutes. An expired interaction can no longer be answered. Expiry is a denial (an approval's marker becomes `denied`): the model sees `{"error":"interaction_expired"}` for the call, the waiting run ends `failed` with reason `interaction_expired`, Chat reports RUN_ERROR code `interaction_expired` for that run, and a late reply is rejected with HTTP 409 and body `interaction_expired`.
 - **Clarification.** One to three questions, each with two or three described options, plus optional custom text. It supplies information only. A pending clarification survives a product-version change because it authorizes nothing.
 - **Approval binding** is an immutable digest over the operation key, the resolved-name digest, the input-schema digest, the canonical arguments (`json.Number` preserved, trailing data rejected), and the product version, principal, conversation and definition-set digest. The server stores the call; client-supplied replacement calls are rejected.
 
@@ -544,6 +545,11 @@ Every MCP call gets a stable opaque call ID. After a live transport failure wher
   - Alternative considered: both codes `auth_required` (current `catalog/transport.go:62`). Re-authenticating cannot fix a missing entitlement, and one forbidden tool would end the run and block every other tool.
 - **Directory, allowlist, endpoint or settings failure at run start:** `dependency_unavailable`, before any dispatch.
 - **Limit rejection:** `limit_exceeded` (see [Cost seam](#cost-seam)).
+- **Client-caused failure of an explicit target** (`forwardedProps.journeyId`) ends the run `failed` before any model call, with a typed reason on its `run.failed` event that Chat reports as the RUN_ERROR code (no new run state):
+  - `journey_unavailable`: the target is not in the pinned definition set, or its tools do not resolve for this user;
+  - `policy_conflict`: the target is unavailable because two journeys give one operation key or alias different policies;
+  - `activation_refused`: every active journey is pinned, so the target cannot be activated.
+  An expired wait is reported the same way with `interaction_expired` (see [Human waits](#human-waits-and-approvals)). Any other `failed` run is `internal_error`.
 - **Invalid configuration and unexpected internal failure** terminate the run. Chat maps typed outcomes to AG-UI and never exposes raw transport errors, stack traces, credentials or unreviewed Java details. Restricted traces retain an incident/correlation ID.
 
 Conversation persistence does not recover a process that died mid-tool. Reopening reports the run interrupted and the external effect `outcome_unknown`; it does not infer success or continue. A product cutover that retires an endpoint mid-call follows the same rule.

@@ -1046,6 +1046,7 @@ func TestE2EConversationAgent(t *testing.T) {
 			t.Errorf("model requests = %d, want 16", got)
 		}
 		requireActive("after A5", testPrincipal, threadA, "booking")
+		t.Run("F3 chat codes", e2eS4ChatCodes)
 	})
 	t.Run("S5", func(t *testing.T) {
 		stage(t, 5, "H4b")
@@ -1343,6 +1344,7 @@ func TestE2EConversationAgent(t *testing.T) {
 		if m, state, _ := marker(question.id); m != nil || state != "consumed" {
 			t.Errorf("answered clarification marker/state = %v/%s, want NULL/consumed", m, state)
 		}
+		t.Run("F3 approval expiry", e2eS6Expiry)
 	})
 	t.Run("S7", func(t *testing.T) {
 		stage(t, 7, "H6")
@@ -1458,6 +1460,11 @@ func TestE2EConversationAgent(t *testing.T) {
 		e2eRequireLimitExceeded(t, "budget run", body)
 		if !strings.Contains(body, `"retryAfterSeconds":30`) {
 			t.Errorf("budget run SSE lacks the limit_exceeded event with retryAfterSeconds 30: %s", body)
+		}
+		// The reconnect of the limit_exceeded run replays the custom event with the retry hint plus the RUN_ERROR.
+		reconnected := e2eReadBody(t, "budget reconnect", e2eReconnect(t, b.url, threadBudget, runBudget, "token"))
+		if !strings.Contains(reconnected, `"retryAfterSeconds":30`) || !strings.Contains(reconnected, `"code":"limit_exceeded"`) {
+			t.Errorf("budget reconnect lacks retryAfterSeconds 30 or code limit_exceeded: %s", reconnected)
 		}
 		internalBudget := acceptanceThread(t, pool, threadBudget)
 		idBudget := e2eInternalRun(t, pool, internalBudget, runBudget)
@@ -2604,4 +2611,130 @@ func e2eS10(t *testing.T) {
 		t.Errorf("definition_changed events on N = %d, want 0", count)
 	}
 	allReady("at the end")
+}
+
+// e2eS4ChatCodes is F3: a call to a journey alias that is not active is never
+// dispatched, and an explicit journeyId outside the definition set ends the run
+// failed with the journey_unavailable code, live and on reconnect.
+func e2eS4ChatCodes(t *testing.T) {
+	const token = "token"
+	pool := database(t)
+	set := e2eJourneySet(t)
+	endpoint := mcptest.New(t, mcptest.Options{Name: "e2e-s4-codes", Version: "vN"}, e2eCatalog(func(o e2eOp) string { return o.remoteA }))
+	model := modeltest.New(
+		modeltest.Call("travel_lookup", struct{}{}), // 0: the planner journey is not active
+		modeltest.Text("not active noted"),          // 1
+		modeltest.Text("must not be requested"),     // 2: the unknown-journey run never asks
+	)
+	a, b, _ := threeReplicas(t, pool, set, model, testTenancy(t, endpoint.URL()))
+
+	// a. tool_not_active: never dispatched, the run continues with the model's text.
+	body := e2eS8Chat(t, a, token, "e2e-s4-codes-1", "e2e-s4-codes-run1", e2eS8Say("look it up", ""))
+	e2eS8Finished(t, "tool_not_active run", body, "not active noted")
+	if got := model.Count(); got != 2 {
+		t.Fatalf("model requests after the tool_not_active run = %d, want 2", got)
+	}
+	if got := e2eResult(t, model.Requests()[1], "modeltest-call-0"); got != `{"error":"tool_not_active"}` {
+		t.Errorf("result of the inactive call = %s, want {\"error\":\"tool_not_active\"}", got)
+	}
+	if got := endpoint.Count("tools/call"); got != 0 {
+		t.Errorf("MCP tools/call count = %d, want 0 (an inactive journey's call is never dispatched)", got)
+	}
+
+	// b. An explicit journeyId that is not in the definition set.
+	before := model.Count()
+	body = e2eS8Chat(t, b, token, "e2e-s4-codes-2", "e2e-s4-codes-run2", e2eS8Say("go", "no-such-journey"))
+	if !strings.Contains(body, "RUN_ERROR") || !strings.Contains(body, `"code":"journey_unavailable"`) || strings.Contains(body, "RUN_FINISHED") {
+		t.Errorf("unknown journey POST: expected RUN_ERROR code journey_unavailable and no RUN_FINISHED: %s", body)
+	}
+	if got := model.Count(); got != before {
+		t.Errorf("model requests after the unknown-journey run = %d, want unchanged at %d", got, before)
+	}
+	reconnected := e2eReadBody(t, "unknown journey reconnect", e2eReconnect(t, a.url, "e2e-s4-codes-2", "e2e-s4-codes-run2", token))
+	if !strings.Contains(reconnected, "RUN_ERROR") || !strings.Contains(reconnected, `"code":"journey_unavailable"`) || strings.Contains(reconnected, "RUN_FINISHED") {
+		t.Errorf("unknown journey reconnect: expected RUN_ERROR code journey_unavailable and no RUN_FINISHED: %s", reconnected)
+	}
+	internal := acceptanceThread(t, pool, "e2e-s4-codes-2")
+	if got := e2eRunState(t, pool, internal, e2eInternalRun(t, pool, internal, "e2e-s4-codes-run2")); got != string(journal.RunFailed) {
+		t.Errorf("unknown journey run state = %q, want failed", got)
+	}
+}
+
+// e2eS6Expiry is F3: a tenant interaction_ttl governs the approval wait; once it
+// expires, a reply gets 409 interaction_expired and the opening run reconnects as
+// a RUN_ERROR interaction_expired.
+func e2eS6Expiry(t *testing.T) {
+	const (
+		token    = "token"
+		thread   = "e2e-s6-expiry"
+		runOpen  = "e2e-s6-expiry-run1"
+		runReply = "e2e-s6-expiry-run2"
+	)
+	pool := database(t)
+	set := e2eJourneySet(t)
+	endpoint := mcptest.New(t, mcptest.Options{Name: "e2e-s6-expiry", Version: "vN"}, e2eCatalog(func(o e2eOp) string { return o.remoteA }))
+	ttl := settings.MinInteractionTTL
+	tenancy := testTenancy(t, endpoint.URL())
+	source, err := settings.NewMutable(settings.Document{Tenants: map[string]settings.Layer{testTenant: {InteractionTTL: &ttl}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenancy.Settings = source
+	model := modeltest.New(
+		modeltest.Call("activate_journey", map[string]any{"journey": "booking"}), // 0
+		modeltest.Call("book_reserve", struct{}{}),                               // 1: effectful, waits for approval
+	)
+	a, b, c := threeReplicas(t, pool, set, model, tenancy)
+
+	body := e2eS8Chat(t, a, token, thread, runOpen, e2eS8Say("book", ""))
+	if !strings.Contains(body, "interaction.requested") {
+		t.Fatalf("opening run lacks the approval request: %s", body)
+	}
+	internal := acceptanceThreadFor(t, pool, testPrincipal, thread)
+	var id, binding string
+	var remaining float64
+	if err := pool.QueryRow(t.Context(), `SELECT id, COALESCE(artifact->'call'->>'binding',''), extract(epoch FROM expires_at-clock_timestamp()) FROM agent_interactions WHERE thread_id=$1 AND state='pending'`,
+		internal).Scan(&id, &binding, &remaining); err != nil {
+		t.Fatalf("no pending interaction: %v", err)
+	}
+	if remaining < 50 || remaining > 70 {
+		t.Errorf("pending interaction expires in %.1fs, want about 60s (the tenant interaction_ttl)", remaining)
+	}
+
+	// Advance the clock without sleeping: expiry is evaluated on the database clock, so move expires_at into the past.
+	if _, err := pool.Exec(t.Context(), `UPDATE agent_interactions SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	reply := aguitypes.RunAgentInput{ThreadID: thread, RunID: runReply, ForwardedProps: map[string]any{"interactionReply": map[string]any{
+		"interactionId": id, "kind": "approval",
+		"answer": map[string]any{"decision": "approve", "binding": binding},
+	}}}
+	response := acceptancePostWithHeaders(t, b.url, reply, http.Header{"Authorization": {"Bearer " + token}})
+	replyBody, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusConflict || !strings.Contains(string(replyBody), "interaction_expired") {
+		t.Errorf("reply to the expired interaction: status %d body %q, want 409 containing interaction_expired", response.StatusCode, replyBody)
+	}
+
+	reconnected := e2eReadBody(t, "expired reconnect", e2eReconnect(t, c.url, thread, runOpen, token))
+	if !strings.Contains(reconnected, "RUN_ERROR") || !strings.Contains(reconnected, `"code":"interaction_expired"`) ||
+		strings.Contains(reconnected, "RUN_FINISHED") || strings.Contains(reconnected, "internal_error") {
+		t.Errorf("expired reconnect: expected RUN_ERROR interaction_expired only: %s", reconnected)
+	}
+
+	if got := endpoint.Calls("book/reserve"); got != 0 {
+		t.Errorf("MCP book/reserve calls = %d, want 0", got)
+	}
+	var marker *string
+	var state string
+	if err := pool.QueryRow(t.Context(), `SELECT marker, state FROM agent_interactions WHERE id=$1`, id).Scan(&marker, &state); err != nil {
+		t.Fatal(err)
+	}
+	if marker == nil || *marker != "denied" || state != "expired" {
+		t.Errorf("expired interaction marker/state = %v/%s, want denied/expired", marker, state)
+	}
 }

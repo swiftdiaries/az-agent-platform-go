@@ -626,3 +626,38 @@ func TestBeginAttemptPolicyEffectfulRejectedNoSecondAttempt(t *testing.T) {
 		t.Fatalf("idempotent attempt 2 after rejected: %v", err)
 	}
 }
+
+func TestRecordRunCatalogRefreshesValidation(t *testing.T) {
+	ctx := context.Background()
+	s := scopedStore(t)
+	o := admitClaim(t, s, testCommand())
+	digest, err := s.CommitSnapshot(ctx, o, sampleSnapshot("2026.2", descsA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, s.pool, "UPDATE agent_conversations SET catalog_validated_at=clock_timestamp()-interval '1 hour'")
+	before, ok, err := s.ConversationPin(ctx, o)
+	if err != nil || !ok || before.Age < 59*time.Minute {
+		t.Fatalf("aged pin = %+v ok=%v err=%v", before, ok, err)
+	}
+
+	// a mismatched digest changes nothing
+	if err := s.RecordRunCatalog(ctx, o, strings.Repeat("0", 64)); !errors.Is(err, ErrState) {
+		t.Fatalf("wrong digest: %v", err)
+	}
+	same, _, err := s.ConversationPin(ctx, o)
+	if err != nil || !same.ValidatedAt.Equal(before.ValidatedAt) || same.Age < 59*time.Minute {
+		t.Fatalf("wrong digest moved validation: %+v err=%v", same, err)
+	}
+
+	if err := s.RecordRunCatalog(ctx, o, digest); err != nil {
+		t.Fatal(err)
+	}
+	after, ok, err := s.ConversationPin(ctx, o)
+	if err != nil || !ok {
+		t.Fatalf("pin after = %+v ok=%v err=%v", after, ok, err)
+	}
+	if !after.ValidatedAt.After(before.ValidatedAt) || after.Age >= time.Minute {
+		t.Fatalf("validation not refreshed: before=%v after=%v age=%v", before.ValidatedAt, after.ValidatedAt, after.Age)
+	}
+}

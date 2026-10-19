@@ -235,6 +235,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return true
 		case "run.failed", "auth_required", "run.interrupted", "run.dependency_unavailable":
 			code := "internal_error"
+			if e.Type == "run.failed" {
+				code = failureCode(e.Reason)
+			}
 			if e.Type == "run.interrupted" {
 				code = "interrupted"
 			}
@@ -286,7 +289,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		terminal(platform.Event{Type: "run.interrupted"}, 0)
 		return
 	case platform.RunFailed:
-		terminal(platform.Event{Type: "run.failed"}, 0)
+		terminal(platform.Event{Type: "run.failed", Reason: current.TerminalReason}, 0)
 		return
 	case platform.RunAuthRequired:
 		terminal(platform.Event{Type: "auth_required"}, 0)
@@ -295,7 +298,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		terminal(platform.Event{Type: "run.dependency_unavailable"}, 0)
 		return
 	case platform.RunLimitExceeded:
-		emit(events.NewRunErrorEvent("run limit exceeded", events.WithErrorCode("limit_exceeded"), events.WithRunID(input.RunID)), 0)
+		terminal(platform.Event{Type: "run.limit_exceeded", Reason: current.TerminalReason, Detail: current.TerminalDetail}, 0)
 		return
 	}
 
@@ -321,6 +324,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func commandError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	switch {
+	case errors.Is(err, platform.ErrExpired):
+		http.Error(w, "interaction_expired", http.StatusConflict)
+		return
 	case errors.Is(err, platform.ErrDraining):
 		status = http.StatusServiceUnavailable
 	case errors.Is(err, platform.ErrConflict), errors.Is(err, platform.ErrBusy):
@@ -361,4 +367,12 @@ func targetJourney(value any) (string, error) {
 		return "", fmt.Errorf("journeyId must be a string")
 	}
 	return name, nil
+}
+
+func failureCode(reason string) string {
+	switch reason {
+	case journal.ReasonJourneyUnavailable, journal.ReasonPolicyConflict, journal.ReasonActivationRefused, journal.ReasonInteractionExpired:
+		return reason
+	}
+	return "internal_error"
 }

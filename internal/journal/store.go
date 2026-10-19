@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -13,6 +14,7 @@ var (
 	ErrOwnership  = errors.New("run ownership lost")
 	ErrPending    = errors.New("pending commands require another provider request")
 	ErrConflict   = errors.New("communication ID conflicts with accepted command")
+	ErrExpired    = fmt.Errorf("%w: interaction expired", ErrConflict)
 	ErrForbidden  = errors.New("conversation is unavailable to principal")
 	ErrBusy       = errors.New("conversation already has a live run")
 	ErrState      = errors.New("run state does not permit operation")
@@ -38,6 +40,15 @@ const (
 	// RunLimitExceeded is terminal: a cost gateway rejected the run for a
 	// budget or rate limit. Only FinishLimitExceeded may set it.
 	RunLimitExceeded RunState = "limit_exceeded"
+)
+
+// Typed reasons on a run.failed event. They are client-caused failures (or an
+// expired wait) that Chat reports with the same code; "" is an internal failure.
+const (
+	ReasonJourneyUnavailable = "journey_unavailable"
+	ReasonPolicyConflict     = "policy_conflict"
+	ReasonActivationRefused  = "activation_refused"
+	ReasonInteractionExpired = "interaction_expired"
 )
 
 type Command struct{ ThreadID, RunID, CommunicationID, Principal, Tenant, Text, TargetJourney, InteractionID, ReplyKind, ReplyJSON string }
@@ -76,6 +87,10 @@ type Run struct {
 	Settings, ServerInfo       json.RawMessage
 	// CatalogDigest is the catalog snapshot the run used; empty when unrecorded.
 	CatalogDigest string
+	// TerminalReason and TerminalDetail come from the run's latest run.failed or
+	// run.limit_exceeded event; empty when there is none.
+	TerminalReason string
+	TerminalDetail json.RawMessage
 }
 
 type Snapshot struct {

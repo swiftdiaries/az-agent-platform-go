@@ -121,9 +121,15 @@ type Tenancy struct {
 // could carry a credential has been sent.
 var ErrDependencyUnavailable = errors.New("dependency unavailable")
 
-// ErrJourneyUnavailable marks a journey whose tools do not resolve against the
-// conversation's catalog snapshot. The run ends failed and no model call is made.
+// ErrJourneyUnavailable marks an explicit target that is unknown or unavailable.
+// The run ends failed with a typed reason and no model call is made.
 var ErrJourneyUnavailable = errors.New("journey unavailable")
+
+// ErrPolicyConflict marks an explicit target that is unavailable because two journeys give one operation key or alias different policies.
+var ErrPolicyConflict = fmt.Errorf("%w: policy conflict", ErrJourneyUnavailable)
+
+// ErrActivationRefused marks an explicit target that cannot be activated because every active journey is pinned.
+var ErrActivationRefused = fmt.Errorf("%w: activation refused", ErrJourneyUnavailable)
 
 // RunScope is the resolved, recorded scope of one run.
 type RunScope struct {
@@ -297,7 +303,7 @@ func (r *Runner) Binding(ctx context.Context, in RunInput) (string, string, erro
 		return "", digest, nil
 	}
 	if _, ok := set.Journey(in.TargetJourney); !ok {
-		return "", "", fmt.Errorf("unknown journey target")
+		return "", "", fmt.Errorf("%w: unknown journey target", ErrJourneyUnavailable)
 	}
 	return in.TargetJourney, digest, nil
 }
@@ -382,7 +388,7 @@ func (r *Runner) converse(ctx context.Context, input RunInput, set *definitions.
 		if err != nil {
 			if errors.Is(err, journeys.ErrRefused) {
 				recordJourneyEvent(ctx, "journey.activation_refused", limit, "target", input.TargetJourney, nil)
-				return RunOutput{}, fmt.Errorf("%w: %w", ErrJourneyUnavailable, err)
+				return RunOutput{}, fmt.Errorf("%w: %w", ErrActivationRefused, err)
 			}
 			return RunOutput{}, err
 		}
@@ -419,10 +425,14 @@ func unavailableJourney(resolution catalog.Resolution) error {
 		return ErrJourneyUnavailable
 	}
 	reasons := make([]string, 0, len(resolution.Unavailable))
+	kind := ErrJourneyUnavailable
 	for _, u := range resolution.Unavailable {
+		if u.Reason == catalog.ReasonPolicyConflict {
+			kind = ErrPolicyConflict
+		}
 		reasons = append(reasons, string(u.Reason)+" ("+u.Operation+")")
 	}
-	return fmt.Errorf("%w: %s", ErrJourneyUnavailable, strings.Join(reasons, ", "))
+	return fmt.Errorf("%w: %s", kind, strings.Join(reasons, ", "))
 }
 
 func modelRun(parent context.Context, model Model, callBase string, before func(context.Context, *ModelRequest) error, observed func(context.Context) error, access cost.Access, usage func(context.Context, cost.Tokens) error) agent.RunFunc {

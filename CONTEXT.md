@@ -33,7 +33,7 @@ The journeys whose instructions and tools are currently in play for a conversati
 _Avoid_: active specialist
 
 **Explicit target**:
-An optional stable journey identifier supplied with a user message that activates that journey directly. UI mention syntax is outside the agent platform language.
+An optional stable journey identifier supplied with a user message that activates that journey directly. UI mention syntax is outside the agent platform language. A target that is unknown or unavailable fails the run with the code `journey_unavailable` (or `policy_conflict`), and one that cannot be activated because every active journey is pinned fails with `activation_refused`.
 
 **Definition version**:
 An immutable compiled set of journeys (a `definitions.Set`, identified by its digest), pinned by a conversation and re-pinned to the current set at a run start when the conversation is idle (no open wait, no unresolved operation). It identifies instructions, tool selectors, and policy overlays, but not the tools a given user can reach, which come from that user's catalog snapshot.
@@ -68,7 +68,7 @@ The tools the MCP server exposes to one user at one product version. Its tool na
 _Avoid_: tool list, server contract
 
 **Catalog snapshot**:
-A user's tool catalog captured when a conversation's first message is handled, identified by digest and revalidated at each run start. It never grants permission; the MCP server still authorizes every call.
+A user's tool catalog captured when a conversation's first message is handled, identified by digest and revalidated at each run start. Its TTL counts from the last validation. It never grants permission; the MCP server still authorizes every call.
 
 **Tool alias**:
 The stable model-facing name for a tool selector's operation, the same on every tenant and product version whichever of the selector's operation keys resolves. A selector with alternative operation keys declares its alias; a single key defaults to a name derived from it. It is mapped to the user's dynamic tool name at call time.
@@ -97,7 +97,7 @@ The platform port through which a run asks whether it may start and obtains the 
 ### Human interaction
 
 **Human interaction**:
-A durable request for one user's input that pauses the conversation agent at a safe boundary. It is either a clarification question or an explicit action approval. It expires after the interaction TTL.
+A durable request for one user's input that pauses the conversation agent at a safe boundary. It is either a clarification question or an explicit action approval. It expires after the interaction TTL; expiry is a denial, reported with the code `interaction_expired`.
 
 **Clarification question**:
 A structured question with choices and optional custom text. Its answer supplies information; it does not authorize an action.

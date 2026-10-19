@@ -294,7 +294,7 @@ func TestJourneyAuthenticatedAGUIToMCP(t *testing.T) {
 	unknownTarget.ThreadID, unknownTarget.RunID = "thread-5", "message-5"
 	unknownTarget.ForwardedProps = map[string]any{"journeyId": "missing"}
 	unknown := postAGUI(t, api.URL, unknownTarget, "alice-token", "session=alice", "")
-	if unknown.StatusCode != http.StatusOK || !strings.Contains(unknown.Body, `"code":"internal_error"`) || strings.Contains(unknown.Body, "missing") {
+	if unknown.StatusCode != http.StatusOK || !strings.Contains(unknown.Body, `"code":"journey_unavailable"`) || strings.Contains(unknown.Body, "missing") {
 		t.Fatalf("unknown target response = %#v", unknown)
 	}
 

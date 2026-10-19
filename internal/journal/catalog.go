@@ -110,7 +110,8 @@ func (s *Store) CommitSnapshot(ctx context.Context, o Owner, snap CatalogSnapsho
 }
 
 // RecordRunCatalog records, under the ownership fence, that the owner's run used
-// the conversation's pinned snapshot. The digest must be that pin.
+// the conversation's pinned snapshot. The digest must be that pin. Reusing the
+// pin is a revalidation, so it also refreshes the conversation's validation time.
 func (s *Store) RecordRunCatalog(ctx context.Context, o Owner, digest string) error {
 	c := o.Command
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
@@ -123,6 +124,9 @@ func (s *Store) RecordRunCatalog(ctx context.Context, o Owner, digest string) er
 		}
 		if !pinned {
 			return ErrState
+		}
+		if _, err := tx.Exec(ctx, "UPDATE agent_conversations SET catalog_validated_at=clock_timestamp() WHERE id=$1", c.ThreadID); err != nil {
+			return err
 		}
 		_, err := tx.Exec(ctx, "UPDATE agent_runs SET catalog_digest=$3 WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID, digest)
 		return err

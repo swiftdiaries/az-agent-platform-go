@@ -24,14 +24,14 @@ func (s *Store) Snapshot(ctx context.Context, thread, principal string) (Snapsho
 		if err := json.Unmarshal(activeRaw, &snapshot.ActiveJourneys); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, "SELECT id,state,COALESCE(journey_id,''),answer,COALESCE(product_version,''),COALESCE(endpoint_id,''),settings,server_info,COALESCE(catalog_digest,''),ARRAY(SELECT run_id FROM agent_commands c WHERE c.thread_id=r.thread_id AND c.execution_run_id=r.id ORDER BY ordinal),(SELECT count(*) FROM agent_commands c WHERE c.thread_id=r.thread_id AND c.execution_run_id=r.id AND NOT included AND terminal_reason=''),(SELECT jsonb_agg(jsonb_build_object('CommunicationID',c.communication_id,'State',CASE WHEN c.included THEN 'included' WHEN c.terminal_reason='' THEN 'pending' WHEN c.terminal_reason='interrupted' THEN 'interrupted' WHEN c.terminal_reason='consumed' THEN 'consumed' WHEN c.terminal_reason IN ('failed','auth_required','dependency_unavailable','limit_exceeded') THEN 'rejected' ELSE 'rejected' END,'Reason',c.terminal_reason) ORDER BY c.ordinal) FROM agent_commands c WHERE c.thread_id=r.thread_id AND c.execution_run_id=r.id) FROM agent_runs r WHERE thread_id=$1", thread)
+		rows, err := tx.Query(ctx, "SELECT id,state,COALESCE(journey_id,''),answer,COALESCE(product_version,''),COALESCE(endpoint_id,''),settings,server_info,COALESCE(catalog_digest,''),COALESCE((SELECT e.reason FROM agent_events e WHERE e.thread_id=r.thread_id AND e.run_id=r.id AND e.kind IN ('run.failed','run.limit_exceeded') ORDER BY e.sequence DESC LIMIT 1),''),(SELECT e.detail FROM agent_events e WHERE e.thread_id=r.thread_id AND e.run_id=r.id AND e.kind IN ('run.failed','run.limit_exceeded') ORDER BY e.sequence DESC LIMIT 1),ARRAY(SELECT run_id FROM agent_commands c WHERE c.thread_id=r.thread_id AND c.execution_run_id=r.id ORDER BY ordinal),(SELECT count(*) FROM agent_commands c WHERE c.thread_id=r.thread_id AND c.execution_run_id=r.id AND NOT included AND terminal_reason=''),(SELECT jsonb_agg(jsonb_build_object('CommunicationID',c.communication_id,'State',CASE WHEN c.included THEN 'included' WHEN c.terminal_reason='' THEN 'pending' WHEN c.terminal_reason='interrupted' THEN 'interrupted' WHEN c.terminal_reason='consumed' THEN 'consumed' WHEN c.terminal_reason IN ('failed','auth_required','dependency_unavailable','limit_exceeded') THEN 'rejected' ELSE 'rejected' END,'Reason',c.terminal_reason) ORDER BY c.ordinal) FROM agent_commands c WHERE c.thread_id=r.thread_id AND c.execution_run_id=r.id) FROM agent_runs r WHERE thread_id=$1", thread)
 		if err != nil {
 			return err
 		}
 		for rows.Next() {
 			var run Run
 			var outcomes []byte
-			if err := rows.Scan(&run.RunID, &run.State, &run.JourneyID, &run.Answer, &run.ProductVersion, &run.EndpointID, &run.Settings, &run.ServerInfo, &run.CatalogDigest, &run.CommandRunIDs, &run.PendingCommands, &outcomes); err != nil {
+			if err := rows.Scan(&run.RunID, &run.State, &run.JourneyID, &run.Answer, &run.ProductVersion, &run.EndpointID, &run.Settings, &run.ServerInfo, &run.CatalogDigest, &run.TerminalReason, &run.TerminalDetail, &run.CommandRunIDs, &run.PendingCommands, &outcomes); err != nil {
 				rows.Close()
 				return err
 			}

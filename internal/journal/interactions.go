@@ -269,6 +269,9 @@ func expireInteractions(ctx context.Context, tx pgx.Tx, thread string) error {
 		if err := appendEvent(ctx, tx, thread, Event{RunID: run, Type: "interaction.expired"}); err != nil {
 			return err
 		}
+		if err := appendEvent(ctx, tx, thread, Event{RunID: run, Type: "run.failed", Reason: ReasonInteractionExpired}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -318,6 +321,9 @@ func (s *Store) reply(ctx context.Context, c Command) (Receipt, bool, error) {
 		if !valid && state == "pending" {
 			expired = true
 			return expireInteractions(ctx, tx, c.ThreadID)
+		}
+		if state == "expired" {
+			return ErrExpired
 		}
 		if !valid || state != "pending" {
 			return ErrConflict
@@ -373,7 +379,7 @@ func (s *Store) reply(ctx context.Context, c Command) (Receipt, bool, error) {
 		return nil
 	})
 	if err == nil && expired {
-		err = ErrConflict
+		err = ErrExpired
 	}
 	return receipt, fresh, err
 }

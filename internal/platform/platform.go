@@ -20,6 +20,7 @@ import (
 
 var (
 	ErrConflict  = journal.ErrConflict
+	ErrExpired   = journal.ErrExpired
 	ErrForbidden = journal.ErrForbidden
 	ErrBusy      = journal.ErrBusy
 	ErrDraining  = errors.New("platform is draining")
@@ -278,7 +279,12 @@ func (p *Platform) execute(ctx context.Context, owner journal.Owner, c Command, 
 				state = RunAuthRequired
 			}
 		}
-		finishErr := p.store.Finish(ctx, owner, state, output.History, output.Answer, output.CallID, output.ToolName)
+		var finishErr error
+		if reason := failureReason(err); state == RunFailed && reason != "" {
+			finishErr = p.store.FinishFailed(ctx, owner, output.History, reason)
+		} else {
+			finishErr = p.store.Finish(ctx, owner, state, output.History, output.Answer, output.CallID, output.ToolName)
+		}
 		if errors.Is(finishErr, journal.ErrPending) {
 			// Admission won the final-drain race. Continue with this live owner's
 			// credentials and in-memory history; no other replica can claim this run.
@@ -349,4 +355,16 @@ func (p *Platform) Observe(ctx context.Context, thread, principal string, cursor
 		}
 	}()
 	return observation, nil
+}
+
+func failureReason(err error) string {
+	switch {
+	case errors.Is(err, agentruntime.ErrActivationRefused):
+		return journal.ReasonActivationRefused
+	case errors.Is(err, agentruntime.ErrPolicyConflict):
+		return journal.ReasonPolicyConflict
+	case errors.Is(err, agentruntime.ErrJourneyUnavailable):
+		return journal.ReasonJourneyUnavailable
+	}
+	return ""
 }

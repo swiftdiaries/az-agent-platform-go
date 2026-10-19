@@ -81,6 +81,19 @@ func (s *Store) Finish(ctx context.Context, o Owner, state RunState, history jso
 	return s.finish(ctx, o, state, history, answer, callID, tool, nil)
 }
 
+// FinishFailed finishes a run as failed with a typed client-caused reason
+// (journey_unavailable, policy_conflict or activation_refused) recorded on the
+// terminal run.failed event. Everything else matches Finish(RunFailed):
+// operations are marked unknown and pending commands are disposed failed.
+func (s *Store) FinishFailed(ctx context.Context, o Owner, history json.RawMessage, reason string) error {
+	switch reason {
+	case ReasonJourneyUnavailable, ReasonPolicyConflict, ReasonActivationRefused:
+	default:
+		return ErrState
+	}
+	return s.finish(ctx, o, RunFailed, history, "", "", "", &Event{Type: "run.failed", Reason: reason})
+}
+
 // finish is the shared terminal transaction; terminal, when set, replaces the
 // run's default terminal event.
 func (s *Store) finish(ctx context.Context, o Owner, state RunState, history json.RawMessage, answer, callID, tool string, terminal *Event) error {
