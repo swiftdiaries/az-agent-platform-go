@@ -587,3 +587,42 @@ func TestBeginAttemptPolicyEffectfulAndUnknown(t *testing.T) {
 		}
 	}
 }
+
+func TestBeginAttemptPolicyEffectfulRejectedNoSecondAttempt(t *testing.T) {
+	ctx := context.Background()
+	s := scopedStore(t)
+	o := admitClaim(t, s, testCommand())
+	startScoped(t, s, o, "j")
+
+	eff := policyOp(t, s, o, "k1", "effectful")
+	approve(t, s, o, eff, "a1")
+	if err := s.BeginAttempt(ctx, o, eff, 1, "a1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EndAttempt(ctx, o, eff, 1, "rejected"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BeginAttempt(ctx, o, eff, 2, ""); !errors.Is(err, ErrState) {
+		t.Fatalf("effectful attempt 2 after rejected: %v", err)
+	}
+	var outcome string
+	var attempts int
+	if err := s.pool.QueryRow(ctx, "SELECT outcome,(SELECT count(*) FROM agent_attempts WHERE call_id=$1) FROM agent_operations WHERE call_id=$1", "k1").Scan(&outcome, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if outcome != "rejected" || attempts != 1 {
+		t.Fatalf("outcome=%s attempts=%d", outcome, attempts)
+	}
+
+	idem := policyOp(t, s, o, "k2", "idempotent")
+	approve(t, s, o, idem, "a2")
+	if err := s.BeginAttempt(ctx, o, idem, 1, "a2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EndAttempt(ctx, o, idem, 1, "rejected"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BeginAttempt(ctx, o, idem, 2, ""); err != nil {
+		t.Fatalf("idempotent attempt 2 after rejected: %v", err)
+	}
+}

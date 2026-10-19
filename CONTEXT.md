@@ -61,7 +61,7 @@ _Avoid_: allowlist (when meaning exact tool names)
 Platform-owned rules for a journey's operations that can only narrow what the server publishes, such as denying an operation, requiring approval, or setting its policy class.
 
 **Policy class**:
-The reviewed retry and approval class the overlay gives an operation: `read_only`, `idempotent` or `effectful`. Approval is required unless the class is `read_only`. Only `read_only` and `idempotent` operations are retried. MCP annotations inform but never grant a class.
+The reviewed retry and approval class the overlay gives an operation: `read_only`, `idempotent` or `effectful`. Approval is required unless the class is `read_only`. Only `read_only` and `idempotent` operations are retried; an effectful call is never re-sent, even after a business rejection. MCP annotations inform but never grant a class.
 
 **Tool catalog**:
 The tools the MCP server exposes to one user at one product version. Its tool names are dynamic per tenant and user.
@@ -83,7 +83,7 @@ The authoritative mapping from a tenant to its product version and MCP endpoint.
 ### Settings and cost
 
 **Settings**:
-Tenant and user configuration that a settings source supplies and an API can later supply, layered deploy default, then tenant, then user, where a user value can only narrow the tenant's limits. Settings are typed, carry a version digest, and are resolved once at run start and recorded on the run. The first setting is `max_active_journeys`; the second is the opaque `cost.profile`.
+Tenant and user configuration that a settings source supplies and an API can later supply, layered deploy default, then tenant, then user, where a user value can only narrow the tenant's limits. Settings are typed, carry a version digest, and are resolved once at run start and recorded on the run. The first setting is `max_active_journeys`; the second is the opaque `cost.profile`; the third is `interaction_ttl`, the wait cap for human interactions (default 5 minutes).
 
 **Attribution**:
 The opaque identifiers (tenant, principal, conversation, run, journey) that tag a run's model calls and usage so an enforcement point can count them. It never contains credentials or content.
@@ -97,7 +97,7 @@ The platform port through which a run asks whether it may start and obtains the 
 ### Human interaction
 
 **Human interaction**:
-A durable request for one user's input that pauses the conversation agent at a safe boundary. It is either a clarification question or an explicit action approval.
+A durable request for one user's input that pauses the conversation agent at a safe boundary. It is either a clarification question or an explicit action approval. It expires after the interaction TTL.
 
 **Clarification question**:
 A structured question with choices and optional custom text. Its answer supplies information; it does not authorize an action.

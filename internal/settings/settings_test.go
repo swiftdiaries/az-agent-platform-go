@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func ip(n int) *int       { return &n }
@@ -154,7 +155,7 @@ func TestNarrowOnly(t *testing.T) {
 			if s.MaxActiveJourneys != tc.want {
 				t.Fatalf("MaxActiveJourneys = %d, want %d", s.MaxActiveJourneys, tc.want)
 			}
-			if s.Digest != digestOf(tc.want, s.Cost.Profile) {
+			if s.Digest != digestOf(tc.want, s.Cost.Profile, DefaultInteractionTTL) {
 				t.Fatalf("digest does not carry clamped value")
 			}
 			var rec Settings
@@ -191,7 +192,7 @@ func TestMergeDefaultsOnly(t *testing.T) {
 	if s.MaxActiveJourneys != DefaultMaxActiveJourneys || s.Cost.Profile != "" {
 		t.Fatalf("got %+v", s)
 	}
-	if s.Digest != digestOf(DefaultMaxActiveJourneys, "") {
+	if s.Digest != digestOf(DefaultMaxActiveJourneys, "", DefaultInteractionTTL) {
 		t.Fatalf("digest not set")
 	}
 }
@@ -338,7 +339,7 @@ func TestDigest(t *testing.T) {
 	t.Run("canonical form", func(t *testing.T) {
 		c := mustCompile(t, Document{})
 		s := resolve(t, c, "a", "p")
-		want := digestOf(2, "")
+		want := digestOf(2, "", DefaultInteractionTTL)
 		if s.Digest != want {
 			t.Fatalf("digest %s want %s", s.Digest, want)
 		}
@@ -356,7 +357,7 @@ func TestDigest(t *testing.T) {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		want := []string{"cost", "digest", "max_active_journeys"}
+		want := []string{"cost", "digest", "interaction_ttl", "max_active_journeys"}
 		if len(keys) != len(want) {
 			t.Fatalf("keys %v", keys)
 		}
@@ -477,4 +478,94 @@ func TestMutable(t *testing.T) {
 		}
 		wg.Wait()
 	})
+}
+
+func dp(d time.Duration) *time.Duration { return &d }
+
+func TestInteractionTTLDefault(t *testing.T) {
+	s := Merge(Layer{}, Layer{}, Layer{})
+	if s.InteractionTTL != DefaultInteractionTTL || DefaultInteractionTTL != 5*time.Minute {
+		t.Fatalf("InteractionTTL = %v, want 5m", s.InteractionTTL)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(s.Record(), &m); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := m["interaction_ttl"]
+	if !ok {
+		t.Fatalf("record %s lacks interaction_ttl", s.Record())
+	}
+	if string(raw) != "300000000000" {
+		t.Fatalf("interaction_ttl = %s, want 300000000000", raw)
+	}
+}
+
+func TestInteractionTTLTenantOverridesDefault(t *testing.T) {
+	doc := Document{
+		Default: Layer{InteractionTTL: dp(10 * time.Minute)},
+		Tenants: map[string]Layer{"a": {InteractionTTL: dp(time.Hour)}, "b": {}},
+	}
+	c := mustCompile(t, doc)
+	if s := resolve(t, c, "a", "p"); s.InteractionTTL != time.Hour {
+		t.Fatalf("tenant a = %v, want 1h", s.InteractionTTL)
+	}
+	if s := resolve(t, c, "b", "p"); s.InteractionTTL != 10*time.Minute {
+		t.Fatalf("tenant b = %v, want deploy default 10m", s.InteractionTTL)
+	}
+	if s := resolve(t, c, "z", "p"); s.InteractionTTL != 10*time.Minute {
+		t.Fatalf("tenant z = %v, want deploy default 10m", s.InteractionTTL)
+	}
+}
+
+func TestInteractionTTLUserOnlyNarrows(t *testing.T) {
+	doc := Document{
+		Tenants: map[string]Layer{"a": {InteractionTTL: dp(time.Hour)}},
+		Users: map[string]map[string]Layer{"a": {
+			"low":  {InteractionTTL: dp(10 * time.Minute)},
+			"high": {InteractionTTL: dp(2 * time.Hour)},
+		}},
+	}
+	c := mustCompile(t, doc)
+	if s := resolve(t, c, "a", "low"); s.InteractionTTL != 10*time.Minute {
+		t.Fatalf("low = %v, want 10m", s.InteractionTTL)
+	}
+	if s := resolve(t, c, "a", "high"); s.InteractionTTL != time.Hour {
+		t.Fatalf("high = %v, want clamp to tenant 1h", s.InteractionTTL)
+	}
+	if s := Merge(Layer{}, Layer{}, Layer{InteractionTTL: dp(time.Hour)}); s.InteractionTTL != DefaultInteractionTTL {
+		t.Fatalf("above built-in = %v, want 5m", s.InteractionTTL)
+	}
+}
+
+func TestInteractionTTLBounds(t *testing.T) {
+	layers := map[string]func(l Layer) Document{
+		"default": func(l Layer) Document { return Document{Default: l} },
+		"tenant":  func(l Layer) Document { return Document{Tenants: map[string]Layer{"a": l}} },
+		"user":    func(l Layer) Document { return Document{Users: map[string]map[string]Layer{"a": {"p": l}}} },
+	}
+	for name, mk := range layers {
+		for _, bad := range []time.Duration{MinInteractionTTL - time.Nanosecond, 0, MaxInteractionTTL + time.Nanosecond} {
+			_, err := Compile(mk(Layer{InteractionTTL: dp(bad)}))
+			if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), name) {
+				t.Fatalf("%s %v: err = %v, want ErrInvalid naming layer", name, bad, err)
+			}
+		}
+		for _, ok := range []time.Duration{MinInteractionTTL, MaxInteractionTTL} {
+			if _, err := Compile(mk(Layer{InteractionTTL: dp(ok)})); err != nil {
+				t.Fatalf("%s %v: %v", name, ok, err)
+			}
+		}
+	}
+}
+
+func TestInteractionTTLDigest(t *testing.T) {
+	a := Merge(Layer{InteractionTTL: dp(10 * time.Minute)}, Layer{}, Layer{})
+	b := Merge(Layer{InteractionTTL: dp(20 * time.Minute)}, Layer{}, Layer{})
+	a2 := Merge(Layer{}, Layer{InteractionTTL: dp(10 * time.Minute)}, Layer{})
+	if a.Digest == b.Digest {
+		t.Fatalf("different TTL gave same digest %s", a.Digest)
+	}
+	if a.Digest != a2.Digest {
+		t.Fatalf("same TTL gave different digests %s vs %s", a.Digest, a2.Digest)
+	}
 }

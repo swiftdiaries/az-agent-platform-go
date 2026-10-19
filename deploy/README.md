@@ -165,7 +165,7 @@ The app reads these variables (see `config/agent-platform.env.example`):
   `/app/tenancy/tenant-directory.yaml`.
 - `AGENT_PLATFORM_SETTINGS`: path to a required strict YAML settings file
   (deploy default, tenant and user layers; `max_active_journeys` defaults to 2;
-  `cost.profile`). Example: `config/settings.yaml`, mounted at
+  `interaction_ttl` defaults to 5m; `cost.profile`). Example: `config/settings.yaml`, mounted at
   `/app/tenancy/settings.yaml`. A missing file fails startup.
 - `AGENT_PLATFORM_CREDENTIAL_HEADERS`: inbound header names Chat copies into the
   credential forwarded to MCP; default in these manifests `Cookie,Authorization`.

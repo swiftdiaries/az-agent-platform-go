@@ -8,12 +8,11 @@ import (
 	"fmt"
 	"github.com/jackc/pgx/v5"
 	"github.com/microsoft/agent-framework-go/message"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/settings"
 	"io"
 	"strings"
 	"time"
 )
-
-const InteractionTTL = 24 * time.Hour
 
 // ErrSuperseded reports that a decided approval no longer matches the call it was given for;
 // the approval is marked superseded and nothing was dispatched.
@@ -170,19 +169,23 @@ func (s *Store) Wait(ctx context.Context, o Owner, i Interaction, checkpoint, hi
 		}
 		var productVersion, definitionDigest *string
 		var principal string
-		var active []byte
-		if err := tx.QueryRow(ctx, "SELECT r.product_version,r.definition_digest,c.principal,c.active_journeys FROM agent_runs r JOIN agent_conversations c ON c.id=r.thread_id WHERE r.thread_id=$1 AND r.id=$2", c.ThreadID, c.RunID).Scan(&productVersion, &definitionDigest, &principal, &active); err != nil {
+		var active, recorded []byte
+		if err := tx.QueryRow(ctx, "SELECT r.product_version,r.definition_digest,c.principal,c.active_journeys,r.settings FROM agent_runs r JOIN agent_conversations c ON c.id=r.thread_id WHERE r.thread_id=$1 AND r.id=$2", c.ThreadID, c.RunID).Scan(&productVersion, &definitionDigest, &principal, &active, &recorded); err != nil {
 			return err
 		}
 		if productVersion == nil || definitionDigest == nil {
 			return ErrState
+		}
+		ttl, err := recordedInteractionTTL(recorded)
+		if err != nil {
+			return err
 		}
 		expected, err := BindCall(CallBinding{JourneyID: i.JourneyID, OperationKey: i.OperationKey, NameDigest: i.NameDigest, SchemaDigest: i.SchemaDigest,
 			Arguments: i.Call.Arguments, ProductVersion: *productVersion, Principal: principal, Conversation: c.ThreadID, DefinitionSet: *definitionDigest})
 		if err != nil || expected != i.Call.Binding {
 			return ErrState
 		}
-		if err := tx.QueryRow(ctx, "SELECT clock_timestamp()+$1*interval '1 millisecond'", InteractionTTL.Milliseconds()).Scan(&i.ExpiresAt); err != nil {
+		if err := tx.QueryRow(ctx, "SELECT clock_timestamp()+$1*interval '1 millisecond'", ttl.Milliseconds()).Scan(&i.ExpiresAt); err != nil {
 			return err
 		}
 		artifact, err := json.Marshal(i)
@@ -204,6 +207,24 @@ func (s *Store) Wait(ctx context.Context, o Owner, i Interaction, checkpoint, hi
 		}
 		return appendEvent(ctx, tx, c.ThreadID, Event{RunID: c.RunID, Type: "run.awaiting_input", CallID: i.Call.CallID})
 	})
+}
+
+// recordedInteractionTTL reads the wait cap from the settings recorded on the run; runs recorded
+// before the setting existed (or with no value) get the built-in default.
+func recordedInteractionTTL(recorded []byte) (time.Duration, error) {
+	if len(recorded) == 0 {
+		return settings.DefaultInteractionTTL, nil
+	}
+	var r struct {
+		InteractionTTL time.Duration `json:"interaction_ttl"`
+	}
+	if err := json.Unmarshal(recorded, &r); err != nil {
+		return 0, ErrState
+	}
+	if r.InteractionTTL <= 0 {
+		return settings.DefaultInteractionTTL, nil
+	}
+	return r.InteractionTTL, nil
 }
 func expireInteractions(ctx context.Context, tx pgx.Tx, thread string) error {
 	rows, err := tx.Query(ctx, "UPDATE agent_interactions SET state='expired',marker=CASE WHEN kind='approval' THEN 'denied' END WHERE thread_id=$1 AND state='pending' AND expires_at<=clock_timestamp() RETURNING run_id", thread)

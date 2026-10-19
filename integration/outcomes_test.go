@@ -251,7 +251,7 @@ func TestBeginAttemptSecondAttemptPredecessorMatrix(t *testing.T) {
 				}
 
 				err = store.BeginAttempt(t.Context(), owner, op, 2, "")
-				allowed := predecessor == "rejected" || predecessor == "outcome_unknown" && policy != "effectful"
+				allowed := (predecessor == "rejected" || predecessor == "outcome_unknown") && policy != "effectful"
 				if allowed && err != nil {
 					t.Fatalf("allowed retry rejected: %v", err)
 				}
@@ -702,7 +702,7 @@ func TestBusinessErrorChangedActionRequiresNewApproval(t *testing.T) {
 			next = r.Interaction
 		}
 	}
-	if next == nil || next.Call.Binding == i.Call.Binding || next.Call.CallID == i.Call.CallID || calls.Load() != 2 || models.Load() != 2 {
+	if next == nil || next.Call.Binding == i.Call.Binding || next.Call.CallID == i.Call.CallID || calls.Load() != 1 || models.Load() != 2 {
 		t.Fatal("repair did not request new exact approval", calls.Load(), models.Load())
 	}
 	bad := approve("reply2", next)
@@ -715,7 +715,7 @@ func TestBusinessErrorChangedActionRequiresNewApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	awaitState(t, p, c.ThreadID, reply.RunID, journal.RunFailed)
-	if calls.Load() != 4 || models.Load() != 2 {
+	if calls.Load() != 2 || models.Load() != 2 {
 		t.Fatal("repair budget reset across wait", calls.Load(), models.Load())
 	}
 	var unknown int

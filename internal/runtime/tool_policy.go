@@ -42,9 +42,10 @@ func guardedCall(ctx context.Context, in RunInput, binding toolCatalog, op journ
 		if errors.Is(err, catalog.ErrNotPermitted) {
 			return map[string]any{"error": "not_permitted"}, nil
 		}
-		// A business rejection is definite; repeat unchanged once before offering one
-		// argument repair. Transport uncertainty requires reviewed replay safety.
-		safe := outcome == "rejected" || op.Policy == "read_only" || op.Policy == "idempotent"
+		// An approved effectful call is never re-sent, even after a business rejection.
+		// read_only and idempotent calls repeat unchanged once, after a rejection or
+		// transport uncertainty alike, before offering one argument repair.
+		safe := op.Policy == "read_only" || op.Policy == "idempotent"
 		if !safe || attempt == 2 {
 			if outcome == "outcome_unknown" {
 				return nil, journal.ErrOutcomeUnknown

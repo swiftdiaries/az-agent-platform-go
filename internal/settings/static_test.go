@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const staticSample = `default:
@@ -80,7 +81,7 @@ func TestStaticLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.MaxActiveJourneys != DefaultMaxActiveJourneys || got.Cost.Profile != "" || got.Digest != digestOf(DefaultMaxActiveJourneys, "") {
+	if got.MaxActiveJourneys != DefaultMaxActiveJourneys || got.Cost.Profile != "" || got.Digest != digestOf(DefaultMaxActiveJourneys, "", DefaultInteractionTTL) {
 		t.Fatalf("built-ins = %+v", got)
 	}
 
@@ -142,4 +143,31 @@ func TestStaticStrict(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestStaticInteractionTTL(t *testing.T) {
+	s, err := ParseStatic([]byte("default:\n  interaction_ttl: 36h\ntenants:\n  t:\n    interaction_ttl: 2h\nusers:\n  t:\n    p:\n      interaction_ttl: 30m\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Resolve(context.Background(), Scope{Tenant: "t", Principal: "p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.InteractionTTL != 30*time.Minute {
+		t.Fatalf("user = %v, want 30m", got.InteractionTTL)
+	}
+	got, _ = s.Resolve(context.Background(), Scope{Tenant: "t", Principal: "q"})
+	if got.InteractionTTL != 2*time.Hour {
+		t.Fatalf("tenant = %v, want 2h", got.InteractionTTL)
+	}
+	got, _ = s.Resolve(context.Background(), Scope{Tenant: "other", Principal: "q"})
+	if got.InteractionTTL != 36*time.Hour {
+		t.Fatalf("default = %v, want 36h", got.InteractionTTL)
+	}
+	for _, y := range []string{"default:\n  interaction_ttl: soon\n", "default:\n  interaction_ttl: 30s\n"} {
+		if _, err := ParseStatic([]byte(y)); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%q err = %v, want ErrInvalid", y, err)
+		}
+	}
 }

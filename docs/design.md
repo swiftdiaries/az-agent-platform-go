@@ -33,7 +33,7 @@ They communicate through a narrow in-process interface. A journey is configurati
 - The user's MCP `tools/list` result is captured and cached when a conversation's first message is handled.
 - Tenants run different product versions. The MCP server ships in step with the product, so each product version has its own MCP endpoint, and a tenant directory maps each tenant to its product version and endpoint. Several product versions are supported at once.
 - The Java MCP server publishes `_meta` on its tools.
-- Most journeys can ask structured clarification questions and request explicit action approval. A durable wait may span pod replacement and hours or days, then resume the same pinned conversation on any replica without repeating completed tools.
+- Most journeys can ask structured clarification questions and request explicit action approval. A durable wait may span pod replacement and lasts up to the tenant's interaction TTL (default 5 minutes), then resumes the same pinned conversation on any replica without repeating completed tools.
 - **Tenant and user settings** that an API can later supply. `max_active_journeys` is the first such setting.
 - **A cost API** whose enforcement sits outside the platform (an Envoy RLS service, a Linkerd-based RLS service, or LiteLLM virtual keys per tenant and per user, possibly in front of a gateway such as agentgateway). The platform builds and tests the seams now; the mechanism behind them is chosen later.
 
@@ -482,6 +482,7 @@ The policy overlay assigns each operation a class. The class is authoritative fo
 
 ## Human waits and approvals
 
+- **Expiry.** Every wait (clarification or approval) expires after `interaction_ttl`, resolved from settings at run start and recorded on the run. The default is 5 minutes. An expired interaction can no longer be answered.
 - **Clarification.** One to three questions, each with two or three described options, plus optional custom text. It supplies information only. A pending clarification survives a product-version change because it authorizes nothing.
 - **Approval binding** is an immutable digest over the operation key, the resolved-name digest, the input-schema digest, the canonical arguments (`json.Number` preserved, trailing data rejected), and the product version, principal, conversation and definition-set digest. The server stores the call; client-supplied replacement calls are rejected.
 
@@ -536,7 +537,7 @@ Every MCP call gets a stable opaque call ID. After a live transport failure wher
 - **Single retry owner.** The agent runtime owns retry. Model SDK retry stays disabled, or counts in the same budget. There is one retry budget per run, one logical operation ID per operation, and a distinct attempt ID per attempt.
 - **Transient model failure:** may retry with bounded exponential backoff and jitter inside one total deadline. A limit rejection is never retried in-run.
 - **Transient MCP failure:** retried only for `read_only` or `idempotent` operations. The Binding, not the model, owns those attempts.
-- **Business rejection:** returned as a small structured result so the model can repair its arguments within a per-turn tool-error budget. Changed arguments are a new proposed action and need a new approval where approval applies.
+- **Business rejection:** returned as a small structured result so the model can repair its arguments within a per-turn tool-error budget. Changed arguments are a new proposed action and need a new approval where approval applies. An approved effectful call is never re-sent, even after a business rejection (decided 2026-10-19, R3); `read_only` and `idempotent` operations repeat a rejected call unchanged once before the model may repair it.
 - **Ambiguous effectful call:** `outcome_unknown`. The run ends, the operation's journey is **pinned**, and no model re-issue happens. Reconciliation or explicit product policy is required before another related action. V1 keeps TARGET's **thread-level stop**: a later run start is refused while an operation is unresolved. The journey pin is recorded as well, so a later reconcile path can relax the stop to the journey.
 - **Auth failure (401):** credential missing or expired. `auth_required`, and the Binding is marked broken so no later call in the run is sent.
 - **Entitlement rejection (403)** on `tools/call` (M15): the model sees the nil-error result `{"error":"not_permitted"}`. The operation's outcome is `rejected`; it is not retried, it does not mark the Binding broken, and other tools stay callable. A 403 on `initialize` or `tools/list` stays `auth_required`, since there is no call to answer. A call rejected because the user's entitlement changed after the snapshot is one of these two, never `outcome_unknown`.
@@ -559,8 +560,9 @@ Settings decouple per-tenant and per-user behaviour from code and deployment. Th
 - **When it applies.** Settings are resolved once at run start (after the tenant directory) and recorded on the run: digest plus applied values. A resolution failure is `dependency_unavailable`, before any dispatch.
 - **Fields:**
   - `max_active_journeys`: default 2, allowed 1 to 4 (see [Active set](#active-set-and-the-per-tenant-limit));
+  - `interaction_ttl`: the wait cap for clarifications and approvals, a duration, default 5m, allowed 1m to 7d; a user value only narrows (shorter);
   - `cost.profile`: an opaque reference that the cost adapter interprets.
-- **User-level cost settings are deferred.** `cost.profile` is set only at the deploy-default and tenant layers for now; a user layer may only narrow `max_active_journeys`. A user cost layer needs its own narrowing rule before it is accepted.
+- **User-level cost settings are deferred.** `cost.profile` is set only at the deploy-default and tenant layers for now; a user layer may only narrow `max_active_journeys` and `interaction_ttl`. A user cost layer needs its own narrowing rule before it is accepted.
 
 ## Cost seam
 

@@ -73,6 +73,7 @@ data:
   settings.yaml: |
     default:
       max_active_journeys: 2
+      interaction_ttl: 5m
       cost:
         profile: ""
 ---

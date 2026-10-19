@@ -1,7 +1,8 @@
 // Package settings resolves layered, typed per-tenant and per-user settings.
 //
 // Values layer built-in defaults, then the deploy default, then the tenant,
-// then the user. A user layer may only narrow limits. Settings are resolved
+// then the user. A user layer may only narrow limits (max_active_journeys and
+// interaction_ttl; cost is not settable per user). Settings are resolved
 // once per run and recorded with a version digest of the applied values.
 package settings
 
@@ -14,12 +15,18 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 )
 
 const (
 	DefaultMaxActiveJourneys = 2
 	MinMaxActiveJourneys     = 1
 	MaxMaxActiveJourneys     = 4
+
+	// DefaultInteractionTTL is the built-in wait cap for human clarifications and approvals.
+	DefaultInteractionTTL = 5 * time.Minute
+	MinInteractionTTL     = time.Minute
+	MaxInteractionTTL     = 7 * 24 * time.Hour
 )
 
 var (
@@ -41,9 +48,10 @@ type Cost struct {
 // Settings are the resolved, applied values for one run. Digest is a version
 // digest of the applied values.
 type Settings struct {
-	MaxActiveJourneys int    `json:"max_active_journeys"`
-	Cost              Cost   `json:"cost"`
-	Digest            string `json:"digest"`
+	MaxActiveJourneys int           `json:"max_active_journeys"`
+	Cost              Cost          `json:"cost"`
+	InteractionTTL    time.Duration `json:"interaction_ttl"`
+	Digest            string        `json:"digest"`
 }
 
 // Record returns the JSON the journal stores on the run: applied values and digest.
@@ -62,8 +70,9 @@ type Source interface {
 
 // Layer is one partial layer. nil means not set at this layer.
 type Layer struct {
-	MaxActiveJourneys *int       `json:"max_active_journeys,omitempty" yaml:"max_active_journeys,omitempty"`
-	Cost              *CostLayer `json:"cost,omitempty" yaml:"cost,omitempty"`
+	MaxActiveJourneys *int           `json:"max_active_journeys,omitempty" yaml:"max_active_journeys,omitempty"`
+	Cost              *CostLayer     `json:"cost,omitempty" yaml:"cost,omitempty"`
+	InteractionTTL    *time.Duration `json:"interaction_ttl,omitempty" yaml:"interaction_ttl,omitempty"`
 }
 
 // CostLayer is the partial cost layer.
@@ -97,6 +106,10 @@ func copyLayer(l Layer) Layer {
 		v := *l.MaxActiveJourneys
 		out.MaxActiveJourneys = &v
 	}
+	if l.InteractionTTL != nil {
+		v := *l.InteractionTTL
+		out.InteractionTTL = &v
+	}
 	if l.Cost != nil {
 		c := CostLayer{}
 		if l.Cost.Profile != nil {
@@ -112,6 +125,9 @@ func checkBounds(name string, l Layer) error {
 	if n := l.MaxActiveJourneys; n != nil && (*n < MinMaxActiveJourneys || *n > MaxMaxActiveJourneys) {
 		return invalidf("%s: max_active_journeys %d outside %d-%d", name, *n, MinMaxActiveJourneys, MaxMaxActiveJourneys)
 	}
+	if d := l.InteractionTTL; d != nil && (*d < MinInteractionTTL || *d > MaxInteractionTTL) {
+		return invalidf("%s: interaction_ttl %s outside %s-%s", name, *d, MinInteractionTTL, MaxInteractionTTL)
+	}
 	return nil
 }
 
@@ -121,6 +137,9 @@ func apply(s *Settings, l Layer) {
 	}
 	if l.Cost != nil && l.Cost.Profile != nil {
 		s.Cost.Profile = *l.Cost.Profile
+	}
+	if l.InteractionTTL != nil {
+		s.InteractionTTL = *l.InteractionTTL
 	}
 }
 
@@ -192,25 +211,29 @@ func (c *Compiled) Resolve(ctx context.Context, scope Scope) (Settings, error) {
 	return Merge(c.def, c.tenants[scope.Tenant], c.users[scope.Tenant][scope.Principal]), nil
 }
 
-// Merge layers built-in defaults, def, tenant, then user: the user's max_active_journeys is clamped to the
-// tenant-effective value (min). User cost is ignored (Compile still rejects it). Digest is set. Pure.
+// Merge layers built-in defaults, def, tenant, then user: the user's max_active_journeys and
+// interaction_ttl are each clamped to the tenant-effective value (min). User cost is ignored (Compile still rejects it). Digest is set. Pure.
 func Merge(def, tenant, user Layer) Settings {
-	s := Settings{MaxActiveJourneys: DefaultMaxActiveJourneys}
+	s := Settings{MaxActiveJourneys: DefaultMaxActiveJourneys, InteractionTTL: DefaultInteractionTTL}
 	apply(&s, def)
 	apply(&s, tenant)
 	if n := user.MaxActiveJourneys; n != nil && *n < s.MaxActiveJourneys {
 		s.MaxActiveJourneys = *n
 	}
-	s.Digest = digestOf(s.MaxActiveJourneys, s.Cost.Profile)
+	if d := user.InteractionTTL; d != nil && *d < s.InteractionTTL {
+		s.InteractionTTL = *d
+	}
+	s.Digest = digestOf(s.MaxActiveJourneys, s.Cost.Profile, s.InteractionTTL)
 	return s
 }
 
 // digestOf is the lowercase hex SHA-256 of the canonical JSON of the applied values.
-func digestOf(maxActive int, profile string) string {
+func digestOf(maxActive int, profile string, ttl time.Duration) string {
 	b, _ := json.Marshal(struct {
-		Cost              Cost `json:"cost"`
-		MaxActiveJourneys int  `json:"max_active_journeys"`
-	}{Cost{profile}, maxActive})
+		Cost              Cost          `json:"cost"`
+		InteractionTTL    time.Duration `json:"interaction_ttl"`
+		MaxActiveJourneys int           `json:"max_active_journeys"`
+	}{Cost{profile}, ttl, maxActive})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
