@@ -150,16 +150,39 @@ func bearerRequest(token string) *http.Request {
 func TestKeycloakAuthenticatorValidatesAndCanonicalizesPrincipal(t *testing.T) {
 	key, jwk := newSigningKey(t, "one")
 	auth, _ := newTestAuthenticator(t, jwk)
-	principal, err := auth.Authenticate(bearerRequest(signedToken(t, key, "one", jwt.MapClaims{"sub": "alice", "tenant": "tenant-a"})))
+	identity, err := auth.Authenticate(bearerRequest(signedToken(t, key, "one", jwt.MapClaims{"sub": "alice", "tenant": "tenant-a"})))
 	if err != nil {
 		t.Fatal(err)
 	}
+	principal := identity.Principal
 	if principal != "8:tenant-a5:alice" {
 		t.Fatalf("principal = %q", principal)
 	}
+	otherIdentity, err := auth.Authenticate(bearerRequest(signedToken(t, key, "one", jwt.MapClaims{"sub": "lice", "tenant": "tenant-aa"})))
+	if err != nil || principal == otherIdentity.Principal {
+		t.Fatalf("tenant/user identity collision: principal=%q other=%q err=%v", principal, otherIdentity.Principal, err)
+	}
+}
+
+func TestKeycloakIdentityExposesTenant(t *testing.T) {
+	key, jwk := newSigningKey(t, "one")
+	auth, _ := newTestAuthenticator(t, jwk)
+	identity, err := auth.Authenticate(bearerRequest(signedToken(t, key, "one", jwt.MapClaims{"sub": "alice", "tenant": "tenant-a"})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.Tenant != "tenant-a" {
+		t.Fatalf("tenant = %q", identity.Tenant)
+	}
+	if want := canonicalPrincipal("tenant-a", "alice"); identity.Principal != want {
+		t.Fatalf("principal = %q, want %q", identity.Principal, want)
+	}
 	other, err := auth.Authenticate(bearerRequest(signedToken(t, key, "one", jwt.MapClaims{"sub": "lice", "tenant": "tenant-aa"})))
-	if err != nil || principal == other {
-		t.Fatalf("tenant/user identity collision: principal=%q other=%q err=%v", principal, other, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.Tenant != "tenant-aa" || other.Principal == identity.Principal {
+		t.Fatalf("tenant/user identity collision: %+v vs %+v", identity, other)
 	}
 }
 

@@ -1,0 +1,319 @@
+package catalog
+
+import (
+	"encoding/json"
+	"sort"
+
+	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
+)
+
+const defaultMaxTools = 15
+
+// Snapshot is the set of tools an integration endpoint advertised for one
+// product version. It is evidence, never authorization.
+type Snapshot struct {
+	Digest, ProductVersion, EndpointID, ServerVersion string
+	Tools                                             []Descriptor
+}
+
+// Reason says why a journey cannot be served from a snapshot.
+type Reason string
+
+const (
+	ReasonMissing        Reason = "missing_operation"
+	ReasonAmbiguous      Reason = "ambiguous_operation"
+	ReasonCollision      Reason = "alias_collision"
+	ReasonInvalidAlias   Reason = "invalid_alias"
+	ReasonMaxTools       Reason = "max_tools_exceeded"
+	ReasonVersion        Reason = "product_version_out_of_range"
+	ReasonPolicyConflict Reason = "policy_conflict"
+)
+
+// Unavailable is one reason a journey cannot be served. Operation is an
+// operation key, or an alias for collisions; it is never a remote tool name.
+type Unavailable struct {
+	Reason    Reason
+	Operation string
+}
+
+// Tool is one resolved operation as the model sees it.
+type Tool struct {
+	Alias, OperationKey, RemoteName string
+	Description                     string
+	InputSchema                     json.RawMessage
+	Class                           definitions.Class // never empty: unclassified resolves to effectful
+	RequiresApproval                bool              // Class != read_only or the overlay requires approval
+}
+
+// Resolution is the outcome of resolving one journey against a snapshot.
+type Resolution struct {
+	JourneyID   string
+	Tools       []Tool        // sorted by alias; nil when unavailable
+	Unavailable []Unavailable // empty means available
+}
+
+// Available reports whether the journey can be served.
+func (r Resolution) Available() bool { return len(r.Unavailable) == 0 }
+
+// selection accumulates what the matching selectors say about one tool. Only
+// an op selector contributes a class; a tag match adds approval alone.
+type selection struct {
+	opClass  definitions.Class
+	opAlias  string
+	fromOp   bool
+	approval bool
+}
+
+// alias is the choosing op selector's alias; a tool matched only by tags
+// takes the alias derived from its operation key.
+func (s selection) alias(key string) string {
+	if s.fromOp && s.opAlias != "" {
+		return s.opAlias
+	}
+	alias, _ := definitions.AliasFor(key)
+	return alias
+}
+
+func (s selection) class() definitions.Class {
+	if s.fromOp && s.opClass != "" {
+		return s.opClass
+	}
+	return definitions.ClassEffectful
+}
+
+// Resolve matches the journey's reviewed selectors against the snapshot. It is
+// pure and deterministic: the result does not depend on the order of
+// snapshot.Tools.
+func Resolve(journey definitions.Journey, snapshot Snapshot, metaKey string) Resolution {
+	res := Resolution{JourneyID: journey.ID}
+	if !journey.ProductVersions.IsZero() && !journey.ProductVersions.Contains(snapshot.ProductVersion) {
+		res.Unavailable = []Unavailable{{ReasonVersion, ""}}
+		return res
+	}
+
+	denied := make(map[string]bool, len(journey.Deny))
+	for _, key := range journey.Deny {
+		denied[key] = true
+	}
+	// byKey indexes selectable tools (non-empty string key, not denied).
+	keys := make([]string, len(snapshot.Tools))
+	byKey := map[string][]int{}
+	for i, d := range snapshot.Tools {
+		if key, ok := d.Meta[metaKey].(string); ok && key != "" && !denied[key] {
+			keys[i] = key
+			byKey[key] = append(byKey[key], i)
+		}
+	}
+
+	var unavailable []Unavailable
+	seen := map[Unavailable]bool{}
+	add := func(reason Reason, operation string) {
+		u := Unavailable{reason, operation}
+		if !seen[u] {
+			seen[u] = true
+			unavailable = append(unavailable, u)
+		}
+	}
+
+	selected := map[int]selection{}
+	keyTools := map[string]map[int]bool{}
+	choose := func(index int, s definitions.Selector) {
+		next := selected[index]
+		next.approval = next.approval || s.ApprovalRequired
+		if len(s.Ops) > 0 {
+			next.opClass = s.Class
+			next.opAlias = s.Alias
+			next.fromOp = true
+		}
+		selected[index] = next
+		if keyTools[keys[index]] == nil {
+			keyTools[keys[index]] = map[int]bool{}
+		}
+		keyTools[keys[index]][index] = true
+	}
+
+	// Operation selectors: the first alternative with a candidate wins.
+	for _, s := range journey.Tools {
+		if len(s.Ops) == 0 {
+			continue
+		}
+		found := false
+		for _, op := range s.Ops {
+			var candidates []int
+			for _, index := range byKey[op] {
+				if !s.ReadOnlyHint || snapshot.Tools[index].ReadOnlyHint {
+					candidates = append(candidates, index)
+				}
+			}
+			if len(candidates) == 0 {
+				continue
+			}
+			found = true
+			if len(candidates) > 1 {
+				add(ReasonAmbiguous, op)
+			} else {
+				choose(candidates[0], s)
+			}
+			break
+		}
+		if !found {
+			add(ReasonMissing, s.Ops[0])
+		}
+	}
+
+	// Tag selectors are optional: they add every matching keyed tool.
+	for _, s := range journey.Tools {
+		if len(s.Ops) != 0 || len(s.Tags) == 0 {
+			continue
+		}
+		for index, d := range snapshot.Tools {
+			if keys[index] != "" && (!s.ReadOnlyHint || d.ReadOnlyHint) && hasAllTags(d.Meta, s.Tags) {
+				choose(index, s)
+			}
+		}
+	}
+
+	selectedKeys := make([]string, 0, len(keyTools))
+	for key := range keyTools {
+		selectedKeys = append(selectedKeys, key)
+	}
+	sort.Strings(selectedKeys)
+
+	// Two different remote tools for one operation key are ambiguous.
+	for _, key := range selectedKeys {
+		if len(keyTools[key]) > 1 {
+			add(ReasonAmbiguous, key)
+		}
+	}
+
+	// Aliases must be valid, unreserved and unique within the journey.
+	aliasOwner := map[string]string{}
+	for _, key := range selectedKeys {
+		indexes := make([]int, 0, len(keyTools[key]))
+		for index := range keyTools[key] {
+			indexes = append(indexes, index)
+		}
+		sort.Ints(indexes)
+		for _, index := range indexes {
+			alias := selected[index].alias(key)
+			switch {
+			case !definitions.ValidAlias(alias):
+				add(ReasonInvalidAlias, key)
+			case definitions.IsReservedToolName(alias):
+				add(ReasonCollision, alias)
+			default:
+				if owner, ok := aliasOwner[alias]; ok && owner != key {
+					add(ReasonCollision, alias)
+				}
+				aliasOwner[alias] = key
+			}
+		}
+	}
+
+	maxTools := journey.MaxTools
+	if maxTools <= 0 {
+		maxTools = defaultMaxTools
+	}
+	if len(selected) > maxTools {
+		add(ReasonMaxTools, "")
+	}
+
+	if len(unavailable) > 0 {
+		res.Unavailable = unavailable
+		return res
+	}
+	tools := make([]Tool, 0, len(selected))
+	for index, sel := range selected {
+		d := snapshot.Tools[index]
+		tools = append(tools, Tool{
+			Alias: sel.alias(keys[index]), OperationKey: keys[index], RemoteName: d.Name,
+			Description: d.Description, InputSchema: d.InputSchema,
+			Class:            sel.class(),
+			RequiresApproval: sel.class() != definitions.ClassReadOnly || sel.approval,
+		})
+	}
+	sort.Slice(tools, func(a, b int) bool { return tools[a].Alias < tools[b].Alias })
+	if len(tools) > 0 {
+		res.Tools = tools
+	}
+	return res
+}
+
+func hasAllTags(meta map[string]any, want []string) bool {
+	list, _ := meta["tags"].([]any)
+	have := make(map[string]bool, len(list))
+	for _, v := range list {
+		if tag, ok := v.(string); ok {
+			have[tag] = true
+		}
+	}
+	for _, tag := range want {
+		if !have[tag] {
+			return false
+		}
+	}
+	return true
+}
+
+type policy struct {
+	class    definitions.Class
+	approval bool
+}
+
+// CheckPolicies marks unavailable every available resolution that shares an
+// operation key or an alias with another available resolution under a
+// different (Class, RequiresApproval). It is pure: it returns a new slice,
+// preserves input order, and leaves unavailable resolutions unchanged.
+func CheckPolicies(rs []Resolution) []Resolution {
+	keyPolicies := map[string]map[policy]bool{}
+	aliasPolicies := map[string]map[policy]bool{}
+	note := func(m map[string]map[policy]bool, name string, p policy) {
+		if m[name] == nil {
+			m[name] = map[policy]bool{}
+		}
+		m[name][p] = true
+	}
+	for _, r := range rs {
+		if !r.Available() {
+			continue
+		}
+		for _, t := range r.Tools {
+			p := policy{t.Class, t.RequiresApproval}
+			note(keyPolicies, t.OperationKey, p)
+			note(aliasPolicies, t.Alias, p)
+		}
+	}
+
+	out := make([]Resolution, len(rs))
+	for i, r := range rs {
+		out[i] = r
+		if !r.Available() {
+			continue
+		}
+		seen := map[string]bool{}
+		var conflicts []string
+		for _, t := range r.Tools {
+			name := ""
+			switch {
+			case len(keyPolicies[t.OperationKey]) > 1:
+				name = t.OperationKey
+			case len(aliasPolicies[t.Alias]) > 1:
+				name = t.Alias
+			}
+			if name != "" && !seen[name] {
+				seen[name] = true
+				conflicts = append(conflicts, name)
+			}
+		}
+		if len(conflicts) == 0 {
+			continue
+		}
+		sort.Strings(conflicts)
+		out[i].Tools = nil
+		out[i].Unavailable = make([]Unavailable, len(conflicts))
+		for j, name := range conflicts {
+			out[i].Unavailable[j] = Unavailable{ReasonPolicyConflict, name}
+		}
+	}
+	return out
+}

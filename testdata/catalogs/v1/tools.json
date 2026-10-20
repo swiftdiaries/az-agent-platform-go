@@ -1,0 +1,37 @@
+[
+  {
+    "name": "lookup_destination",
+    "description": "Look up a travel destination and return its highlights and typical weather.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {"destination": {"type": "string", "description": "City or region name"}},
+      "required": ["destination"]
+    },
+    "annotations": {"readOnlyHint": true},
+    "_meta": {"operation_key": "lookup_destination", "tags": ["travel"]}
+  },
+  {
+    "name": "lookup_shift",
+    "description": "Return the caller's scheduled shift for a date.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {"date": {"type": "string", "description": "ISO-8601 date"}},
+      "required": ["date"]
+    },
+    "annotations": {"readOnlyHint": true},
+    "_meta": {"operation_key": "lookup_shift", "tags": ["shifts"]}
+  },
+  {
+    "name": "request_shift_swap",
+    "description": "Ask a colleague to swap a shift with the caller.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "date": {"type": "string", "description": "ISO-8601 date of the shift"},
+        "colleague": {"type": "string", "description": "Colleague identifier"}
+      },
+      "required": ["date", "colleague"]
+    },
+    "_meta": {"operation_key": "request_shift_swap", "tags": ["shifts"]}
+  }
+]

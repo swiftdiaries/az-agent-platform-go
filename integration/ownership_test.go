@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 	"reflect"
@@ -229,7 +230,7 @@ func TestOwnershipLossDuringModelRejectsResultAndRequiresFreshIngress(t *testing
 	pool := database(t)
 	started, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var calls atomic.Int64
-	runner := fixtureRunner(t, modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	runner := fixtureRunner(t, pool, modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		if calls.Add(1) == 1 {
 			close(started)
 			<-release
@@ -245,8 +246,8 @@ func TestOwnershipLossDuringModelRejectsResultAndRequiresFreshIngress(t *testing
 	defer a.Close()
 	b := platform.New(runner, journal.New(pool))
 	defer b.Close()
-	command := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "comm", Principal: "alice", Text: "initial"}
-	if _, err := a.Submit(ctx, platform.Submission{Command: command}); err != nil {
+	command := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "comm", Principal: "alice", Tenant: testTenant, Text: "initial"}
+	if _, err := a.Submit(ctx, command, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -257,7 +258,7 @@ func TestOwnershipLossDuringModelRejectsResultAndRequiresFreshIngress(t *testing
 	command.RunID = "steer"
 	command.CommunicationID = "steer"
 	command.Text = "pending correction"
-	receipt, err := b.Submit(ctx, platform.Submission{Command: command})
+	receipt, err := b.Submit(ctx, command, credential.Credential{})
 	if err != nil || receipt.ExecutionRunID != "run" {
 		t.Fatalf("steering %+v %v", receipt, err)
 	}
@@ -286,14 +287,14 @@ func TestOwnershipLossDuringModelRejectsResultAndRequiresFreshIngress(t *testing
 	if !reflect.DeepEqual(before, after) {
 		t.Fatalf("stale completion changed journal before %+v after %+v", before, after)
 	}
-	duplicate, err := b.Submit(ctx, platform.Submission{Command: command})
+	duplicate, err := b.Submit(ctx, command, credential.Credential{})
 	if err != nil || duplicate != receipt || calls.Load() != 1 {
 		t.Fatalf("retry restarted interrupted owner: %+v %v", duplicate, err)
 	}
 	command.RunID = "fresh"
 	command.CommunicationID = "fresh"
 	command.Text = "fresh ingress"
-	if _, err := b.Submit(ctx, platform.Submission{Command: command}); err != nil {
+	if _, err := b.Submit(ctx, command, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	waitDatabase(t, pool, "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE id='fresh' AND state='completed')")

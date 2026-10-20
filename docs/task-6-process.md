@@ -4,8 +4,9 @@
 
 `/livez` returns success while the process is serving. It never opens PostgreSQL,
 Foundry, or MCP connections. `/readyz` returns success only when the process is
-not draining and PostgreSQL can verify every current or session-referenced
-definition digest against the loaded immutable registry. It never calls a model
+not draining and a current definition set exists and the current set plus every
+set referenced by an open wait or an unresolved operation loads and compiles
+from the PostgreSQL definition store. It never calls a model
 or MCP server.
 
 On `SIGTERM`, the command entrypoint will call `Service.Shutdown` with
@@ -27,8 +28,13 @@ these nonsecret values through `envFrom`; actual values have not been supplied.
 | --- | --- |
 | `AGENT_PLATFORM_PORT` | HTTP listen port |
 | `AGENT_PLATFORM_SHUTDOWN_GRACE` | Go duration for graceful drain |
-| `AGENT_PLATFORM_CONFIG` | mounted immutable `journeys.yaml` path |
-| `AGENT_PLATFORM_RETAINED_CONFIGS` | comma-separated mounted retained bundle paths when database pins require them |
+| `AGENT_PLATFORM_MCP_ENDPOINTS` | MCP endpoint allowlist, `id=url[,id2=url2]` |
+| `AGENT_PLATFORM_CREDENTIAL_HEADERS` | inbound header names copied into the credential sent to MCP |
+| `AGENT_PLATFORM_TENANT_DIRECTORY` | mounted tenant directory YAML path |
+| `AGENT_PLATFORM_SETTINGS` | mounted settings YAML path |
+| `AGENT_PLATFORM_COST_GATE` | `open` or `headers` |
+| `AGENT_PLATFORM_COST_HEADERS` | attribution header names; blank uses the `X-Agent-*` defaults |
+| `AGENT_PLATFORM_HISTORY_BUDGET` | `model=tokens` pairs that include the configured model |
 | `KEYCLOAK_JWT_ISSUER` | Keycloak issuer |
 | `KEYCLOAK_JWKS_URL` | HTTPS JWKS endpoint |
 | `KEYCLOAK_JWT_AUDIENCE` | expected audience |
@@ -39,22 +45,28 @@ these nonsecret values through `envFrom`; actual values have not been supplied.
 | `KEYCLOAK_JWT_ALLOWED_ALGORITHMS` | comma-separated RSA JWT algorithms |
 | `AZ_AGENT_FOUNDRY_PROJECT_ENDPOINT` | Azure AI Foundry project endpoint |
 | `AZ_AGENT_FOUNDRY_DEPLOYMENT` | Foundry deployment name |
+| `AZURE_CLIENT_ID` | workload identity client ID |
 | `OTEL_SERVICE_NAME` | trace service name |
 | `OTEL_SERVICE_VERSION` | deployed revision/version |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | optional absolute HTTP(S) OTLP traces URL, including its path; empty disables export |
 
 Every listed ConfigMap key is required except
-`AGENT_PLATFORM_RETAINED_CONFIGS` and `OTEL_EXPORTER_OTLP_ENDPOINT`, which are
-empty when no session pin needs an older bundle or trace export is disabled.
+`AGENT_PLATFORM_CREDENTIAL_HEADERS`, `AGENT_PLATFORM_COST_GATE`,
+`AGENT_PLATFORM_COST_HEADERS` and `OTEL_EXPORTER_OTLP_ENDPOINT`, which may be
+empty or defaulted (an empty OTLP endpoint disables trace export).
 There are no implicit file, port, or grace-period
 defaults: `AGENT_PLATFORM_PORT` must be an integer from 1 through 65535 and
 `AGENT_PLATFORM_SHUTDOWN_GRACE` must be a positive Go duration. Missing or
 invalid values stop startup with the fixed message `agent platform startup
 failed`; values and Secret details are not printed.
 
-`journeys.yaml` remains mounted ConfigMap content. It declares the Java MCP
-endpoint and the exact forwarded-header allowlist; deployment does not add an
-ad hoc endpoint override or interpolate secret values into YAML. Header values
+Definitions are not mounted or configured in serve mode. The `activate` init
+container stores the compiled set from a bundle image in the PostgreSQL
+definition store (see [design.md](design.md#definitions) and
+[deploy/README.md](../deploy/README.md)); the Java MCP endpoint and the
+forwarded-header allowlist come from `AGENT_PLATFORM_MCP_ENDPOINTS` and
+`AGENT_PLATFORM_CREDENTIAL_HEADERS`, and deployment does not interpolate secret
+values into YAML. Header values
 are request-scoped credentials only. They are not written to the journal,
 events, traces, logs, ConfigMap, or this document.
 

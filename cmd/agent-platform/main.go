@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/textproto"
 	"net/url"
@@ -17,28 +19,42 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/defstore"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/provider/foundry"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/provider/litellm"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/service"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/settings"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/telemetry"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/tenantdir"
 )
 
 const (
 	envDatabaseURL   = "DATABASE_URL"
-	envConfig        = "AGENT_PLATFORM_CONFIG"
-	envRetained      = "AGENT_PLATFORM_RETAINED_CONFIGS"
 	envPort          = "AGENT_PLATFORM_PORT"
 	envShutdownGrace = "AGENT_PLATFORM_SHUTDOWN_GRACE"
 	envModelProvider = "AZ_AGENT_MODEL_PROVIDER"
+	// envCredentialHeaders optionally names the inbound headers forwarded to MCP.
+	envCredentialHeaders = "AGENT_PLATFORM_CREDENTIAL_HEADERS"
+	// envTenantDirectory is the path of the tenant directory YAML file.
+	envTenantDirectory = "AGENT_PLATFORM_TENANT_DIRECTORY"
+	// envMCPEndpoints is the MCP endpoint allowlist, as id=url,id2=url2.
+	envMCPEndpoints = "AGENT_PLATFORM_MCP_ENDPOINTS"
+	// envSettings is the path of the settings YAML file.
+	envSettings = "AGENT_PLATFORM_SETTINGS"
+	// envCostGate selects the cost enforcement adapter: open (default) or headers.
+	envCostGate = "AGENT_PLATFORM_COST_GATE"
+	// envCostHeaders names the attribution headers the headers gate sends.
+	envCostHeaders = "AGENT_PLATFORM_COST_HEADERS"
+	// envHistoryBudget is the per-model history budget, as model=tokens,model2=tokens.
+	envHistoryBudget = "AGENT_PLATFORM_HISTORY_BUDGET"
 )
 
 type config struct {
 	databaseURL       string
-	definitionPath    string
-	retainedConfigs   []string
 	port              int
 	grace             time.Duration
 	keycloak          chat.KeycloakConfig
@@ -47,10 +63,22 @@ type config struct {
 	modelProvider     string
 	litellm           litellm.Config
 	telemetry         telemetry.Config
+	credentialHeaders []string
+	costGate          cost.Gate
+	historyBudget     int
+
+	tenantDirectoryPath string
+	settingsPath        string
+	mcpEndpoints        tenantdir.Allowlist
 }
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	if len(os.Args) > 1 && os.Args[1] == "activate" {
+		code := runActivate(ctx, os.Args[2:], os.Getenv, os.Stdout, os.Stderr)
+		stop()
+		os.Exit(code)
+	}
 	defer stop()
 	if err := run(ctx, os.Getenv); err != nil {
 		// Startup errors intentionally do not expose ConfigMap or Secret values.
@@ -80,9 +108,9 @@ func run(ctx context.Context, lookup func(string) string) error {
 			_ = shutdownTelemetry(shutdownCtx)
 		}
 	}()
-	registry, err := definitions.Load(config.definitionPath, config.retainedConfigs...)
+	directory, endpoints, settingsSource, err := loadTenancy(config)
 	if err != nil {
-		return errors.New("invalid definitions")
+		return err
 	}
 	pool, err := pgxpool.New(ctx, config.databaseURL)
 	if err != nil {
@@ -104,7 +132,10 @@ func run(ctx context.Context, lookup func(string) string) error {
 		return errors.New("invalid model configuration")
 	}
 	app, err := service.New(service.Dependencies{
-		Pool: pool, Registry: registry, Authenticator: authenticator, Model: model,
+		Pool: pool, Authenticator: authenticator, Model: model,
+		CredentialHeaders: config.credentialHeaders, CostGate: config.costGate,
+		Directory: directory, Endpoints: endpoints, Settings: settingsSource,
+		HistoryBudget: config.historyBudget,
 	})
 	if err != nil {
 		return errors.New("service initialization failed")
@@ -134,6 +165,20 @@ func run(ctx context.Context, lookup func(string) string) error {
 	}
 }
 
+// loadTenancy loads the tenant directory and settings files named by config.
+// Errors are fixed messages: file contents and paths are never echoed.
+func loadTenancy(config config) (tenantdir.Directory, tenantdir.Allowlist, settings.Source, error) {
+	directory, err := tenantdir.LoadStatic(config.tenantDirectoryPath)
+	if err != nil {
+		return nil, tenantdir.Allowlist{}, nil, errors.New("invalid tenant directory")
+	}
+	source, err := settings.LoadStatic(config.settingsPath)
+	if err != nil {
+		return nil, tenantdir.Allowlist{}, nil, errors.New("invalid settings")
+	}
+	return directory, config.mcpEndpoints, source, nil
+}
+
 func newModel(config config) (runtime.Model, error) {
 	if config.modelProvider == "litellm" {
 		return litellm.New(config.litellm)
@@ -159,10 +204,6 @@ func loadConfig(lookup func(string) string) (config, error) {
 		return value, nil
 	}
 	databaseURL, err := require(envDatabaseURL)
-	if err != nil {
-		return config{}, err
-	}
-	definitionPath, err := require(envConfig)
 	if err != nil {
 		return config{}, err
 	}
@@ -214,13 +255,69 @@ func loadConfig(lookup func(string) string) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	credentialHeaders, err := credential.ParseHeaderNames(lookup(envCredentialHeaders))
+	if err != nil {
+		return config{}, errors.New("invalid credential header configuration")
+	}
+	costGate, err := cost.New(strings.TrimSpace(lookup(envCostGate)), lookup(envCostHeaders))
+	if err != nil {
+		return config{}, errors.New("invalid cost gate configuration")
+	}
+	tenantDirectoryPath, err := require(envTenantDirectory)
+	if err != nil {
+		return config{}, err
+	}
+	endpointSpec, err := require(envMCPEndpoints)
+	if err != nil {
+		return config{}, err
+	}
+	mcpEndpoints, err := tenantdir.ParseAllowlist(endpointSpec)
+	if err != nil || len(mcpEndpoints.IDs()) == 0 {
+		return config{}, errors.New("invalid MCP endpoint configuration")
+	}
+	settingsPath, err := require(envSettings)
+	if err != nil {
+		return config{}, err
+	}
+	configuredModel := foundryDeployment
+	if modelProvider == "litellm" {
+		configuredModel = litellmConfig.Model
+	}
+	historyBudget, err := parseHistoryBudget(lookup(envHistoryBudget), configuredModel)
+	if err != nil {
+		return config{}, err
+	}
 	return config{
-		databaseURL: databaseURL, definitionPath: definitionPath,
-		retainedConfigs: splitValues(lookup(envRetained)), port: port, grace: grace, keycloak: keycloak,
+		tenantDirectoryPath: tenantDirectoryPath, mcpEndpoints: mcpEndpoints, settingsPath: settingsPath,
+		databaseURL: databaseURL, port: port, grace: grace, keycloak: keycloak,
 		foundryEndpoint: foundryEndpoint, foundryDeployment: foundryDeployment,
 		modelProvider: modelProvider, litellm: litellmConfig,
-		telemetry: telemetryConfig,
+		telemetry: telemetryConfig, credentialHeaders: credentialHeaders, costGate: costGate,
+		historyBudget: historyBudget,
 	}, nil
+}
+
+// parseHistoryBudget parses model=tokens pairs and returns the entry for the
+// configured model. Errors are fixed messages and never echo the value.
+func parseHistoryBudget(value, model string) (int, error) {
+	budgets := map[string]int{}
+	if strings.TrimSpace(value) == "" {
+		return 0, errors.New("history budget is missing")
+	}
+	for _, pair := range strings.Split(value, ",") {
+		name, tokens, ok := strings.Cut(pair, "=")
+		name, tokens = strings.TrimSpace(name), strings.TrimSpace(tokens)
+		count, err := strconv.Atoi(tokens)
+		if _, duplicate := budgets[name]; !ok || name == "" || err != nil || count < 1 || duplicate {
+			return 0, errors.New("invalid history budget configuration")
+		}
+		budgets[name] = count
+	}
+	budget, ok := budgets[model]
+	if !ok {
+		return 0, errors.New("history budget is missing for the configured model")
+	}
+	return budget, nil
 }
 
 func keycloakConfig(require func(string) (string, error)) (chat.KeycloakConfig, error) {
@@ -318,4 +415,59 @@ func telemetryHeaders(value string) (map[string]string, error) {
 		headers[name] = headerValue
 	}
 	return headers, nil
+}
+
+// runActivate implements `agent-platform activate [--rollback] --bundle <dir>`. It is safe to run repeatedly and concurrently
+// (it is the init container of every Agent pod). Failures print one fixed line naming a category; bundle
+// content and the database URL are never printed.
+func runActivate(ctx context.Context, args []string, lookup func(string) string, stdout, stderr io.Writer) int {
+	fail := func(category string) int {
+		fmt.Fprintf(stderr, "agent platform activation failed: %s\n", category)
+		return 1
+	}
+	flags := flag.NewFlagSet("activate", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	bundle := flags.String("bundle", "", "directory holding the definition bundle")
+	rollback := flags.Bool("rollback", false, "move current back to a set activated before")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || strings.TrimSpace(*bundle) == "" {
+		return fail("usage")
+	}
+	databaseURL := strings.TrimSpace(lookup(envDatabaseURL))
+	if databaseURL == "" {
+		return fail("configuration")
+	}
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		return fail("database")
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		return fail("database")
+	}
+	res, err := defstore.Activate(ctx, pool, *bundle, defstore.Options{Rollback: *rollback})
+	if err != nil {
+		return fail(activateCategory(err))
+	}
+	switch res.Outcome {
+	case defstore.AlreadyCurrent:
+		fmt.Fprintf(stdout, "already current %s\n", res.Digest)
+	case defstore.Superseded:
+		fmt.Fprintf(stdout, "not activated %s: activated before (use --rollback); current %s\n", res.Digest, res.Current)
+	default:
+		fmt.Fprintf(stdout, "activated %s\n", res.Digest)
+	}
+	return 0
+}
+
+// activateCategory names the one fixed stderr category for an Activate failure.
+func activateCategory(err error) string {
+	switch {
+	case errors.Is(err, defstore.ErrDatabase):
+		return "database"
+	case errors.Is(err, defstore.ErrBundle):
+		return "bundle"
+	case errors.Is(err, journal.ErrDefinition):
+		return "unavailable definition"
+	}
+	return "other"
 }

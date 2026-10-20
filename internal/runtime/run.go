@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
-	"net/http"
+	"slices"
+	"strings"
 
 	"github.com/microsoft/agent-framework-go/agent"
 	"github.com/microsoft/agent-framework-go/message"
@@ -17,10 +19,14 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
-	platformskills "github.com/swiftdiaries/az-agent-platform-go/internal/skills"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/journeys"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/settings"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/tenantdir"
 )
 
 type ModelTool struct {
@@ -35,37 +41,40 @@ type ToolResult struct {
 	Value  any
 }
 
-type Handoff struct{ JourneyID, Text string }
-
 type ModelRequest struct {
-	Handoff         Handoff
-	Context         []string
 	History         json.RawMessage
 	PendingCommands []journal.Input
-	Instructions    string
-	Messages        []string
+	// Instructions is journeys.Compose(...) for this round.
+	Instructions string
+	Messages     []string
 	// ProviderMessages is the exact MAF history for this turn. It is transient:
 	// providers must not replace the product-owned durable history with a
 	// provider session.
 	ProviderMessages []*message.Message
 	Tools            []ModelTool
 	ToolResults      []ToolResult
+	// DefinitionDigest is the digest of the pinned definition set.
 	DefinitionDigest string
-	SkillCatalog     []SkillMetadata
-	SkillMaterial    []platformskills.Material
-	Provenance       RequestProvenance
+	// ActiveJourneys is the active set for this round, least recently used first.
+	ActiveJourneys []string
+	Provenance     RequestProvenance
 	// OnDispatch commits materialization at the final provider request boundary.
 	// A provider must call it at most once, after constructing the exact request
 	// and immediately before its transport sends it.
 	OnDispatch func(context.Context) error
+	// Access decorates every HTTP request the provider sends for this round
+	// (attribution headers). The zero value applies nothing.
+	Access cost.Access
 }
 
-// SkillMetadata is the metadata-only skill catalog exposed to the provider.
-type SkillMetadata struct{ Name, Description string }
-
+// RequestProvenance records the digests of the material behind one request.
+// Definition is the set digest; System the composed instructions; Catalog the
+// available journey metadata; History the durable history. Active holds one entry
+// per active journey (least recently used first) and Skills one per supporting file
+// read in this run.
 type RequestProvenance struct {
-	Definition, System, Handoff, Catalog, Context, History MaterialProvenance
-	Pending, IncludedInput, ContextInputs, Skills          []MaterialProvenance
+	Definition, System, Catalog, History   MaterialProvenance
+	Active, Pending, IncludedInput, Skills []MaterialProvenance
 }
 
 type MaterialProvenance struct{ ID, Digest string }
@@ -80,6 +89,8 @@ type ModelResponse struct {
 	Text      string
 	ToolCalls []ToolCall
 	ToolCall  *ToolCall
+	// Usage is the token usage the provider reported for this completion.
+	Usage cost.Tokens
 }
 
 type Model interface {
@@ -87,9 +98,44 @@ type Model interface {
 }
 
 type Runner struct {
-	definitions *definitions.Registry
-	mcp         *platformmcp.Client
-	model       Model
+	defs    Definitions
+	model   Model
+	tenancy Tenancy
+}
+
+// Tenancy is what a Runner needs to resolve a tenant at run start.
+type Tenancy struct {
+	Directory tenantdir.Directory
+	Endpoints tenantdir.Allowlist
+	Settings  settings.Source
+	// Cost admits runs and decorates provider requests. Nil is cost.Open{}.
+	Cost cost.Gate
+	// HistoryBudget is the estimated tokens of history sent per provider request;
+	// older whole turns beyond it are left out of the request. 0 disables trimming
+	// and is for tests only.
+	HistoryBudget int
+}
+
+// ErrDependencyUnavailable marks a tenant directory, allowlist, settings or MCP
+// endpoint failure. The run ends dependency_unavailable and no request that
+// could carry a credential has been sent.
+var ErrDependencyUnavailable = errors.New("dependency unavailable")
+
+// ErrJourneyUnavailable marks an explicit target that is unknown or unavailable.
+// The run ends failed with a typed reason and no model call is made.
+var ErrJourneyUnavailable = errors.New("journey unavailable")
+
+// ErrPolicyConflict marks an explicit target that is unavailable because two journeys give one operation key or alias different policies.
+var ErrPolicyConflict = fmt.Errorf("%w: policy conflict", ErrJourneyUnavailable)
+
+// ErrActivationRefused marks an explicit target that cannot be activated because every active journey is pinned.
+var ErrActivationRefused = fmt.Errorf("%w: activation refused", ErrJourneyUnavailable)
+
+// RunScope is the resolved, recorded scope of one run.
+type RunScope struct {
+	Entry    tenantdir.Entry
+	Endpoint tenantdir.Endpoint
+	Settings settings.Settings
 }
 
 type RunInput struct {
@@ -100,10 +146,18 @@ type RunInput struct {
 	ThreadID         string
 	RunID            string
 	Principal        string
+	Tenant           string
 	Text             string
 	TargetJourney    string
 	DefinitionDigest string
-	Headers          http.Header
+	Credential       credential.Credential
+	// ProductVersion, Endpoint and Settings are filled from Scope before Run.
+	ProductVersion string
+	Endpoint       tenantdir.Endpoint
+	Settings       settings.Settings
+	// Attribution and Access are filled from Admit once per run, before Run.
+	Attribution cost.Attribution
+	Access      cost.Access
 }
 
 type RunOutput struct {
@@ -115,69 +169,273 @@ type RunOutput struct {
 	ToolName  string
 }
 
-func NewRunner(registry *definitions.Registry, client *platformmcp.Client, model Model) *Runner {
-	return &Runner{definitions: registry, mcp: client, model: model}
+// Definitions serves compiled definition sets by set digest (defstore.Loader in production).
+type Definitions interface {
+	Load(ctx context.Context, digest string) (*definitions.Set, error)
+	Served(digest string) bool // no I/O: called inside journal transactions
+}
+
+func NewRunner(defs Definitions, model Model, tenancy Tenancy) *Runner {
+	return &Runner{defs: defs, model: model, tenancy: tenancy}
+}
+
+// Scope resolves directory, then allowlist, then settings, and records them on
+// the run (fenced) before any dispatch. A resolution failure is
+// ErrDependencyUnavailable and nothing has been sent anywhere.
+func (r *Runner) Scope(ctx context.Context, in RunInput) (RunScope, error) {
+	entry, endpoint, err := tenantdir.Lookup(ctx, r.tenancy.Directory, r.tenancy.Endpoints, in.Tenant)
+	if err != nil {
+		return RunScope{}, unavailable(ctx, err)
+	}
+	if r.tenancy.Settings == nil {
+		return RunScope{}, unavailable(ctx, settings.ErrUnavailable)
+	}
+	resolved, err := r.tenancy.Settings.Resolve(ctx, settings.Scope{Tenant: in.Tenant, Principal: in.Principal})
+	if err != nil {
+		return RunScope{}, unavailable(ctx, err)
+	}
+	if in.Store == nil {
+		return RunScope{}, journal.ErrDefinition
+	}
+	if err := in.Store.RecordRunScope(ctx, in.Owner, journal.RunScope{ProductVersion: entry.ProductVersion, EndpointID: entry.EndpointID, Settings: resolved.Record()}); err != nil {
+		return RunScope{}, err
+	}
+	return RunScope{Entry: entry, Endpoint: endpoint, Settings: resolved}, nil
+}
+
+// Admit asks the cost gate whether the run may start and builds the request
+// decoration for its provider calls. A denial is the *cost.LimitError; a gate
+// failure is ErrDependencyUnavailable. Neither error text carries attribution.
+// in.TargetJourney becomes Attribution.Journey unchecked, so the caller must
+// already have validated it through Binding.
+func (r *Runner) Admit(ctx context.Context, in RunInput) (cost.Attribution, cost.Access, error) {
+	var gate cost.Gate = cost.Open{}
+	if r.tenancy.Cost != nil {
+		gate = r.tenancy.Cost
+	}
+	a := cost.Attribution{Tenant: in.Tenant, Principal: in.Principal, Conversation: in.ThreadID, Run: in.RunID, Journey: in.TargetJourney}
+	decision, err := gate.Admit(ctx, a, in.Settings.Cost)
+	if err != nil {
+		return cost.Attribution{}, cost.Access{}, unavailable(ctx, err)
+	}
+	if err := decision.Err(); err != nil {
+		return cost.Attribution{}, cost.Access{}, err
+	}
+	access, err := gate.Access(ctx, a, in.Settings.Cost)
+	if err != nil {
+		return cost.Attribution{}, cost.Access{}, unavailable(ctx, err)
+	}
+	return a, access, nil
+}
+
+// unavailable fails closed, except that the caller's own cancellation stays a
+// cancellation rather than a dependency verdict.
+func unavailable(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrDependencyUnavailable, err)
 }
 
 // Ready verifies only durable definition availability. It deliberately does
 // not contact a provider or MCP server.
 func (r *Runner) Ready(ctx context.Context, store *journal.Store) (bool, error) {
-	if r == nil || r.definitions == nil || store == nil {
+	if r == nil || r.defs == nil || store == nil {
 		return false, journal.ErrDefinition
 	}
-	return store.DefinitionsReady(ctx, r.definitions.JourneyIDForDigest)
+	digests, err := store.ReferencedDefinitions(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, digest := range digests {
+		if _, err := r.defs.Load(ctx, digest); err != nil {
+			if errors.Is(err, journal.ErrDefinition) {
+				return false, nil
+			}
+			return false, err
+		}
+	}
+	return store.DefinitionsReady(ctx, r.defs.Served)
 }
 
-// Binding resolves an existing session's pin or the database current pointer for a new one.
+// bindingAttempts bounds the load-and-retry loop of Binding.
+const bindingAttempts = 3
+
+// Binding resolves the conversation's pinned definition set (or the database
+// current pointer for a new one). There is no routing: the journey it returns is
+// the explicit target when one is given and present in the pinned set, and ""
+// otherwise (the conversation's active set decides what the model can use).
 func (r *Runner) Binding(ctx context.Context, in RunInput) (string, string, error) {
-	journey, err := r.route(ctx, in.TargetJourney, in.Text)
+	if r == nil || r.defs == nil || in.Store == nil {
+		return "", "", journal.ErrDefinition
+	}
+	var digest string
+	for attempt := 1; ; attempt++ {
+		// The served predicate runs inside a journal transaction, so it only
+		// records what is missing; the loads happen between attempts.
+		var missing []string
+		served := func(d string) bool {
+			if r.defs.Served(d) {
+				return true
+			}
+			missing = append(missing, d)
+			return false
+		}
+		var err error
+		digest, err = in.Store.ResolveDefinition(ctx, in.Owner, served)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, journal.ErrDefinition) || len(missing) == 0 || attempt >= bindingAttempts {
+			return "", "", err
+		}
+		for _, d := range missing {
+			if _, err := r.defs.Load(ctx, d); err != nil {
+				return "", "", err
+			}
+		}
+	}
+	set, err := r.defs.Load(ctx, digest)
 	if err != nil {
 		return "", "", err
 	}
-	if in.Store == nil {
-		return "", "", journal.ErrDefinition
+	if in.TargetJourney == "" {
+		return "", digest, nil
 	}
-	digest, err := in.Store.ResolveDefinition(ctx, in.Owner, journey.ID, journey.Digest, r.definitions.JourneyIDForDigest)
-	if err != nil {
-		return "", "", err
+	if _, ok := set.Journey(in.TargetJourney); !ok {
+		return "", "", fmt.Errorf("%w: unknown journey target", ErrJourneyUnavailable)
 	}
-	if _, ok := r.definitions.Version(digest); !ok {
-		return "", "", journal.ErrDefinition
-	}
-	return journey.ID, digest, nil
+	return in.TargetJourney, digest, nil
 }
 
 func (r *Runner) Run(ctx context.Context, input RunInput) (RunOutput, error) {
-	journey, ok := r.definitions.Version(input.DefinitionDigest)
-	if !ok || journey.ID != input.TargetJourney {
+	if !input.Endpoint.Valid() {
+		return RunOutput{}, fmt.Errorf("%w: no allowlisted endpoint", ErrDependencyUnavailable)
+	}
+	set, err := r.defs.Load(ctx, input.DefinitionDigest)
+	if err != nil {
 		return RunOutput{}, journal.ErrDefinition
 	}
-	ctx, span := otel.Tracer("az-agent-platform/runtime").Start(ctx, "journey.run")
-	span.SetAttributes(
-		attribute.String("thread.id", input.ThreadID), attribute.String("run.id", input.RunID),
-		attribute.String("journey.id", journey.ID),
-	)
-	defer span.End()
-	server, ok := r.definitions.ServerFor(input.DefinitionDigest)
-	if !ok {
-		return RunOutput{}, fmt.Errorf("journey MCP server is unavailable")
+	if input.TargetJourney != "" {
+		if _, ok := set.Journey(input.TargetJourney); !ok {
+			return RunOutput{}, journal.ErrDefinition
+		}
 	}
+	ctx, span := otel.Tracer("az-agent-platform/runtime").Start(ctx, "journey.run")
+	span.SetAttributes(attribute.String("thread.id", input.ThreadID), attribute.String("run.id", input.RunID))
+	if input.TargetJourney != "" {
+		span.SetAttributes(attribute.String("journey.id", input.TargetJourney))
+	}
+	defer span.End()
 	if err := input.Store.Check(ctx, input.Owner); err != nil {
 		return RunOutput{}, err
 	}
-	bound, err := r.mcp.Bind(ctx, server, journey.MCP.Tools, input.Headers)
+	binding, err := catalog.Open(ctx, catalog.Scope{ProductVersion: input.ProductVersion, Endpoint: input.Endpoint}, input.Credential, input.Store, input.Owner, set, catalog.Options{})
+	if err != nil {
+		if errors.Is(err, catalog.ErrEndpointUnavailable) {
+			return RunOutput{}, fmt.Errorf("%w: %w", ErrDependencyUnavailable, err)
+		}
+		return RunOutput{}, err
+	}
+	defer binding.Close()
+	return r.converse(ctx, input, set, binding)
+}
+
+// converse prepares the conversation's active set for this run and runs the loop.
+// Journeys that do not resolve for this user are hidden, not failures: only an
+// explicit target that is unavailable fails the run.
+func (r *Runner) converse(ctx context.Context, input RunInput, set *definitions.Set, cat toolCatalog) (RunOutput, error) {
+	var available []definitions.Journey
+	for _, journey := range set.Journeys() {
+		if resolution, ok := cat.Resolution(journey.ID); ok && resolution.Available() {
+			available = append(available, journey)
+		}
+	}
+	isAvailable := func(id string) bool {
+		return slices.ContainsFunc(available, func(j definitions.Journey) bool { return j.ID == id })
+	}
+	limit := input.Settings.MaxActiveJourneys
+	if limit < 1 {
+		return RunOutput{}, fmt.Errorf("invalid max active journeys: %d", limit)
+	}
+	persisted, pinned, err := input.Store.ActiveJourneys(ctx, input.Owner)
 	if err != nil {
 		return RunOutput{}, err
 	}
-	defer bound.Close()
-
+	active := journeys.NewActiveSet(persisted)
+	for _, id := range active.IDs() {
+		if !isAvailable(id) {
+			active.Remove(id)
+		}
+	}
+	trace.SpanFromContext(ctx).SetAttributes(attribute.Int("journeys.limit", limit))
+	fitEvicted, err := active.Fit(limit, pinned)
+	if err != nil {
+		return RunOutput{}, err
+	}
+	if len(fitEvicted) > 0 {
+		recordJourneyEvent(ctx, "journey.evicted", limit, "fit", "", fitEvicted)
+	}
+	// A continuation resumes interactions bound to journeys that may have since become
+	// unavailable; its target is simply not activated, and the approval guard decides.
+	continuation := input.Owner.Command.InteractionID != ""
+	if input.TargetJourney != "" && !(continuation && !isAvailable(input.TargetJourney)) {
+		if !isAvailable(input.TargetJourney) {
+			resolution, _ := cat.Resolution(input.TargetJourney)
+			return RunOutput{}, unavailableJourney(resolution)
+		}
+		evicted, err := active.Activate(input.TargetJourney, limit, pinned)
+		if err != nil {
+			if errors.Is(err, journeys.ErrRefused) {
+				recordJourneyEvent(ctx, "journey.activation_refused", limit, "target", input.TargetJourney, nil)
+				return RunOutput{}, fmt.Errorf("%w: %w", ErrActivationRefused, err)
+			}
+			return RunOutput{}, err
+		}
+		recordJourneyEvent(ctx, "journey.activated", limit, "target", input.TargetJourney, evicted)
+	}
+	if !slices.Equal(persisted, active.IDs()) {
+		if err := input.Store.SetActiveJourneys(ctx, input.Owner, active.IDs()); err != nil {
+			return RunOutput{}, err
+		}
+	}
 	if err := input.Store.Check(ctx, input.Owner); err != nil {
 		return RunOutput{}, err
 	}
-	return r.runHarness(ctx, input, journey, bound, server)
+	return r.runHarness(ctx, input, &conversation{set: set, cat: cat, available: available, active: active, limit: limit})
 }
 
-func modelRun(parent context.Context, model Model, callBase string, before func(context.Context, *ModelRequest) error, observed func(context.Context) error) agent.RunFunc {
+// recordJourneyEvent adds a journey lifecycle event to the current span. It carries
+// config journey IDs and counts only, never tool names, descriptions or content.
+func recordJourneyEvent(ctx context.Context, name string, limit int, trigger, journeyID string, evicted []string) {
+	attrs := []attribute.KeyValue{attribute.Int("journeys.limit", limit), attribute.String("journeys.trigger", trigger)}
+	if journeyID != "" {
+		attrs = append(attrs, attribute.String("journey.id", journeyID))
+	}
+	if len(evicted) > 0 {
+		attrs = append(attrs, attribute.StringSlice("journeys.evicted", evicted))
+	}
+	trace.SpanFromContext(ctx).AddEvent(name, trace.WithAttributes(attrs...))
+}
+
+// unavailableJourney describes why a journey's tools did not resolve. It names
+// only reasons and operation keys or aliases, never remote tool names.
+func unavailableJourney(resolution catalog.Resolution) error {
+	if len(resolution.Unavailable) == 0 {
+		return ErrJourneyUnavailable
+	}
+	reasons := make([]string, 0, len(resolution.Unavailable))
+	kind := ErrJourneyUnavailable
+	for _, u := range resolution.Unavailable {
+		if u.Reason == catalog.ReasonPolicyConflict {
+			kind = ErrPolicyConflict
+		}
+		reasons = append(reasons, string(u.Reason)+" ("+u.Operation+")")
+	}
+	return fmt.Errorf("%w: %s", kind, strings.Join(reasons, ", "))
+}
+
+func modelRun(parent context.Context, model Model, callBase string, before func(context.Context, *ModelRequest) error, observed func(context.Context) error, access cost.Access, usage func(context.Context, cost.Tokens) error) agent.RunFunc {
 	return func(ctx context.Context, messages []*message.Message, options ...agent.Option) iter.Seq2[*agent.ResponseUpdate, error] {
 		return func(yield func(*agent.ResponseUpdate, error) bool) {
 			ctx = trace.ContextWithSpanContext(ctx, trace.SpanContextFromContext(parent))
@@ -190,13 +448,21 @@ func modelRun(parent context.Context, model Model, callBase string, before func(
 				request.Tools = append(request.Tools, ModelTool{Name: candidate.Name(), Description: candidate.Description(), Schema: schemaValue(schema)})
 			}
 			request.ProviderMessages = messages
+			callNames := map[string]string{}
+			for _, msg := range messages {
+				for _, content := range msg.Contents {
+					if call, ok := content.(*message.FunctionCallContent); ok {
+						callNames[call.CallID] = call.Name
+					}
+				}
+			}
 			for _, msg := range messages {
 				if text := msg.String(); text != "" {
 					request.Messages = append(request.Messages, text)
 				}
 				for _, content := range msg.Contents {
 					if result, ok := content.(*message.FunctionResultContent); ok {
-						request.ToolResults = append(request.ToolResults, ToolResult{CallID: result.CallID, Value: result.Result})
+						request.ToolResults = append(request.ToolResults, ToolResult{CallID: result.CallID, Name: callNames[result.CallID], Value: result.Result})
 					}
 				}
 			}
@@ -209,6 +475,7 @@ func modelRun(parent context.Context, model Model, callBase string, before func(
 				return
 			}
 			observedOnce := false
+			request.Access = access
 			request.OnDispatch = func(context.Context) error {
 				if observedOnce {
 					return nil
@@ -230,6 +497,10 @@ func modelRun(parent context.Context, model Model, callBase string, before func(
 			// Test and local models have no HTTP transport callback. Their successful
 			// completion is the observable request boundary.
 			if err := request.OnDispatch(ctx); err != nil {
+				yield(nil, err)
+				return
+			}
+			if err := usage(ctx, response.Usage); err != nil {
 				yield(nil, err)
 				return
 			}
@@ -264,14 +535,6 @@ func schemaValue(schema tool.SchemaTool) any {
 	return schema.Schema()
 }
 
-func funcsAsTools(functions []tool.FuncTool) []tool.Tool {
-	tools := make([]tool.Tool, len(functions))
-	for i := range functions {
-		tools[i] = functions[i]
-	}
-	return tools
-}
-
 func stableCallID(threadID, runID string) string {
 	sum := sha256.Sum256([]byte(threadID + "\x00" + runID + "\x00tool-1"))
 	return "call_" + hex.EncodeToString(sum[:8])
@@ -280,13 +543,4 @@ func stableCallID(threadID, runID string) string {
 func digestValue(value any) string {
 	data, _ := json.Marshal(value)
 	return fmt.Sprintf("%x", sha256.Sum256(data))
-}
-
-func cloneSkillMaterial(in []platformskills.Material) []platformskills.Material {
-	out := make([]platformskills.Material, len(in))
-	for i, material := range in {
-		out[i] = material
-		out[i].Body = append([]byte(nil), material.Body...)
-	}
-	return out
 }

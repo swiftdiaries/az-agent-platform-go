@@ -8,15 +8,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"strings"
 	"testing"
 	"time"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/service"
@@ -25,25 +21,14 @@ import (
 func TestServiceDrainRejectsNewAdmissionAndInterruptsExpiredOwner(t *testing.T) {
 	pool := database(t)
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "deployment", Version: "1"}, nil)
-	mcp.AddTool(mcpServer, &mcp.Tool{Name: "lookup", Description: "read-only lookup"}, func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
+	mcp.AddTool(mcpServer, withDescription(keyedTool("lookup", "lookup"), "read-only lookup"), func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
 		return &mcp.CallToolResult{}, struct{}{}, nil
 	})
 	mcpHandler := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, nil))
 	defer mcpHandler.Close()
 
 	root := t.TempDir()
-	path := writeDefinitionBundle(t, root, "prompt\n")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(strings.Replace(string(data), "http://example", mcpHandler.URL, 1)), 0600); err != nil {
-		t.Fatal(err)
-	}
-	registry, err := definitions.Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	installSets(t, pool, compileSet(t, writeDefinitionBundle(t, root, "prompt\n")))
 
 	started := make(chan struct{})
 	cancelled := make(chan struct{})
@@ -53,11 +38,13 @@ func TestServiceDrainRejectsNewAdmissionAndInterruptsExpiredOwner(t *testing.T) 
 		close(cancelled)
 		return agentruntime.ModelResponse{}, ctx.Err()
 	})
+	tenancy := testTenancy(t, mcpHandler.URL)
 	app, err := service.New(service.Dependencies{
-		Pool:          pool,
-		Registry:      registry,
-		Authenticator: chat.StaticBearerTokens{"token": "alice"},
-		Model:         model,
+		Pool:              pool,
+		Authenticator:     acceptanceTokens,
+		Model:             model,
+		CredentialHeaders: []string{"Authorization"},
+		Directory:         tenancy.Directory, Endpoints: tenancy.Endpoints, Settings: tenancy.Settings,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -162,15 +149,15 @@ func TestServiceShutdownBoundsBlockedAdmissionAndClaim(t *testing.T) {
 		t.Run(barrier.name, func(t *testing.T) {
 			pool := database(t)
 			root := t.TempDir()
-			registry, err := definitions.Load(writeDefinitionBundle(t, root, "prompt\n"))
-			if err != nil {
-				t.Fatal(err)
-			}
+			installSets(t, pool, compileSet(t, writeDefinitionBundle(t, root, "prompt\n")))
+			tenancy := testTenancy(t, "http://127.0.0.1:1")
 			app, err := service.New(service.Dependencies{
-				Pool: pool, Registry: registry, Authenticator: chat.StaticBearerTokens{"token": "alice"},
+				Pool: pool, Authenticator: acceptanceTokens,
+				Directory: tenancy.Directory, Endpoints: tenancy.Endpoints, Settings: tenancy.Settings,
 				Model: modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 					return agentruntime.ModelResponse{}, nil
 				}),
+				CredentialHeaders: []string{"Authorization"},
 			})
 			if err != nil {
 				t.Fatal(err)

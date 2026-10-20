@@ -14,6 +14,7 @@ import (
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	"go.opentelemetry.io/otel"
@@ -24,6 +25,8 @@ type handler struct {
 	auth     Authenticator
 	platform *platform.Platform
 	ids      IdentityMap
+
+	credentialHeaders []string
 }
 
 type interactionCall struct {
@@ -47,15 +50,16 @@ func safeInteraction(i *journal.Interaction) *interaction {
 	return &interaction{ID: i.ID, Kind: i.Kind, Questions: i.Questions, Call: interactionCall{CallID: i.Call.CallID, Name: i.Call.Name, Arguments: i.Call.Arguments, Binding: i.Call.Binding}, ExpiresAt: i.ExpiresAt}
 }
 
-func NewHandler(auth Authenticator, service *platform.Platform, pool *pgxpool.Pool) http.Handler {
-	return &handler{auth: auth, platform: service, ids: IdentityMap{pool: pool}}
+func NewHandler(auth Authenticator, service *platform.Platform, pool *pgxpool.Pool, credentialHeaders []string) http.Handler {
+	return &handler{auth: auth, platform: service, ids: IdentityMap{pool: pool}, credentialHeaders: slices.Clone(credentialHeaders)}
 }
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	principal, err := h.auth.Authenticate(r)
+	identity, err := h.auth.Authenticate(r)
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	principal := identity.Principal
 	cursor := int64(0)
 	if raw := r.Header.Get("Last-Event-ID"); raw != "" {
 		cursor, err = strconv.ParseInt(raw, 10, 64)
@@ -131,9 +135,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer span.End()
 	span.SetAttributes(attribute.String("thread.id", thread), attribute.String("run.id", run))
 	if create {
-		// Submit synchronously selects only the journey's configured MCP header names;
-		// no inbound header map is retained by execution or written to persistence.
-		_, err = h.platform.Submit(ctx, platform.Submission{Command: platform.Command{ThreadID: thread, RunID: run, CommunicationID: communication, Principal: principal, Text: text, TargetJourney: target, InteractionID: reply.InteractionID, ReplyKind: reply.Kind, ReplyJSON: replyJSON}, Headers: r.Header})
+		// Chat copies only the configured credential header names into the
+		// Credential; no inbound header map is retained or persisted.
+		_, err = h.platform.Submit(ctx, platform.Command{ThreadID: thread, RunID: run, CommunicationID: communication, Principal: principal, Tenant: identity.Tenant, Text: text, TargetJourney: target, InteractionID: reply.InteractionID, ReplyKind: reply.Kind, ReplyJSON: replyJSON}, credential.FromRequest(r, h.credentialHeaders))
 		if err != nil {
 			commandError(w, err)
 			return
@@ -219,13 +223,29 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case "run.completed":
 			emit(events.NewRunFinishedEvent(input.ThreadID, input.RunID), sequence)
 			return true
-		case "run.failed", "auth_required", "run.interrupted":
+		case "run.limit_exceeded":
+			var detail struct {
+				RetryAfterSeconds int64 `json:"retry_after_seconds"`
+			}
+			_ = json.Unmarshal(e.Detail, &detail)
+			if !emit(events.NewCustomEvent("limit_exceeded", events.WithValue(map[string]any{"kind": e.Reason, "retryAfterSeconds": detail.RetryAfterSeconds})), sequence) {
+				return true
+			}
+			emit(events.NewRunErrorEvent("run limit exceeded", events.WithErrorCode("limit_exceeded"), events.WithRunID(input.RunID)), 0)
+			return true
+		case "run.failed", "auth_required", "run.interrupted", "run.dependency_unavailable":
 			code := "internal_error"
+			if e.Type == "run.failed" {
+				code = failureCode(e.Reason)
+			}
 			if e.Type == "run.interrupted" {
 				code = "interrupted"
 			}
 			if e.Type == "auth_required" {
 				code = "auth_required"
+			}
+			if e.Type == "run.dependency_unavailable" {
+				code = "dependency_unavailable"
 			}
 			emit(events.NewRunErrorEvent("run could not complete", events.WithErrorCode(code), events.WithRunID(input.RunID)), sequence)
 			return true
@@ -269,10 +289,16 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		terminal(platform.Event{Type: "run.interrupted"}, 0)
 		return
 	case platform.RunFailed:
-		terminal(platform.Event{Type: "run.failed"}, 0)
+		terminal(platform.Event{Type: "run.failed", Reason: current.TerminalReason}, 0)
 		return
 	case platform.RunAuthRequired:
 		terminal(platform.Event{Type: "auth_required"}, 0)
+		return
+	case platform.RunDependencyUnavailable:
+		terminal(platform.Event{Type: "run.dependency_unavailable"}, 0)
+		return
+	case platform.RunLimitExceeded:
+		terminal(platform.Event{Type: "run.limit_exceeded", Reason: current.TerminalReason, Detail: current.TerminalDetail}, 0)
 		return
 	}
 
@@ -298,6 +324,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func commandError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	switch {
+	case errors.Is(err, platform.ErrExpired):
+		http.Error(w, "interaction_expired", http.StatusConflict)
+		return
 	case errors.Is(err, platform.ErrDraining):
 		status = http.StatusServiceUnavailable
 	case errors.Is(err, platform.ErrConflict), errors.Is(err, platform.ErrBusy):
@@ -338,4 +367,12 @@ func targetJourney(value any) (string, error) {
 		return "", fmt.Errorf("journeyId must be a string")
 	}
 	return name, nil
+}
+
+func failureCode(reason string) string {
+	switch reason {
+	case journal.ReasonJourneyUnavailable, journal.ReasonPolicyConflict, journal.ReasonActivationRefused, journal.ReasonInteractionExpired:
+		return reason
+	}
+	return "internal_error"
 }

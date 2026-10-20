@@ -18,6 +18,22 @@ services:
     volumes:
       - agent-platform-task-6-pgdata:/var/lib/postgresql/data
 
+  # One-shot: stores the bundle in PostgreSQL and makes it current, then exits.
+  activate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: az-agent-platform:task-6
+    command: ["activate", "--bundle", "/bundle"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+    volumes:
+      - ../configs:/bundle:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   agent-platform:
     build:
       context: ..
@@ -28,15 +44,21 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      activate:
+        condition: service_completed_successfully
     expose:
       - "8080"
     environment:
       AGENT_PLATFORM_PORT: "8080"
       AGENT_PLATFORM_SHUTDOWN_GRACE: 25s
-      AGENT_PLATFORM_CONFIG: /app/configs/journeys.yaml
-      AGENT_PLATFORM_RETAINED_CONFIGS: ""
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
-      TEST_JAVA_MCP_ENDPOINT: ${TEST_JAVA_MCP_ENDPOINT:?set TEST_JAVA_MCP_ENDPOINT}
+      AGENT_PLATFORM_MCP_ENDPOINTS: ${AGENT_PLATFORM_MCP_ENDPOINTS:?set AGENT_PLATFORM_MCP_ENDPOINTS}
+      AGENT_PLATFORM_CREDENTIAL_HEADERS: ${AGENT_PLATFORM_CREDENTIAL_HEADERS:-Cookie,Authorization}
+      AGENT_PLATFORM_TENANT_DIRECTORY: /app/tenancy/tenant-directory.yaml
+      AGENT_PLATFORM_SETTINGS: /app/tenancy/settings.yaml
+      AGENT_PLATFORM_COST_GATE: ${AGENT_PLATFORM_COST_GATE:-open}
+      AGENT_PLATFORM_COST_HEADERS: ${AGENT_PLATFORM_COST_HEADERS:-}
+      AGENT_PLATFORM_HISTORY_BUDGET: ${AGENT_PLATFORM_HISTORY_BUDGET:?set AGENT_PLATFORM_HISTORY_BUDGET (model=tokens, e.g. gpt-4o=64000)}
       KEYCLOAK_JWT_ISSUER: ${KEYCLOAK_JWT_ISSUER:?set KEYCLOAK_JWT_ISSUER}
       KEYCLOAK_JWKS_URL: ${KEYCLOAK_JWKS_URL:?set KEYCLOAK_JWKS_URL}
       KEYCLOAK_JWT_AUDIENCE: ${KEYCLOAK_JWT_AUDIENCE:?set KEYCLOAK_JWT_AUDIENCE}
@@ -54,8 +76,23 @@ services:
       OTEL_SERVICE_VERSION: ${OTEL_SERVICE_VERSION:?set OTEL_SERVICE_VERSION}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
+    volumes:
+      - ./config/tenant-directory.yaml:/app/tenancy/tenant-directory.yaml:ro
+      - ./config/settings.yaml:/app/tenancy/settings.yaml:ro
     init: true
     stop_grace_period: 30s
+
+  # BLOCKED until a cost API exists (docs/migration.md, Integration inputs: the
+  # enforcement mechanism is undecided). Optional placeholder, never started by
+  # default; start only with `--profile agentgateway`. The image tag is a
+  # pinned placeholder and ships no gateway config, so it is not a working
+  # enforcement point. A real one must accept the attribution headers only from
+  # Agent (mTLS or network policy) and be wired with AGENT_PLATFORM_COST_GATE=headers.
+  agentgateway:
+    profiles: ["agentgateway"]
+    image: ghcr.io/agentgateway/agentgateway:v0.0.0-placeholder
+    expose:
+      - "8081"
 
 volumes:
   agent-platform-task-6-pgdata:

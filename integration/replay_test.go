@@ -15,29 +15,27 @@ import (
 	"time"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
-func fixtureRunner(t *testing.T, model agentruntime.Model) *agentruntime.Runner {
+func fixtureRunner(t *testing.T, pool *pgxpool.Pool, model agentruntime.Model) *agentruntime.Runner {
 	t.Helper()
 	server := mcp.NewServer(&mcp.Implementation{Name: "persistent-fixture", Version: "1"}, nil)
-	mcp.AddTool(server, &mcp.Tool{Name: "lookup_destination"}, func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
+	mcp.AddTool(server, keyedTool(remoteLookup, lookupAlias), func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
 		return nil, struct{}{}, nil
 	})
 	endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
 	t.Cleanup(endpoint.Close)
-	t.Setenv("TEST_JAVA_MCP_ENDPOINT", endpoint.URL)
-	registry, err := definitions.Load(filepath.Join("..", "configs", "journeys.yaml"))
+	registry, err := compileFile(filepath.Join("..", "configs", "journeys.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return agentruntime.NewRunner(registry, platformmcp.NewClient(), model)
+	return agentruntime.NewRunner(storedDefinitions(t, pool, registry), model, testTenancy(t, endpoint.URL))
 }
 
 // A request-scoped run context would cancel the model here. A process-local ID map
@@ -62,11 +60,11 @@ func TestPersistenceDisconnectAndReplacement(t *testing.T) {
 		}
 		return agentruntime.ModelResponse{Text: "Kyoto is remembered"}, nil
 	})
-	runner := fixtureRunner(t, model)
+	runner := fixtureRunner(t, pool, model)
 	service := platform.New(runner, journal.New(pool))
 	t.Cleanup(service.Close)
-	auth := chat.StaticBearerTokens{"token": "alice", "other": "bob"}
-	api := httptest.NewServer(chat.NewHandler(auth, service, pool))
+	auth := chat.StaticBearerTokens{"token": testPrincipal, "other": "tenant-a/bob"}
+	api := httptest.NewServer(chat.NewHandler(auth, service, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	body := aguitypes.RunAgentInput{ThreadID: "external-email@example.test", RunID: "external-1", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "remember Kyoto"}}}
 	payload, _ := json.Marshal(body)
@@ -86,15 +84,15 @@ func TestPersistenceDisconnectAndReplacement(t *testing.T) {
 	response.Body.Close()
 	close(release)
 	var thread string
-	if err := pool.QueryRow(context.Background(), "SELECT id FROM chat_threads WHERE principal='alice'").Scan(&thread); err != nil {
+	if err := pool.QueryRow(context.Background(), "SELECT id FROM chat_threads WHERE principal='tenant-a/alice'").Scan(&thread); err != nil {
 		t.Fatal(err)
 	}
-	waitCompleted(t, service, thread, "alice")
+	waitCompleted(t, service, thread, testPrincipal)
 	service.Close()
 	api.Close()
-	replacement := platform.New(fixtureRunner(t, model), journal.New(pool))
+	replacement := platform.New(fixtureRunner(t, pool, model), journal.New(pool))
 	t.Cleanup(replacement.Close)
-	api2 := httptest.NewServer(chat.NewHandler(auth, replacement, pool))
+	api2 := httptest.NewServer(chat.NewHandler(auth, replacement, pool, []string{"Authorization", "Cookie"}))
 	defer api2.Close()
 	retry := postAGUI(t, api2.URL, body, "token", "fresh-secret", "")
 	if !strings.Contains(retry.Body, "remembered Kyoto") || calls.Load() != 1 {
@@ -121,7 +119,7 @@ func TestPersistenceDisconnectAndReplacement(t *testing.T) {
 		t.Fatalf("observation authorization %d", denied.StatusCode)
 	}
 	var persisted string
-	err = pool.QueryRow(context.Background(), `SELECT (SELECT json_agg(c)::text FROM agent_commands c)||(SELECT json_agg(s)::text FROM agent_sessions s)||(SELECT json_agg(e)::text FROM agent_events e)`).Scan(&persisted)
+	err = pool.QueryRow(context.Background(), `SELECT (SELECT json_agg(c)::text FROM agent_commands c)||(SELECT json_agg(v)::text FROM agent_conversations v)||(SELECT json_agg(e)::text FROM agent_events e)`).Scan(&persisted)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,13 +303,13 @@ func TestReplaySnapshotConcurrentCommit(t *testing.T) {
 func TestReplayHTTPReconnectCursor(t *testing.T) {
 	pool := database(t)
 	var calls atomic.Int64
-	runner := fixtureRunner(t, modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	runner := fixtureRunner(t, pool, modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		calls.Add(1)
 		return agentruntime.ModelResponse{Text: "durable answer"}, nil
 	}))
 	p := platform.New(runner, journal.New(pool))
 	defer p.Close()
-	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, p, pool))
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": testPrincipal}, p, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	input := aguitypes.RunAgentInput{ThreadID: "external", RunID: "run", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "hi"}}}
 	first := postAGUI(t, api.URL, input, "token", "", "")
@@ -322,7 +320,7 @@ func TestReplayHTTPReconnectCursor(t *testing.T) {
 	if err := pool.QueryRow(context.Background(), "SELECT id FROM chat_threads").Scan(&thread); err != nil {
 		t.Fatal(err)
 	}
-	snapshot := waitCompleted(t, p, thread, "alice")
+	snapshot := waitCompleted(t, p, thread, testPrincipal)
 	for _, cursor := range []int64{0, snapshot.Watermark, snapshot.Watermark + 20} {
 		request, _ := http.NewRequest(http.MethodGet, api.URL+"?threadId=external&runId=run", nil)
 		request.Header.Set("Authorization", "Bearer token")

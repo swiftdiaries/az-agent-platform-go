@@ -1,0 +1,56 @@
+[
+  {
+    "name": "travel/lookup destination",
+    "description": "Look up a travel destination: highlights, typical weather and visa notes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "destination": {"type": "string", "description": "City or region name"},
+        "month": {"type": "string", "description": "Optional travel month, 1-12"}
+      },
+      "required": ["destination"]
+    },
+    "annotations": {"readOnlyHint": true},
+    "_meta": {"operation_key": "lookup_destination", "tags": ["travel"]}
+  },
+  {
+    "name": "shifts:lookup",
+    "description": "Return the caller's scheduled shift for a date, including the location.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {"date": {"type": "string", "description": "ISO-8601 date"}},
+      "required": ["date"]
+    },
+    "annotations": {"readOnlyHint": true},
+    "_meta": {"operation_key": "lookup_shift", "tags": ["shifts"]}
+  },
+  {
+    "name": "shifts/request swap",
+    "description": "Ask a colleague to swap a shift with the caller; the colleague must approve.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "date": {"type": "string", "description": "ISO-8601 date of the shift"},
+        "colleague": {"type": "string", "description": "Colleague identifier"},
+        "reason": {"type": "string", "description": "Optional note shown to the colleague"}
+      },
+      "required": ["date", "colleague"]
+    },
+    "_meta": {"operation_key": "request_shift_swap", "tags": ["shifts"]}
+  },
+  {
+    "name": "shifts/cancel swap",
+    "description": "Cancel a pending shift swap request.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {"request_id": {"type": "string"}},
+      "required": ["request_id"]
+    },
+    "_meta": {"operation_key": "cancel_shift_swap", "tags": ["shifts"]}
+  },
+  {
+    "name": "server/ping",
+    "description": "Health check; not part of any journey.",
+    "inputSchema": {"type": "object", "properties": {}}
+  }
+]

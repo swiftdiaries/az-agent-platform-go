@@ -6,10 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,108 +15,18 @@ import (
 	"time"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/service"
 )
 
-type acceptanceReplica struct {
-	app *service.Service
-	url string
-}
-
-func startAcceptanceReplica(t *testing.T, pool *pgxpool.Pool, registry *definitions.Registry, model agentruntime.Model) acceptanceReplica {
+// acceptanceSet compiles the planner bundle whose one tool is operation key
+// travel.lookup (alias travel_lookup). policy is "read_only", "idempotent" or
+// "effectful" (the unclassified default).
+func acceptanceSet(t *testing.T, policy string) *definitions.Set {
 	t.Helper()
-	app, err := service.New(service.Dependencies{
-		Pool: pool, Registry: registry, Authenticator: chat.StaticBearerTokens{"token": "alice"}, Model: model,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- app.Serve(listener) }()
-	t.Cleanup(func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		if err := app.Shutdown(shutdownCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-			t.Error(err)
-		}
-		if err := <-serveErr; err != nil {
-			t.Error(err)
-		}
-		app.Close()
-	})
-	return acceptanceReplica{app: app, url: "http://" + listener.Addr().String()}
-}
-
-func acceptancePost(t *testing.T, endpoint string, input aguitypes.RunAgentInput) *http.Response {
-	t.Helper()
-	body, err := json.Marshal(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer token")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return response
-}
-
-func acceptanceReconnect(t *testing.T, endpoint, thread, run string) *http.Response {
-	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, endpoint+"?threadId="+thread+"&runId="+run, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer token")
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return response
-}
-
-func acceptanceRegistry(t *testing.T, endpoint, policy string) *definitions.Registry {
-	t.Helper()
-	path := writeDefinitionBundle(t, t.TempDir(), "prompt\n")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data = bytes.Replace(data, []byte("http://example"), []byte(endpoint), 1)
-	data = bytes.Replace(data, []byte(`"class":"read_only"`), []byte(`"class":"`+policy+`"`), 1)
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		t.Fatal(err)
-	}
-	registry, err := definitions.Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return registry
-}
-
-func acceptanceThread(t *testing.T, pool *pgxpool.Pool, external string) string {
-	t.Helper()
-	var thread string
-	if err := pool.QueryRow(t.Context(), "SELECT id FROM chat_threads WHERE principal='alice' AND external_id=$1", external).Scan(&thread); err != nil {
-		t.Fatal(err)
-	}
-	return thread
+	return compileSet(t, writeBundleConfig(t, t.TempDir(), "prompt\n", "travel.lookup", policy))
 }
 
 // This is the missing process-level regression: all ingress and reconnects use
@@ -129,7 +37,7 @@ func TestAcceptanceThreeServiceHTTPSteeringReconnectAndForcedDrain(t *testing.T)
 	var releaseTool sync.Once
 	t.Cleanup(func() { releaseTool.Do(func() { close(toolRelease) }) })
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "acceptance", Version: "1"}, nil)
-	mcp.AddTool(mcpServer, &mcp.Tool{Name: "lookup"}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, struct{}, error) {
+	mcp.AddTool(mcpServer, keyedTool("lookup", "travel.lookup"), func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, struct{}, error) {
 		close(toolStarted)
 		select {
 		case <-toolRelease:
@@ -152,19 +60,17 @@ func TestAcceptanceThreeServiceHTTPSteeringReconnectAndForcedDrain(t *testing.T)
 			return agentruntime.ModelResponse{}, ctx.Err()
 		}
 		if len(request.ToolResults) == 0 {
-			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "lookup", Arguments: json.RawMessage(`{}`)}}, nil
+			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "travel_lookup", Arguments: json.RawMessage(`{}`)}}, nil
 		}
 		if len(request.PendingCommands) != 1 || request.PendingCommands[0].Text != "use Osaka instead" {
 			return agentruntime.ModelResponse{}, errors.New("steering was not delivered at the next provider boundary")
 		}
 		return agentruntime.ModelResponse{Text: "corrected Osaka"}, nil
 	})
-	registry := acceptanceRegistry(t, mcpAPI.URL, "read_only")
-	a := startAcceptanceReplica(t, pool, registry, model)
-	b := startAcceptanceReplica(t, pool, registry, model)
-	c := startAcceptanceReplica(t, pool, registry, model)
+	registry := acceptanceSet(t, "read_only")
+	a, b, c := threeReplicas(t, pool, registry, model, testTenancy(t, mcpAPI.URL))
 
-	first := acceptancePost(t, a.url, aguitypes.RunAgentInput{ThreadID: "steer-thread", RunID: "run-a", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan"}}})
+	first := acceptancePost(t, a.url, aguitypes.RunAgentInput{ThreadID: "steer-thread", RunID: "run-a", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "plan"}}, ForwardedProps: map[string]any{"journeyId": "planner"}})
 	defer first.Body.Close()
 	if first.StatusCode != http.StatusOK {
 		t.Fatalf("first admission = %d", first.StatusCode)
@@ -185,7 +91,7 @@ func TestAcceptanceThreeServiceHTTPSteeringReconnectAndForcedDrain(t *testing.T)
 		t.Fatalf("reconnect = %d", reconnect.StatusCode)
 	}
 	thread := acceptanceThread(t, pool, "steer-thread")
-	snapshot, err := journal.New(pool).Snapshot(t.Context(), thread, "alice")
+	snapshot, err := journal.New(pool).Snapshot(t.Context(), thread, testPrincipal)
 	if err != nil || len(snapshot.Runs) != 1 || snapshot.Runs[0].PendingCommands != 1 {
 		t.Fatalf("durable steering receipt = %#v, %v", snapshot, err)
 	}
@@ -253,7 +159,7 @@ func TestAcceptanceThreeServiceHTTPApprovalAndReconnect(t *testing.T) {
 	pool := database(t)
 	var calls atomic.Int32
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "approval", Version: "1"}, nil)
-	mcp.AddTool(mcpServer, &mcp.Tool{Name: "lookup"}, func(_ context.Context, request *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, map[string]any, error) {
+	mcp.AddTool(mcpServer, keyedTool("lookup", "travel.lookup"), func(_ context.Context, request *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, map[string]any, error) {
 		authorization := request.Extra.Header.Get("Authorization")
 		if authorization != "Bearer token" {
 			return nil, nil, errors.New("approval did not use fresh request credentials")
@@ -265,16 +171,14 @@ func TestAcceptanceThreeServiceHTTPApprovalAndReconnect(t *testing.T) {
 	defer mcpAPI.Close()
 	model := modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		if len(request.ToolResults) == 0 {
-			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "lookup", Arguments: json.RawMessage(`{"amount":1}`)}}, nil
+			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "travel_lookup", Arguments: json.RawMessage(`{"amount":1}`)}}, nil
 		}
 		return agentruntime.ModelResponse{Text: "approved and complete"}, nil
 	})
-	registry := acceptanceRegistry(t, mcpAPI.URL, "effectful")
-	a := startAcceptanceReplica(t, pool, registry, model)
-	b := startAcceptanceReplica(t, pool, registry, model)
-	c := startAcceptanceReplica(t, pool, registry, model)
+	registry := acceptanceSet(t, "effectful")
+	a, b, c := threeReplicas(t, pool, registry, model, testTenancy(t, mcpAPI.URL))
 
-	wait := acceptancePost(t, a.url, aguitypes.RunAgentInput{ThreadID: "approval-thread", RunID: "approval-run", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "change"}}})
+	wait := acceptancePost(t, a.url, aguitypes.RunAgentInput{ThreadID: "approval-thread", RunID: "approval-run", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "change"}}, ForwardedProps: map[string]any{"journeyId": "planner"}})
 	defer wait.Body.Close()
 	if wait.StatusCode != http.StatusOK {
 		t.Fatalf("approval request = %d", wait.StatusCode)
@@ -287,7 +191,7 @@ func TestAcceptanceThreeServiceHTTPApprovalAndReconnect(t *testing.T) {
 		t.Fatalf("missing approval request: %s", waitBody)
 	}
 	thread := acceptanceThread(t, pool, "approval-thread")
-	snapshot, err := journal.New(pool).Snapshot(t.Context(), thread, "alice")
+	snapshot, err := journal.New(pool).Snapshot(t.Context(), thread, testPrincipal)
 	if err != nil || len(snapshot.Runs) != 1 || snapshot.Runs[0].Interaction == nil {
 		t.Fatalf("durable approval wait = %#v, %v", snapshot, err)
 	}

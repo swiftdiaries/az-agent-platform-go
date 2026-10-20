@@ -1,3 +1,5 @@
+> **Superseded.** This document is historical. The current design is [docs/design.md](../../../design.md); the migration plan is [docs/migration.md](../../../migration.md).
+
 # Review carry-forward
 
 The earlier review covered an incomplete 40-task draft; it did not approve execution. The user requested the six-deliverable simplification on 2026-09-14. This note retains its substantive checks; removing draft code does not prove the implementation correct.

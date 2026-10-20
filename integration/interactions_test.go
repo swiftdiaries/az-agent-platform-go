@@ -9,9 +9,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/microsoft/agent-framework-go/message"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/tenantdir"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -45,20 +47,33 @@ func awaitState(t *testing.T, p *platform.Platform, thread, run string, state jo
 	t.Fatal("state timeout", state)
 	return platform.Snapshot{}
 }
-func TestHITLQuestionShape(t *testing.T) {
-	call := questionCall("provider")
-	binding, err := journal.ActionBinding(call.Name, call.Arguments)
+
+// testClarification builds a v2-bound clarification for the given conversation state.
+func testClarification(t *testing.T, call *agentruntime.ToolCall, thread, principal, version, set string) journal.Interaction {
+	t.Helper()
+	schema, err := journal.SchemaDigest(json.RawMessage(`{"type":"object"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := journal.NameDigest(call.Name)
+	binding, err := journal.BindCall(journal.CallBinding{OperationKey: call.Name, NameDigest: name, SchemaDigest: schema, Arguments: call.Arguments, ProductVersion: version, Principal: principal, Conversation: thread, DefinitionSet: set})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var args struct {
 		Questions []journal.Question `json:"questions"`
 	}
-	if err = json.Unmarshal(call.Arguments, &args); err != nil {
+	if err := json.Unmarshal(call.Arguments, &args); err != nil {
 		t.Fatal(err)
 	}
-	i := journal.Interaction{ID: "wait", Kind: "clarification", Questions: args.Questions, Call: journal.ProposedCall{CallID: "platform", ProviderCallID: call.CallID, Name: call.Name, Arguments: call.Arguments, Binding: binding}}
-	if err = i.Validate(); err != nil {
+	return journal.Interaction{ID: "interaction", Kind: "clarification", Questions: args.Questions, OperationKey: call.Name, NameDigest: name, SchemaDigest: schema,
+		Call: journal.ProposedCall{CallID: "operation", ProviderCallID: call.CallID, Name: call.Name, Arguments: call.Arguments, Binding: binding}}
+}
+
+func TestHITLQuestionShape(t *testing.T) {
+	call := questionCall("provider")
+	i := testClarification(t, call, "thread", "alice", "v1", strings.Repeat("a", 64))
+	if err := i.Validate(); err != nil {
 		t.Fatal(err)
 	}
 	for _, bad := range []journal.Reply{{}, {Decision: "approve"}, {Answers: map[string]journal.Answer{"choice": {Option: "C"}}}, {Answers: map[string]journal.Answer{"choice": {Option: "A", Custom: "both"}}}} {
@@ -74,7 +89,7 @@ func TestHITLQuestionShape(t *testing.T) {
 func TestHITLDurableWaitReply(t *testing.T) {
 	pool := database(t)
 	store := journal.New(pool)
-	runner := fixtureRunner(t, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	runner := fixtureRunner(t, pool, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		if len(r.ToolResults) == 0 {
 			return agentruntime.ModelResponse{ToolCall: questionCall("question")}, nil
 		}
@@ -82,8 +97,8 @@ func TestHITLDurableWaitReply(t *testing.T) {
 	}))
 	p := platform.New(runner, store)
 	defer p.Close()
-	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "comm", Principal: "alice", Text: "ask"}
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: c}); err != nil {
+	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "comm", Principal: "alice", Tenant: testTenant, Text: "ask", TargetJourney: "vacation-planner"}
+	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	s := awaitState(t, p, c.ThreadID, c.RunID, journal.RunAwaitingInput)
@@ -104,37 +119,37 @@ func TestHITLDurableWaitReply(t *testing.T) {
 	steer := c
 	steer.RunID = "steer"
 	steer.CommunicationID = "steer"
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: steer}); !errors.Is(err, journal.ErrBusy) {
+	if _, err := p.Submit(t.Context(), steer, credential.Credential{}); !errors.Is(err, journal.ErrBusy) {
 		t.Fatal("waiting steering must conflict", err)
 	}
 	p.Close()
 	p2 := platform.New(runner, journal.New(pool))
 	defer p2.Close()
-	reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: wait.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
+	reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", Tenant: testTenant, InteractionID: wait.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
 	bad := reply
 	bad.Principal = "mallory"
-	if _, err := p2.Submit(t.Context(), platform.Submission{Command: bad}); !errors.Is(err, journal.ErrForbidden) {
+	if _, err := p2.Submit(t.Context(), bad, credential.Credential{}); !errors.Is(err, journal.ErrForbidden) {
 		t.Fatal("foreign reply", err)
 	}
 	bad = reply
 	bad.ReplyKind = "approval"
-	if _, err := p2.Submit(t.Context(), platform.Submission{Command: bad}); !errors.Is(err, journal.ErrState) {
+	if _, err := p2.Submit(t.Context(), bad, credential.Credential{}); !errors.Is(err, journal.ErrState) {
 		t.Fatal("wrong kind", err)
 	}
-	if _, err := p2.Submit(t.Context(), platform.Submission{Command: reply}); err != nil {
+	if _, err := p2.Submit(t.Context(), reply, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	completed := awaitState(t, p2, c.ThreadID, reply.RunID, journal.RunCompleted)
 	if completed.Answer != "resumed" {
 		t.Fatal(completed)
 	}
-	if _, err := p2.Submit(t.Context(), platform.Submission{Command: reply}); err != nil {
+	if _, err := p2.Submit(t.Context(), reply, credential.Credential{}); err != nil {
 		t.Fatal("duplicate receipt", err)
 	}
 	bad = reply
 	bad.RunID = "another"
 	bad.CommunicationID = "another"
-	if _, err := p2.Submit(t.Context(), platform.Submission{Command: bad}); !errors.Is(err, journal.ErrConflict) {
+	if _, err := p2.Submit(t.Context(), bad, credential.Credential{}); !errors.Is(err, journal.ErrConflict) {
 		t.Fatal("interaction consumed twice", err)
 	}
 	var n int
@@ -154,13 +169,11 @@ func localWait(t *testing.T, pool *pgxpool.Pool) (*journal.Store, journal.Owner,
 	if _, err := s.Start(t.Context(), o, "journey", strings.Repeat("a", 64)); err != nil {
 		t.Fatal(err)
 	}
-	call := questionCall("call")
-	binding, _ := journal.ActionBinding(call.Name, call.Arguments)
-	var args struct {
-		Questions []journal.Question `json:"questions"`
+	if err := s.RecordRunScope(t.Context(), o, journal.RunScope{ProductVersion: "v1", EndpointID: "endpoint", Settings: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
 	}
-	_ = json.Unmarshal(call.Arguments, &args)
-	i := journal.Interaction{ID: "interaction", Kind: "clarification", Questions: args.Questions, Call: journal.ProposedCall{CallID: "operation", ProviderCallID: "call", Name: call.Name, Arguments: call.Arguments, Binding: binding}}
+	i := testClarification(t, questionCall("call"), "thread", "alice", "v1", strings.Repeat("a", 64))
+	i.ID = "interaction"
 	return s, o, i
 }
 func TestReplyWaitTransactionsAndTTL(t *testing.T) {
@@ -210,7 +223,7 @@ func TestReplyWaitTransactionsAndTTL(t *testing.T) {
 		t.Fatal(state, err)
 	}
 	var history string
-	if err := pool.QueryRow(t.Context(), "SELECT history::text FROM agent_sessions").Scan(&history); err != nil || !strings.Contains(history, "interaction_expired") {
+	if err := pool.QueryRow(t.Context(), "SELECT history::text FROM agent_conversations WHERE id='thread'").Scan(&history); err != nil || !strings.Contains(history, "interaction_expired") {
 		t.Fatal("expired call not closed", err)
 	}
 
@@ -249,7 +262,7 @@ func TestReplyWaitTransactionsAndTTL(t *testing.T) {
 	if err := pool.QueryRow(t.Context(), "SELECT i.state,(SELECT count(*) FROM agent_commands WHERE run_id='reply'),(SELECT count(*) FROM agent_runs WHERE id='reply'),(SELECT count(*) FROM agent_events WHERE kind='interaction.expired') FROM agent_interactions i").Scan(&state, &n, &runs, &events); err != nil || state != "expired" || n != 0 || runs != 0 || events != 1 {
 		t.Fatal(state, n, runs, events, err)
 	}
-	if err := pool.QueryRow(t.Context(), "SELECT history::text FROM agent_sessions").Scan(&history); err != nil || !strings.Contains(history, "interaction_expired") {
+	if err := pool.QueryRow(t.Context(), "SELECT history::text FROM agent_conversations WHERE id='thread'").Scan(&history); err != nil || !strings.Contains(history, "interaction_expired") {
 		t.Fatal("expiry during lock wait did not close history", err)
 	}
 }
@@ -272,11 +285,11 @@ func TestHITLSeparateProcessAfterWaitAndReplyCommit(t *testing.T) {
 			}
 			return
 		}
-		p := platform.New(fixtureRunner(t, modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+		p := platform.New(fixtureRunner(t, pool, modelFunc(func(context.Context, agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 			return agentruntime.ModelResponse{ToolCall: questionCall("process-call")}, nil
 		})), store)
 		defer p.Close()
-		if _, err := p.Submit(t.Context(), platform.Submission{Command: platform.Command{ThreadID: "process", RunID: "wait", CommunicationID: "wait", Principal: "alice", Text: "ask"}}); err != nil {
+		if _, err := p.Submit(t.Context(), platform.Command{ThreadID: "process", RunID: "wait", CommunicationID: "wait", Principal: "alice", Tenant: testTenant, Text: "ask", TargetJourney: "vacation-planner"}, credential.Credential{}); err != nil {
 			t.Fatal(err)
 		}
 		awaitState(t, p, "process", "wait", journal.RunAwaitingInput)
@@ -311,7 +324,7 @@ func TestHITLSeparateProcessAfterWaitAndReplyCommit(t *testing.T) {
 	if err := json.Unmarshal(artifact, &i); err != nil {
 		t.Fatal(err)
 	}
-	reply := journal.Command{ThreadID: "process", RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: i.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"custom":"fresh answer"}}}`}
+	reply := journal.Command{ThreadID: "process", RunID: "reply", CommunicationID: "reply", Principal: "alice", Tenant: testTenant, InteractionID: i.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"custom":"fresh answer"}}}`}
 	child("reply", reply)
 	if _, err := pool.Exec(t.Context(), "UPDATE agent_runs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", reply.RunID); err != nil {
 		t.Fatal(err)
@@ -325,7 +338,7 @@ func TestHITLSeparateProcessAfterWaitAndReplyCommit(t *testing.T) {
 		t.Fatal("reaper destroyed never-started continuation", state, epoch, continuations, commands, err)
 	}
 	var models atomic.Int32
-	p := platform.New(fixtureRunner(t, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	p := platform.New(fixtureRunner(t, pool, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		models.Add(1)
 		if len(r.ToolResults) != 1 || r.ToolResults[0].CallID != "process-call" {
 			t.Errorf("lost correlated result: %+v", r.ToolResults)
@@ -333,8 +346,8 @@ func TestHITLSeparateProcessAfterWaitAndReplyCommit(t *testing.T) {
 		return agentruntime.ModelResponse{Text: "process resumed"}, nil
 	})), journal.New(pool))
 	defer p.Close()
-	c := platform.Command{ThreadID: reply.ThreadID, RunID: reply.RunID, CommunicationID: reply.CommunicationID, Principal: reply.Principal, InteractionID: reply.InteractionID, ReplyKind: reply.ReplyKind, ReplyJSON: reply.ReplyJSON}
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: c}); err != nil {
+	c := platform.Command{ThreadID: reply.ThreadID, RunID: reply.RunID, CommunicationID: reply.CommunicationID, Principal: reply.Principal, Tenant: testTenant, InteractionID: reply.InteractionID, ReplyKind: reply.ReplyKind, ReplyJSON: reply.ReplyJSON}
+	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	awaitState(t, p, "process", "reply", journal.RunCompleted)
@@ -350,7 +363,7 @@ func TestReplyChatProjectionAndOutstandingOrdering(t *testing.T) {
 	pool := database(t)
 	const providerCallID = "provider-only-sentinel"
 	var models atomic.Int32
-	runner := fixtureRunner(t, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	runner := fixtureRunner(t, pool, modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		if models.Add(1) == 1 {
 			return agentruntime.ModelResponse{ToolCalls: []agentruntime.ToolCall{*questionCall(providerCallID), {CallID: "sibling", Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}}, nil
 		}
@@ -382,7 +395,7 @@ func TestReplyChatProjectionAndOutstandingOrdering(t *testing.T) {
 	}))
 	p := platform.New(runner, journal.New(pool))
 	defer p.Close()
-	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, p, pool))
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": testPrincipal}, p, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	first := postJSONAGUI(t, api.URL, `{"threadId":"external-thread","runId":"external-wait","messages":[{"id":"user","role":"user","content":"ask"}],"tools":[],"context":[],"state":{},"forwardedProps":{}}`, "token", "", "")
 	if first.StatusCode != 200 || !strings.Contains(first.Body, "interaction.requested") {
@@ -436,6 +449,7 @@ func TestHITLCompletedToolNotReplayed(t *testing.T) {
 	backend := httptest.NewServer(mock)
 	defer backend.Close()
 	model := modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+		requireAliasOffered(t, r)
 		switch len(r.ToolResults) {
 		case 0:
 			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "completed", Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
@@ -445,37 +459,204 @@ func TestHITLCompletedToolNotReplayed(t *testing.T) {
 			return agentruntime.ModelResponse{Text: "resumed without replay"}, nil
 		}
 	})
-	p := platform.New(policyRunner(t, backend.URL, "read_only", model), journal.New(pool))
-	c := platform.Command{ThreadID: "replay", RunID: "replay", CommunicationID: "replay", Principal: "alice", Text: "go"}
-	if _, err := p.Submit(t.Context(), platform.Submission{Command: c}); err != nil {
+	p := platform.New(policyRunner(t, pool, backend.URL, "read_only", model), journal.New(pool))
+	c := platform.Command{ThreadID: "replay", RunID: "replay", CommunicationID: "replay", Principal: "alice", Tenant: testTenant, Text: "go", TargetJourney: "planner"}
+	if _, err := p.Submit(t.Context(), c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	s := awaitState(t, p, c.ThreadID, c.RunID, journal.RunAwaitingInput)
 	i := s.Runs[0].Interaction
 	p.Close()
-	p2 := platform.New(policyRunner(t, backend.URL, "read_only", model), journal.New(pool))
+	p2 := platform.New(policyRunner(t, pool, backend.URL, "read_only", model), journal.New(pool))
 	defer p2.Close()
-	reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", InteractionID: i.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
-	if _, err := p2.Submit(t.Context(), platform.Submission{Command: reply}); err != nil {
+	reply := platform.Command{ThreadID: c.ThreadID, RunID: "reply", CommunicationID: "reply", Principal: "alice", Tenant: testTenant, InteractionID: i.ID, ReplyKind: "clarification", ReplyJSON: `{"answers":{"choice":{"option":"A"}}}`}
+	if _, err := p2.Submit(t.Context(), reply, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	awaitState(t, p2, c.ThreadID, reply.RunID, journal.RunCompleted)
 	if len(mock.calls()) != 1 {
 		t.Fatal("completed tool replayed", len(mock.calls()))
 	}
+	mock.requireRemoteName(t)
+	requireOperationRows(t, pool, 1)
 }
 
 func TestReplyLosslessActionBinding(t *testing.T) {
-	one, err := journal.ActionBinding("write", []byte(`{"n":9007199254740992,"s":"a"}`))
+	bind := func(arguments string) (string, error) {
+		return journal.BindCall(journal.CallBinding{JourneyID: "j", OperationKey: "write", NameDigest: journal.NameDigest("write"), SchemaDigest: strings.Repeat("s", 8), Arguments: json.RawMessage(arguments), ProductVersion: "v1", Principal: "alice", Conversation: "thread", DefinitionSet: strings.Repeat("a", 64)})
+	}
+	one, err := bind(`{"n":9007199254740992,"s":"a"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	same, err := journal.ActionBinding("write", []byte(`{"s":"a", "n":9007199254740992}`))
+	same, err := bind(`{"s":"a", "n":9007199254740992}`)
 	if err != nil || one != same {
 		t.Fatal("non-deterministic canonical binding")
 	}
-	different, err := journal.ActionBinding("write", []byte(`{"n":9007199254740993,"s":"a"}`))
+	different, err := bind(`{"n":9007199254740993,"s":"a"}`)
 	if err != nil || one == different {
 		t.Fatal("large integer rounded in binding")
 	}
+}
+
+// lookupModel proposes one effectful lookup_destination call, then answers.
+func lookupModel() agentruntime.Model {
+	return modelFunc(func(_ context.Context, r agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+		if len(r.ToolResults) > 0 {
+			return agentruntime.ModelResponse{Text: "done"}, nil
+		}
+		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{CallID: "write", Name: lookupAlias, Arguments: json.RawMessage(`{"city":"A"}`)}}, nil
+	})
+}
+
+func waitForApproval(t *testing.T, runner *agentruntime.Runner, pool *pgxpool.Pool, thread string) *journal.Interaction {
+	t.Helper()
+	p := platform.New(runner, journal.New(pool))
+	defer p.Close()
+	c := platform.Command{ThreadID: thread, RunID: "approval", CommunicationID: "approval", Principal: "alice", Tenant: testTenant, Text: "change", TargetJourney: "planner"}
+	if _, err := p.Submit(t.Context(), c, liveCredential("live-auth")); err != nil {
+		t.Fatal(err)
+	}
+	i := awaitState(t, p, c.ThreadID, c.RunID, journal.RunAwaitingInput).Runs[0].Interaction
+	if i == nil {
+		t.Fatal("missing approval")
+	}
+	return i
+}
+
+func approve(t *testing.T, p *platform.Platform, thread string, i *journal.Interaction, run string) {
+	t.Helper()
+	reply := platform.Command{ThreadID: thread, RunID: run, CommunicationID: run, Principal: "alice", Tenant: testTenant, InteractionID: i.ID, ReplyKind: "approval",
+		ReplyJSON: fmt.Sprintf(`{"decision":"approve","binding":%q}`, i.Call.Binding)}
+	if _, err := p.Submit(t.Context(), reply, liveCredential("fresh-live-auth")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestApprovalSupersededOnDefinitionSetChange(t *testing.T) {
+	pool := database(t)
+	mock := newMockMCP(t)
+	backend := httptest.NewServer(mock)
+	defer backend.Close()
+	xPath := writeBundleConfig(t, t.TempDir(), "prompt X\n", lookupAlias, "")
+	yPath := writeBundleConfig(t, t.TempDir(), "prompt Y\n", lookupAlias, "")
+	setX := compileSet(t, xPath)
+	setY := compileSet(t, yPath)
+	if setX.Digest() == setY.Digest() {
+		t.Fatal("sets must differ")
+	}
+	defs := storedDefinitions(t, pool, setX, setY) // X becomes current
+	runnerX := agentruntime.NewRunner(defs, lookupModel(), testTenancy(t, backend.URL))
+	runnerY := agentruntime.NewRunner(defs, lookupModel(), testTenancy(t, backend.URL))
+	i := waitForApproval(t, runnerX, pool, "rollout")
+	// The configuration rolls to Y. A reply continuation never idle-re-pins (M6), so the
+	// re-pin is forced here by clearing the conversation pin: the continuation then pins
+	// to current Y, and the approval granted under X must be superseded, not dispatched.
+	store := journal.New(pool)
+	if err := store.ActivateDefinition(t.Context(), setX.Digest(), setY.Digest(), servedOnly(setX.Digest(), setY.Digest())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(t.Context(), "UPDATE agent_conversations SET definition_digest=NULL WHERE id='rollout'"); err != nil {
+		t.Fatal(err)
+	}
+	p := platform.New(runnerY, store)
+	defer p.Close()
+	approve(t, p, "rollout", i, "reply")
+	awaitState(t, p, "rollout", "reply", journal.RunAwaitingInput)
+	var marker string
+	if err := pool.QueryRow(t.Context(), "SELECT marker FROM agent_interactions WHERE id=$1", i.ID).Scan(&marker); err != nil || marker != "superseded" {
+		t.Fatalf("marker = %q/%v", marker, err)
+	}
+	var pending, other int
+	if err := pool.QueryRow(t.Context(), "SELECT count(*) FILTER (WHERE state='pending' AND kind='approval' AND marker='requested' AND id<>$1), count(*) FILTER (WHERE state='pending' AND id=$1) FROM agent_interactions", i.ID).Scan(&pending, &other); err != nil || pending != 1 || other != 0 {
+		t.Fatalf("pending approvals = %d/%d (%v)", pending, other, err)
+	}
+	if calls := mock.calls(); len(calls) != 0 {
+		t.Fatalf("superseded approval dispatched: %v", calls)
+	}
+	requireOperationRows(t, pool, 0)
+}
+
+func TestApprovalKeepsPinOnReplyContinuation(t *testing.T) {
+	pool := database(t)
+	mock := newMockMCP(t)
+	backend := httptest.NewServer(mock)
+	defer backend.Close()
+	xPath := writeBundleConfig(t, t.TempDir(), "prompt X\n", lookupAlias, "")
+	yPath := writeBundleConfig(t, t.TempDir(), "prompt Y\n", lookupAlias, "")
+	setX := compileSet(t, xPath)
+	setY := compileSet(t, yPath)
+	if setX.Digest() == setY.Digest() {
+		t.Fatal("sets must differ")
+	}
+	defs := storedDefinitions(t, pool, setX, setY) // X becomes current
+	runnerX := agentruntime.NewRunner(defs, lookupModel(), testTenancy(t, backend.URL))
+	i := waitForApproval(t, runnerX, pool, "rollout")
+	store := journal.New(pool)
+	// The pending approval pins the conversation to X: Y alone cannot be activated.
+	if err := store.ActivateDefinition(t.Context(), setX.Digest(), setY.Digest(), servedOnly(setY.Digest())); !errors.Is(err, journal.ErrDefinition) {
+		t.Fatalf("activation serving only Y = %v, want ErrDefinition", err)
+	}
+	if err := store.ActivateDefinition(t.Context(), setX.Digest(), setY.Digest(), servedOnly(setX.Digest(), setY.Digest())); err != nil {
+		t.Fatal(err)
+	}
+	runnerXY := agentruntime.NewRunner(defs, lookupModel(), testTenancy(t, backend.URL))
+	p := platform.New(runnerXY, store)
+	defer p.Close()
+	approve(t, p, "rollout", i, "reply")
+	awaitState(t, p, "rollout", "reply", journal.RunCompleted)
+	var changed int
+	if err := pool.QueryRow(t.Context(), "SELECT count(*) FROM agent_events WHERE thread_id='rollout' AND kind='definition_changed'").Scan(&changed); err != nil || changed != 0 {
+		t.Fatalf("definition_changed events = %d (%v), want 0", changed, err)
+	}
+	var pin string
+	if err := pool.QueryRow(t.Context(), "SELECT definition_digest FROM agent_conversations WHERE id='rollout'").Scan(&pin); err != nil || pin != setX.Digest() {
+		t.Fatalf("conversation pin = %q (%v), want X %q", pin, err, setX.Digest())
+	}
+	var marker string
+	if err := pool.QueryRow(t.Context(), "SELECT marker FROM agent_interactions WHERE id=$1", i.ID).Scan(&marker); err != nil || marker != "dispatched" {
+		t.Fatalf("marker = %q/%v, want dispatched", marker, err)
+	}
+	if calls := mock.calls(); len(calls) != 1 {
+		t.Fatalf("approved action dispatched %d times: %v", len(calls), calls)
+	}
+	requireOperationRows(t, pool, 1)
+}
+
+func TestApprovalSupersededWhenJourneyUnavailable(t *testing.T) {
+	pool := database(t)
+	mock := newMockMCP(t)
+	backend := httptest.NewServer(mock)
+	defer backend.Close()
+	path := writeBundleConfig(t, t.TempDir(), "prompt\n", lookupAlias, "")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ranged := strings.Replace(string(data), "    skill: skills/planner\n", "    skill: skills/planner\n    product_versions: {min: \"2026.2\", max_exclusive: \"2026.3\"}\n", 1)
+	if ranged == string(data) {
+		t.Fatal("product_versions not written")
+	}
+	if err := os.WriteFile(path, []byte(ranged), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tenancy := testTenancy(t, backend.URL)
+	directory := tenancy.Directory.(*tenantdir.Mutable)
+	directory.Set(testTenant, tenantdir.Entry{ProductVersion: "2026.2", EndpointID: testEndpointID})
+	runner := agentruntime.NewRunner(storedDefinitions(t, pool, compileSet(t, path)), lookupModel(), tenancy)
+	i := waitForApproval(t, runner, pool, "moved")
+	// The tenant moves to a product version that excludes the journey.
+	directory.Set(testTenant, tenantdir.Entry{ProductVersion: "2026.5", EndpointID: testEndpointID})
+	p := platform.New(runner, journal.New(pool))
+	defer p.Close()
+	approve(t, p, "moved", i, "reply")
+	awaitState(t, p, "moved", "reply", journal.RunCompleted)
+	var marker string
+	if err := pool.QueryRow(t.Context(), "SELECT marker FROM agent_interactions WHERE id=$1", i.ID).Scan(&marker); err != nil || marker != "superseded" {
+		t.Fatalf("marker = %q/%v", marker, err)
+	}
+	if calls := mock.calls(); len(calls) != 0 {
+		t.Fatalf("superseded approval dispatched: %v", calls)
+	}
+	requireOperationRows(t, pool, 0)
 }

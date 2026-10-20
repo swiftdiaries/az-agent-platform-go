@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -20,9 +21,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
@@ -195,8 +195,12 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 	started, release := make(chan struct{}), make(chan struct{})
 	server := mcp.NewServer(&mcp.Implementation{Name: "steering", Version: "1"}, nil)
 	var toolCalls atomic.Int64
-	mcp.AddTool(server, &mcp.Tool{Name: "lookup_destination", Description: "read options"}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, struct{}, error) {
+	var wrongRemoteName atomic.Bool
+	mcp.AddTool(server, lookupTool("read options"), func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, struct{}, error) {
 		toolCalls.Add(1)
+		if req.Params.Name != remoteLookup {
+			wrongRemoteName.Store(true)
+		}
 		close(started)
 		select {
 		case <-release:
@@ -214,34 +218,32 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 		mcpHandler.ServeHTTP(w, r)
 	}))
 	defer endpoint.Close()
-	t.Setenv("TEST_JAVA_MCP_ENDPOINT", endpoint.URL)
-	registry, err := definitions.Load(filepath.Join("..", "configs", "journeys.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	registry := compileSet(t, filepath.Join("..", "configs", "journeys.yaml"))
 	var modelCalls atomic.Int64
 	observed := make(chan agentruntime.ModelRequest, 4)
 	model := modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		modelCalls.Add(1)
+		requireAliasOffered(t, request)
 		observed <- request
 		if len(request.ToolResults) == 0 {
 			return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
 		}
 		return agentruntime.ModelResponse{Text: "corrected Kyoto"}, nil
 	})
-	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model)
-	auth := chat.StaticBearerTokens{"token": "alice"}
+	runner := agentruntime.NewRunner(storedDefinitions(t, pool, registry), model, testTenancy(t, endpoint.URL))
+	auth := chat.StaticBearerTokens{"token": testPrincipal}
 	var apis []*httptest.Server
 	for range 3 {
 		service := platform.New(runner, journal.New(pool))
 		t.Cleanup(service.Close)
-		api := httptest.NewServer(chat.NewHandler(auth, service, pool))
+		api := httptest.NewServer(chat.NewHandler(auth, service, pool, []string{"Authorization", "Cookie"}))
 		defer api.Close()
 		apis = append(apis, api)
 	}
 	post := func(replica int, run, text, cookie string) *http.Response {
 		t.Helper()
-		payload, _ := json.Marshal(aguitypes.RunAgentInput{ThreadID: "external-thread", RunID: run, Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: text}}})
+		// The journey is an explicit target: there is no routing.
+		payload, _ := json.Marshal(aguitypes.RunAgentInput{ThreadID: "external-thread", RunID: run, Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: text}}, ForwardedProps: map[string]any{"journeyId": "vacation-planner"}})
 		req, _ := http.NewRequest(http.MethodPost, apis[replica].URL, bytes.NewReader(payload))
 		req.Header.Set("Authorization", "Bearer token")
 		req.Header.Set("Cookie", cookie)
@@ -276,7 +278,7 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT id FROM agent_conversations").Scan(&thread); err != nil {
 		t.Fatal(err)
 	}
-	before, err := journal.New(pool).Snapshot(ctx, thread, "alice")
+	before, err := journal.New(pool).Snapshot(ctx, thread, testPrincipal)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +318,7 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 		}
 	}
 	first, second := <-observed, <-observed
-	if first.Handoff.JourneyID != "vacation-planner" || len(first.PendingCommands) != 1 || len(first.History) == 0 {
+	if !slices.Equal(first.ActiveJourneys, []string{"vacation-planner"}) || len(first.PendingCommands) != 1 || len(first.History) == 0 {
 		t.Fatalf("missing explicit provider input: %+v", first)
 	}
 	if len(second.PendingCommands) != 2 || second.PendingCommands[0].Text != "first correction" || second.PendingCommands[1].Text != "second correction" || len(second.ToolResults) != 1 || !bytes.Contains(second.History, []byte("available Kyoto")) {
@@ -325,7 +327,11 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 	if modelCalls.Load() != 2 || toolCalls.Load() != 1 || wrongCredentials.Load() {
 		t.Fatalf("replay or credential transfer: models %d tools %d credentials %v", modelCalls.Load(), toolCalls.Load(), wrongCredentials.Load())
 	}
-	after, err := journal.New(pool).Snapshot(ctx, thread, "alice")
+	if wrongRemoteName.Load() {
+		t.Fatalf("MCP did not receive remote name %q", remoteLookup)
+	}
+	requireOperationRows(t, pool, 1)
+	after, err := journal.New(pool).Snapshot(ctx, thread, testPrincipal)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +352,7 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 	}
 	freshService := platform.New(runner, journal.New(pool))
 	defer freshService.Close()
-	freshAPI := httptest.NewServer(chat.NewHandler(auth, freshService, pool))
+	freshAPI := httptest.NewServer(chat.NewHandler(auth, freshService, pool, []string{"Authorization", "Cookie"}))
 	defer freshAPI.Close()
 	for _, run := range []string{"run-b", "run-b2"} {
 		data := reconnectChat(t, freshAPI.URL, "external-thread", run, "token")
@@ -356,7 +362,7 @@ func TestSteeringBlockedToolAcrossThreeReplicas(t *testing.T) {
 		t.Fatal("fresh Chat reconnect reexecuted the run")
 	}
 	var durable string
-	if err := pool.QueryRow(ctx, `SELECT jsonb_build_array((SELECT jsonb_agg(c) FROM agent_commands c),(SELECT jsonb_agg(s) FROM agent_sessions s),(SELECT jsonb_agg(r) FROM agent_runs r),(SELECT jsonb_agg(e) FROM agent_events e))::text`).Scan(&durable); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT jsonb_build_array((SELECT jsonb_agg(c) FROM agent_commands c),(SELECT jsonb_agg(to_jsonb(v)) FROM agent_conversations v),(SELECT jsonb_agg(r) FROM agent_runs r),(SELECT jsonb_agg(e) FROM agent_events e))::text`).Scan(&durable); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(durable, "secret") || strings.Contains(durable, "Bearer") {
@@ -371,7 +377,7 @@ func TestSteeringInclusionFailureStopsDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	var calls atomic.Int64
-	runner := fixtureRunner(t, modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	runner := fixtureRunner(t, pool, modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		calls.Add(1)
 		if len(request.PendingCommands) != 1 {
 			return agentruntime.ModelResponse{}, errors.New("missing boundary command")
@@ -380,7 +386,7 @@ func TestSteeringInclusionFailureStopsDispatch(t *testing.T) {
 	}))
 	service := platform.New(runner, journal.New(pool))
 	defer service.Close()
-	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": "alice"}, service, pool))
+	api := httptest.NewServer(chat.NewHandler(chat.StaticBearerTokens{"token": testPrincipal}, service, pool, []string{"Authorization", "Cookie"}))
 	defer api.Close()
 	body := aguitypes.RunAgentInput{ThreadID: "external", RunID: "run", Messages: []aguitypes.Message{{Role: aguitypes.RoleUser, Content: "hello"}}}
 	response := postAGUI(t, api.URL, body, "token", "", "")
@@ -391,7 +397,7 @@ func TestSteeringInclusionFailureStopsDispatch(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT id FROM agent_conversations").Scan(&thread); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := service.Snapshot(ctx, thread, "alice")
+	snapshot, err := service.Snapshot(ctx, thread, testPrincipal)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +428,7 @@ func TestSteeringInclusionFailureStopsDispatch(t *testing.T) {
 		t.Fatalf("failed command retried provider: %+v calls %d", retry, calls.Load())
 	}
 	var history string
-	if err := pool.QueryRow(ctx, "SELECT history::text FROM agent_sessions").Scan(&history); err != nil || history != "[]" {
+	if err := pool.QueryRow(ctx, "SELECT history::text FROM agent_conversations WHERE id = $1", thread).Scan(&history); err != nil || history != "[]" {
 		t.Fatalf("failed request history committed %s: %v", history, err)
 	}
 }
@@ -432,7 +438,7 @@ func TestSteeringFinalDrainUsesLiveOwner(t *testing.T) {
 	pool := database(t)
 	started, release := make(chan struct{}), make(chan struct{})
 	var calls atomic.Int64
-	runner := fixtureRunner(t, modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	runner := fixtureRunner(t, pool, modelFunc(func(_ context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		if calls.Add(1) == 1 {
 			close(started)
 			<-release
@@ -447,8 +453,8 @@ func TestSteeringFinalDrainUsesLiveOwner(t *testing.T) {
 	defer a.Close()
 	b := platform.New(runner, journal.New(pool))
 	defer b.Close()
-	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "initial", Principal: "alice", Text: "initial"}
-	if _, err := a.Submit(ctx, platform.Submission{Command: c}); err != nil {
+	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "initial", Principal: "alice", Tenant: testTenant, Text: "initial", TargetJourney: "vacation-planner"}
+	if _, err := a.Submit(ctx, c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -459,7 +465,7 @@ func TestSteeringFinalDrainUsesLiveOwner(t *testing.T) {
 	c.RunID = "late"
 	c.CommunicationID = "late"
 	c.Text = "late correction"
-	if _, err := b.Submit(ctx, platform.Submission{Command: c}); err != nil {
+	if _, err := b.Submit(ctx, c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	close(release)
@@ -479,8 +485,12 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 	started, release, remoteFinished := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var toolCalls, modelCalls atomic.Int64
 	server := mcp.NewServer(&mcp.Implementation{Name: "ownership-loss", Version: "1"}, nil)
-	mcp.AddTool(server, &mcp.Tool{Name: "lookup_destination", Description: "read lookup"}, func(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, struct{}, error) {
+	var wrongRemoteName atomic.Bool
+	mcp.AddTool(server, lookupTool("read lookup"), func(_ context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, struct{}, error) {
 		toolCalls.Add(1)
+		if req.Params.Name != remoteLookup {
+			wrongRemoteName.Store(true)
+		}
 		close(started)
 		<-release // A remote server may finish even after local HTTP cancellation.
 		close(remoteFinished)
@@ -488,18 +498,15 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 	})
 	endpoint := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
 	defer endpoint.Close()
-	t.Setenv("TEST_JAVA_MCP_ENDPOINT", endpoint.URL)
-	registry, err := definitions.Load(filepath.Join("..", "configs", "journeys.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	registry := compileSet(t, filepath.Join("..", "configs", "journeys.yaml"))
 	contexts := make(chan context.Context, 1)
-	model := modelFunc(func(ctx context.Context, _ agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+	model := modelFunc(func(ctx context.Context, request agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 		modelCalls.Add(1)
+		requireAliasOffered(t, request)
 		contexts <- ctx
 		return agentruntime.ModelResponse{ToolCall: &agentruntime.ToolCall{Name: "lookup_destination", Arguments: json.RawMessage(`{}`)}}, nil
 	})
-	runner := agentruntime.NewRunner(registry, platformmcp.NewClient(), model)
+	runner := agentruntime.NewRunner(storedDefinitions(t, pool, registry), model, testTenancy(t, endpoint.URL))
 	a := platform.New(runner, journal.New(pool))
 	defer a.Close()
 	b := platform.New(runner, journal.New(pool))
@@ -511,8 +518,8 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 			close(release)
 		}
 	}()
-	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "initial", Principal: "alice", Text: "initial"}
-	if _, err := a.Submit(ctx, platform.Submission{Command: c}); err != nil {
+	c := platform.Command{ThreadID: "thread", RunID: "run", CommunicationID: "initial", Principal: "alice", Tenant: testTenant, Text: "initial", TargetJourney: "vacation-planner"}
+	if _, err := a.Submit(ctx, c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -524,7 +531,7 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 	c.RunID = "pending"
 	c.CommunicationID = "pending"
 	c.Text = "pending correction"
-	if _, err := b.Submit(ctx, platform.Submission{Command: c}); err != nil {
+	if _, err := b.Submit(ctx, c, credential.Credential{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `CREATE FUNCTION reject_renewal() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'database owner renewal unavailable'; END $$; CREATE TRIGGER reject_renewal BEFORE UPDATE OF lease_until ON agent_runs FOR EACH ROW EXECUTE FUNCTION reject_renewal()`); err != nil {
@@ -568,6 +575,10 @@ func TestOwnershipRenewalFailureCancelsLocalTool(t *testing.T) {
 	}
 	assertCommandOutcome(t, snapshot, "initial", "included", "")
 	assertCommandOutcome(t, snapshot, "pending", "interrupted", "interrupted")
+	if wrongRemoteName.Load() {
+		t.Fatalf("MCP did not receive remote name %q", remoteLookup)
+	}
+	requireOperationRows(t, pool, 1)
 	for _, event := range snapshot.Events {
 		if event.Type == "tool.completed" || event.Type == "message.completed" {
 			t.Fatalf("late result committed: %+v", event)
@@ -734,20 +745,20 @@ func TestSteeringTerminalCommandCorrelationAcrossReplicas(t *testing.T) {
 			pool := database(t)
 			started, release := make(chan struct{}), make(chan struct{})
 			var calls atomic.Int64
-			runner := fixtureRunner(t, modelFunc(func(_ context.Context, _ agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
+			runner := fixtureRunner(t, pool, modelFunc(func(_ context.Context, _ agentruntime.ModelRequest) (agentruntime.ModelResponse, error) {
 				calls.Add(1)
 				close(started)
 				<-release
 				return agentruntime.ModelResponse{}, errors.New("model failed")
 			}))
-			auth := chat.StaticBearerTokens{"token": "alice", "other": "bob"}
+			auth := chat.StaticBearerTokens{"token": testPrincipal, "other": "tenant-a/bob"}
 			owner := platform.New(runner, journal.New(pool))
 			defer owner.Close()
 			peer := platform.New(runner, journal.New(pool))
 			defer peer.Close()
-			a := httptest.NewServer(chat.NewHandler(auth, owner, pool))
+			a := httptest.NewServer(chat.NewHandler(auth, owner, pool, []string{"Authorization", "Cookie"}))
 			defer a.Close()
-			b := httptest.NewServer(chat.NewHandler(auth, peer, pool))
+			b := httptest.NewServer(chat.NewHandler(auth, peer, pool, []string{"Authorization", "Cookie"}))
 			defer b.Close()
 			defer func() {
 				select {
@@ -784,7 +795,7 @@ func TestSteeringTerminalCommandCorrelationAcrossReplicas(t *testing.T) {
 			if err := pool.QueryRow(ctx, "SELECT id FROM agent_conversations").Scan(&thread); err != nil {
 				t.Fatal(err)
 			}
-			snapshot, err := journal.New(pool).Snapshot(ctx, thread, "alice")
+			snapshot, err := journal.New(pool).Snapshot(ctx, thread, testPrincipal)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -810,7 +821,7 @@ func TestSteeringTerminalCommandCorrelationAcrossReplicas(t *testing.T) {
 			// New Platform and Chat instances restore only durable identities and outcomes.
 			fresh := platform.New(runner, journal.New(pool))
 			defer fresh.Close()
-			c := httptest.NewServer(chat.NewHandler(auth, fresh, pool))
+			c := httptest.NewServer(chat.NewHandler(auth, fresh, pool, []string{"Authorization", "Cookie"}))
 			defer c.Close()
 			for _, run := range []string{"correction-one", "correction-two"} {
 				data := reconnectChat(t, c.URL, "external-thread", run, "token")

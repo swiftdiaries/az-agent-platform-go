@@ -17,14 +17,21 @@ func (s *Store) Snapshot(ctx context.Context, thread, principal string) (Snapsho
 			}
 			return err
 		}
-		rows, err := tx.Query(ctx, "SELECT id,state,COALESCE(journey_id,''),answer,ARRAY(SELECT run_id FROM agent_commands c WHERE c.thread_id=r.thread_id AND c.execution_run_id=r.id ORDER BY ordinal),(SELECT count(*) FROM agent_commands c WHERE c.thread_id=r.thread_id AND c.execution_run_id=r.id AND NOT included AND terminal_reason=''),(SELECT jsonb_agg(jsonb_build_object('CommunicationID',c.communication_id,'State',CASE WHEN c.included THEN 'included' WHEN c.terminal_reason='' THEN 'pending' WHEN c.terminal_reason='interrupted' THEN 'interrupted' WHEN c.terminal_reason='consumed' THEN 'consumed' ELSE 'rejected' END,'Reason',c.terminal_reason) ORDER BY c.ordinal) FROM agent_commands c WHERE c.thread_id=r.thread_id AND c.execution_run_id=r.id) FROM agent_runs r WHERE thread_id=$1", thread)
+		var activeRaw []byte
+		if err := tx.QueryRow(ctx, "SELECT active_journeys FROM agent_conversations WHERE id=$1", thread).Scan(&activeRaw); err != nil {
+			return err
+		}
+		if err := json.Unmarshal(activeRaw, &snapshot.ActiveJourneys); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, "SELECT id,state,COALESCE(journey_id,''),answer,COALESCE(product_version,''),COALESCE(endpoint_id,''),settings,server_info,COALESCE(catalog_digest,''),COALESCE((SELECT e.reason FROM agent_events e WHERE e.thread_id=r.thread_id AND e.run_id=r.id AND e.kind IN ('run.failed','run.limit_exceeded') ORDER BY e.sequence DESC LIMIT 1),''),(SELECT e.detail FROM agent_events e WHERE e.thread_id=r.thread_id AND e.run_id=r.id AND e.kind IN ('run.failed','run.limit_exceeded') ORDER BY e.sequence DESC LIMIT 1),ARRAY(SELECT run_id FROM agent_commands c WHERE c.thread_id=r.thread_id AND c.execution_run_id=r.id ORDER BY ordinal),(SELECT count(*) FROM agent_commands c WHERE c.thread_id=r.thread_id AND c.execution_run_id=r.id AND NOT included AND terminal_reason=''),(SELECT jsonb_agg(jsonb_build_object('CommunicationID',c.communication_id,'State',CASE WHEN c.included THEN 'included' WHEN c.terminal_reason='' THEN 'pending' WHEN c.terminal_reason='interrupted' THEN 'interrupted' WHEN c.terminal_reason='consumed' THEN 'consumed' WHEN c.terminal_reason IN ('failed','auth_required','dependency_unavailable','limit_exceeded') THEN 'rejected' ELSE 'rejected' END,'Reason',c.terminal_reason) ORDER BY c.ordinal) FROM agent_commands c WHERE c.thread_id=r.thread_id AND c.execution_run_id=r.id) FROM agent_runs r WHERE thread_id=$1", thread)
 		if err != nil {
 			return err
 		}
 		for rows.Next() {
 			var run Run
 			var outcomes []byte
-			if err := rows.Scan(&run.RunID, &run.State, &run.JourneyID, &run.Answer, &run.CommandRunIDs, &run.PendingCommands, &outcomes); err != nil {
+			if err := rows.Scan(&run.RunID, &run.State, &run.JourneyID, &run.Answer, &run.ProductVersion, &run.EndpointID, &run.Settings, &run.ServerInfo, &run.CatalogDigest, &run.TerminalReason, &run.TerminalDetail, &run.CommandRunIDs, &run.PendingCommands, &outcomes); err != nil {
 				rows.Close()
 				return err
 			}
@@ -38,7 +45,7 @@ func (s *Store) Snapshot(ctx context.Context, thread, principal string) (Snapsho
 		if err := rows.Err(); err != nil {
 			return err
 		}
-		rows, err = tx.Query(ctx, "SELECT run_id,call_id,name,outcome FROM agent_operations WHERE thread_id=$1 ORDER BY call_id", thread)
+		rows, err = tx.Query(ctx, "SELECT run_id,call_id,alias,outcome FROM agent_operations WHERE thread_id=$1 ORDER BY call_id", thread)
 		if err != nil {
 			return err
 		}
@@ -109,7 +116,7 @@ type querier interface {
 }
 
 func readEvents(ctx context.Context, q querier, thread string, after int64) ([]Event, error) {
-	rows, err := q.Query(ctx, "SELECT sequence,kind,run_id,call_id,tool_name,answer,communication_id,reason FROM agent_events WHERE thread_id=$1 AND sequence>$2 ORDER BY sequence", thread, after)
+	rows, err := q.Query(ctx, "SELECT sequence,kind,run_id,call_id,tool_name,answer,communication_id,reason,detail FROM agent_events WHERE thread_id=$1 AND sequence>$2 ORDER BY sequence", thread, after)
 	if err != nil {
 		return nil, err
 	}
@@ -117,8 +124,12 @@ func readEvents(ctx context.Context, q querier, thread string, after int64) ([]E
 	result := []Event{}
 	for rows.Next() {
 		var e Event
-		if err = rows.Scan(&e.Sequence, &e.Type, &e.RunID, &e.CallID, &e.ToolName, &e.Answer, &e.CommunicationID, &e.Reason); err != nil {
+		var detail []byte
+		if err = rows.Scan(&e.Sequence, &e.Type, &e.RunID, &e.CallID, &e.ToolName, &e.Answer, &e.CommunicationID, &e.Reason, &detail); err != nil {
 			return nil, err
+		}
+		if detail != nil {
+			e.Detail = detail
 		}
 		result = append(result, e)
 	}

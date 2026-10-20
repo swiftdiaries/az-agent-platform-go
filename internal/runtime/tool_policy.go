@@ -3,14 +3,15 @@ package runtime
 import (
 	"context"
 	"errors"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	"time"
+
+	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
 )
 
 // Two dispatches share a deadline, exact intent, and platform call ID. No provider
 // retries are performed here: Model.Complete is a complete, buffered turn boundary.
-func guardedCall(ctx context.Context, in RunInput, bound *platformmcp.Bound, op journal.Operation, approval string) (any, error) {
+func guardedCall(ctx context.Context, in RunInput, binding toolCatalog, op journal.Operation, approval string) (any, error) {
 	ownerContext := ctx
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -18,12 +19,12 @@ func guardedCall(ctx context.Context, in RunInput, bound *platformmcp.Bound, op 
 		if err := in.Store.BeginAttempt(ctx, in.Owner, op, attempt, approval); err != nil {
 			return nil, err
 		}
-		result, err := bound.Call(ctx, op.CallID, op.Name, []byte(op.Arguments))
+		result, err := binding.Call(ctx, op.CallID, op.Name, []byte(op.Arguments))
 		outcome := "completed"
 		switch {
-		case errors.Is(err, platformmcp.ErrAuthRequired):
+		case errors.Is(err, catalog.ErrAuthRequired):
 			outcome = "auth_required"
-		case errors.Is(err, platformmcp.ErrBusinessRejected):
+		case errors.Is(err, catalog.ErrBusinessRejected), errors.Is(err, catalog.ErrNotPermitted):
 			outcome = "rejected"
 		case err != nil:
 			outcome = "outcome_unknown"
@@ -37,9 +38,14 @@ func guardedCall(ctx context.Context, in RunInput, bound *platformmcp.Bound, op 
 		if outcome == "auth_required" {
 			return nil, err
 		}
-		// A business rejection is definite; repeat unchanged once before offering one
-		// argument repair. Transport uncertainty requires reviewed replay safety.
-		safe := outcome == "rejected" || op.Policy == "read_only" || op.Policy == "deduplicated"
+		// A 403 is definite and permanent for this call: repeating or repairing cannot help.
+		if errors.Is(err, catalog.ErrNotPermitted) {
+			return map[string]any{"error": "not_permitted"}, nil
+		}
+		// An approved effectful call is never re-sent, even after a business rejection.
+		// read_only and idempotent calls repeat unchanged once, after a rejection or
+		// transport uncertainty alike, before offering one argument repair.
+		safe := op.Policy == "read_only" || op.Policy == "idempotent"
 		if !safe || attempt == 2 {
 			if outcome == "outcome_unknown" {
 				return nil, journal.ErrOutcomeUnknown

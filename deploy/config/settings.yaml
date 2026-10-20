@@ -1,0 +1,9 @@
+# Settings (strict YAML; AGENT_PLATFORM_SETTINGS). Layers: default, then
+# tenants, then users (a user layer may only narrow limits).
+default:
+  max_active_journeys: 2
+  # Wait cap for clarifications and approvals; 1m to 7d. A user value only narrows.
+  interaction_ttl: 5m
+  cost:
+    # Opaque profile name interpreted by the cost enforcer; "" means none.
+    profile: ""

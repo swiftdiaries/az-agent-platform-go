@@ -1,3 +1,5 @@
+> **Superseded.** This document is historical. The current design is [docs/design.md](../../design.md); the migration plan is [docs/migration.md](../../migration.md).
+
 # Hub-and-Spoke Agent Platform: Work Ledger
 
 Status: design approved; qualified MAF durability spike reproduced and independently reviewed; six-deliverable implementation plan prepared

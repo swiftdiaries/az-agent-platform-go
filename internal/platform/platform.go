@@ -8,17 +8,19 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"log/slog"
-	"net/http"
 	"sync"
 	"time"
 
+	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/credential"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
 var (
 	ErrConflict  = journal.ErrConflict
+	ErrExpired   = journal.ErrExpired
 	ErrForbidden = journal.ErrForbidden
 	ErrBusy      = journal.ErrBusy
 	ErrDraining  = errors.New("platform is draining")
@@ -34,20 +36,19 @@ const (
 	RunCompleted     = journal.RunCompleted
 	RunFailed        = journal.RunFailed
 	RunAuthRequired  = journal.RunAuthRequired
+
+	RunDependencyUnavailable = journal.RunDependencyUnavailable
+	RunLimitExceeded         = journal.RunLimitExceeded
 )
 
 type Command struct {
-	ThreadID, RunID, CommunicationID, Principal, Text, TargetJourney, InteractionID, ReplyKind, ReplyJSON string
+	ThreadID, RunID, CommunicationID, Principal, Tenant, Text, TargetJourney, InteractionID, ReplyKind, ReplyJSON string
 }
 
 func (c Command) durable() journal.Command {
-	return journal.Command{ThreadID: c.ThreadID, RunID: c.RunID, CommunicationID: c.CommunicationID, Principal: c.Principal, Text: c.Text, TargetJourney: c.TargetJourney, InteractionID: c.InteractionID, ReplyKind: c.ReplyKind, ReplyJSON: c.ReplyJSON}
+	return journal.Command{ThreadID: c.ThreadID, RunID: c.RunID, CommunicationID: c.CommunicationID, Principal: c.Principal, Tenant: c.Tenant, Text: c.Text, TargetJourney: c.TargetJourney, InteractionID: c.InteractionID, ReplyKind: c.ReplyKind, ReplyJSON: c.ReplyJSON}
 }
 
-type Submission struct {
-	Command Command
-	Headers http.Header
-}
 type Receipt = journal.Receipt
 type Event = journal.Event
 type Snapshot = journal.Snapshot
@@ -133,8 +134,7 @@ func (p *Platform) Ready(ctx context.Context) (bool, error) {
 	}
 	return p.runner.Ready(ctx, p.store)
 }
-func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, error) {
-	c := submission.Command
+func (p *Platform) Submit(ctx context.Context, c Command, cred credential.Credential) (Receipt, error) {
 	ctx, span := otel.Tracer("az-agent-platform/platform").Start(ctx, "agent.start_turn")
 	span.SetAttributes(attribute.String("thread.id", c.ThreadID), attribute.String("run.id", c.RunID), attribute.String("communication.id", c.CommunicationID))
 	defer span.End()
@@ -190,7 +190,6 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 		if err != nil {
 			return Receipt{}, err
 		}
-		headers := submission.Headers.Clone()
 		transferred = true
 		go func() {
 			defer p.runs.Done()
@@ -200,7 +199,7 @@ func (p *Platform) Submit(ctx context.Context, submission Submission) (Receipt, 
 			defer cancel()
 			stop := context.AfterFunc(p.ctx, cancel)
 			defer stop()
-			p.execute(runCtx, owner, c, agentruntime.RunInput{ThreadID: c.ThreadID, RunID: c.RunID, Principal: c.Principal, Text: c.Text, TargetJourney: target, Headers: headers})
+			p.execute(runCtx, owner, c, agentruntime.RunInput{ThreadID: c.ThreadID, RunID: c.RunID, Principal: c.Principal, Tenant: c.Tenant, Text: c.Text, TargetJourney: target, Credential: cred})
 		}()
 	}
 	return receipt, nil
@@ -232,11 +231,24 @@ func (p *Platform) execute(ctx context.Context, owner journal.Owner, c Command, 
 	}()
 	in.Store = p.store
 	in.Owner = owner
-	journey, digest, err := p.runner.Binding(ctx, in)
+	var scope agentruntime.RunScope
+	scope, err = p.runner.Scope(ctx, in)
+	var journey, digest string
 	if err == nil {
-		in.History, err = p.store.Start(ctx, owner, journey, digest)
+		// Resolved once per run; the ErrPending follow-up loop reuses it.
+		in.ProductVersion, in.Endpoint, in.Settings = scope.Entry.ProductVersion, scope.Endpoint, scope.Settings
+		// Binding is DB-only and validates the client-supplied target against the
+		// pinned set, so attribution below never carries a raw journeyId.
+		journey, digest, err = p.runner.Binding(ctx, in)
+	}
+	if err == nil {
 		in.TargetJourney = journey
 		in.DefinitionDigest = digest
+		// Admitted once per run; a denial sends nothing to MCP or the model.
+		in.Attribution, in.Access, err = p.runner.Admit(ctx, in)
+	}
+	if err == nil {
+		in.History, err = p.store.Start(ctx, owner, journey, digest)
 	}
 	for {
 		var output agentruntime.RunOutput
@@ -249,14 +261,30 @@ func (p *Platform) execute(ctx context.Context, owner journal.Owner, c Command, 
 		if ctx.Err() != nil || errors.Is(err, journal.ErrOwnership) {
 			return
 		}
+		var limit *cost.LimitError
+		if errors.As(err, &limit) {
+			finishErr := p.store.FinishLimitExceeded(ctx, owner, output.History, string(limit.Kind), limit.RetryAfter)
+			if finishErr != nil {
+				slog.ErrorContext(ctx, "run completion commit failed", "run.id", c.RunID)
+			}
+			return
+		}
 		state := RunCompleted
 		if err != nil {
 			state = RunFailed
-			if errors.Is(err, platformmcp.ErrAuthRequired) {
+			switch {
+			case errors.Is(err, agentruntime.ErrDependencyUnavailable):
+				state = RunDependencyUnavailable
+			case errors.Is(err, catalog.ErrAuthRequired):
 				state = RunAuthRequired
 			}
 		}
-		finishErr := p.store.Finish(ctx, owner, state, output.History, output.Answer, output.CallID, output.ToolName)
+		var finishErr error
+		if reason := failureReason(err); state == RunFailed && reason != "" {
+			finishErr = p.store.FinishFailed(ctx, owner, output.History, reason)
+		} else {
+			finishErr = p.store.Finish(ctx, owner, state, output.History, output.Answer, output.CallID, output.ToolName)
+		}
 		if errors.Is(finishErr, journal.ErrPending) {
 			// Admission won the final-drain race. Continue with this live owner's
 			// credentials and in-memory history; no other replica can claim this run.
@@ -327,4 +355,16 @@ func (p *Platform) Observe(ctx context.Context, thread, principal string, cursor
 		}
 	}()
 	return observation, nil
+}
+
+func failureReason(err error) string {
+	switch {
+	case errors.Is(err, agentruntime.ErrActivationRefused):
+		return journal.ReasonActivationRefused
+	case errors.Is(err, agentruntime.ErrPolicyConflict):
+		return journal.ReasonPolicyConflict
+	case errors.Is(err, agentruntime.ErrJourneyUnavailable):
+		return journal.ReasonJourneyUnavailable
+	}
+	return ""
 }

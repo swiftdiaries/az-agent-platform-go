@@ -10,6 +10,9 @@ import (
 func (s *Store) Start(ctx context.Context, o Owner, journey, digest string) (json.RawMessage, error) {
 	c := o.Command
 	var history json.RawMessage
+	if len(digest) != 64 {
+		return nil, ErrDefinition
+	}
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		// ponytail: one definition-rollout lock; split per journey only if startup contention matters.
 		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(789134628)"); err != nil {
@@ -25,31 +28,39 @@ func (s *Store) Start(ctx context.Context, o Owner, journey, digest string) (jso
 		if unresolved {
 			return ErrOutcomeUnknown
 		}
-		var existing string
-		err := tx.QueryRow(ctx, "SELECT definition_digest FROM agent_sessions WHERE thread_id=$1 AND journey_id=$2", c.ThreadID, journey).Scan(&existing)
-		if err == pgx.ErrNoRows {
+		var pin *string
+		if err := tx.QueryRow(ctx, "SELECT definition_digest FROM agent_conversations WHERE id=$1", c.ThreadID).Scan(&pin); err != nil {
+			return err
+		}
+		if pin == nil {
+			// An unpinned conversation (new, or migrated) pins to current; current is
+			// bootstrapped to digest when absent.
 			var current string
-			err := tx.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current WHERE journey_id=$1", journey).Scan(&current)
+			err := tx.QueryRow(ctx, "SELECT definition_digest FROM agent_definition_current").Scan(&current)
 			if err == pgx.ErrNoRows {
-				_, err = tx.Exec(ctx, "INSERT INTO agent_definition_current(journey_id,definition_digest) VALUES($1,$2)", journey, digest)
+				if _, err = tx.Exec(ctx, "INSERT INTO agent_definition_current(definition_digest) VALUES($1)", digest); err != nil {
+					return err
+				}
+				current = digest
+			} else if err != nil {
+				return err
 			}
-			if err != nil || current != "" && current != digest {
+			if current != digest {
 				return ErrDefinition
 			}
-		} else if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, "INSERT INTO agent_sessions(thread_id,journey_id,definition_digest) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", c.ThreadID, journey, digest); err != nil {
-			return err
-		}
-		var pinned string
-		if err := tx.QueryRow(ctx, "SELECT definition_digest,history FROM agent_sessions WHERE thread_id=$1 AND journey_id=$2", c.ThreadID, journey).Scan(&pinned, &history); err != nil {
-			return err
-		}
-		if pinned != digest {
+			if _, err = tx.Exec(ctx, "UPDATE agent_conversations SET definition_digest=$2 WHERE id=$1", c.ThreadID, digest); err != nil {
+				return err
+			}
+		} else if *pin != digest {
 			return ErrDefinition
 		}
-		result, err := tx.Exec(ctx, "UPDATE agent_runs SET journey_id=$3,definition_digest=$4 WHERE thread_id=$1 AND id=$2 AND (journey_id IS NULL OR journey_id=$3 AND definition_digest=$4)", c.ThreadID, c.RunID, journey, digest)
+		if err := tx.QueryRow(ctx, "SELECT history FROM agent_conversations WHERE id=$1", c.ThreadID).Scan(&history); err != nil {
+			return err
+		}
+		// A reply continuation run copies the interaction's journey and digest; the
+		// digest of a pre-000009 interaction is an old per-journey digest, so overwrite it.
+		// An empty journey (no explicit target) pins the definition and leaves journey_id as is.
+		result, err := tx.Exec(ctx, "UPDATE agent_runs SET journey_id=COALESCE(NULLIF($3,''),journey_id),definition_digest=$4 WHERE thread_id=$1 AND id=$2 AND ($3='' OR journey_id IS NULL OR journey_id=$3)", c.ThreadID, c.RunID, journey, digest)
 		if err != nil {
 			return err
 		}
@@ -64,16 +75,35 @@ func (s *Store) Start(ctx context.Context, o Owner, journey, digest string) (jso
 // Finish atomically stores provider history and terminal lifecycle events. External
 // calls never occur in this transaction. Admission shares this conversation lock.
 func (s *Store) Finish(ctx context.Context, o Owner, state RunState, history json.RawMessage, answer, callID, tool string) error {
-	c := o.Command
-	if state != RunCompleted && state != RunFailed && state != RunAuthRequired {
+	if state != RunCompleted && state != RunFailed && state != RunAuthRequired && state != RunDependencyUnavailable {
 		return ErrState
 	}
+	return s.finish(ctx, o, state, history, answer, callID, tool, nil)
+}
+
+// FinishFailed finishes a run as failed with a typed client-caused reason
+// (journey_unavailable, policy_conflict or activation_refused) recorded on the
+// terminal run.failed event. Everything else matches Finish(RunFailed):
+// operations are marked unknown and pending commands are disposed failed.
+func (s *Store) FinishFailed(ctx context.Context, o Owner, history json.RawMessage, reason string) error {
+	switch reason {
+	case ReasonJourneyUnavailable, ReasonPolicyConflict, ReasonActivationRefused:
+	default:
+		return ErrState
+	}
+	return s.finish(ctx, o, RunFailed, history, "", "", "", &Event{Type: "run.failed", Reason: reason})
+}
+
+// finish is the shared terminal transaction; terminal, when set, replaces the
+// run's default terminal event.
+func (s *Store) finish(ctx context.Context, o Owner, state RunState, history json.RawMessage, answer, callID, tool string, terminal *Event) error {
+	c := o.Command
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := lockOwner(ctx, tx, o); err != nil {
 			return err
 		}
-		var journey string
-		if err := tx.QueryRow(ctx, "SELECT COALESCE(journey_id,'') FROM agent_runs WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID).Scan(&journey); err != nil {
+		var pinned bool
+		if err := tx.QueryRow(ctx, "SELECT definition_digest IS NOT NULL FROM agent_runs WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID).Scan(&pinned); err != nil {
 			return err
 		}
 		if state == RunCompleted {
@@ -93,8 +123,8 @@ func (s *Store) Finish(ctx context.Context, o Owner, state RunState, history jso
 				return err
 			}
 		}
-		if len(history) > 0 {
-			if _, err := tx.Exec(ctx, "UPDATE agent_sessions SET history=$3 WHERE thread_id=$1 AND journey_id=$2", c.ThreadID, journey, history); err != nil {
+		if len(history) > 0 && pinned {
+			if _, err := tx.Exec(ctx, "UPDATE agent_conversations SET history=$2 WHERE id=$1", c.ThreadID, history); err != nil {
 				return err
 			}
 		}
@@ -115,6 +145,11 @@ func (s *Store) Finish(ctx context.Context, o Owner, state RunState, history jso
 		if state == RunAuthRequired {
 			kind = "auth_required"
 		}
-		return appendEvent(ctx, tx, c.ThreadID, Event{RunID: c.RunID, Type: kind})
+		e := Event{RunID: c.RunID, Type: kind}
+		if terminal != nil {
+			e = *terminal
+			e.RunID = c.RunID
+		}
+		return appendEvent(ctx, tx, c.ThreadID, e)
 	})
 }

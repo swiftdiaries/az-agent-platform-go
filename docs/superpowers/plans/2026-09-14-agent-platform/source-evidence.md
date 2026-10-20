@@ -1,3 +1,5 @@
+> **Superseded.** This document is historical. The current design is [docs/design.md](../../../design.md); the migration plan is [docs/migration.md](../../../migration.md).
+
 # Portable dependency and API evidence
 
 All implementation sessions use this note; none depends on the source repository or `/private/tmp` spike checkout.

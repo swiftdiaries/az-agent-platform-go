@@ -10,18 +10,39 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/chat"
-	"github.com/swiftdiaries/az-agent-platform-go/internal/definitions"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/defstore"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/journal"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/platform"
 	agentruntime "github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/settings"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/tenantdir"
 )
 
 type Dependencies struct {
 	Pool          *pgxpool.Pool
-	Registry      *definitions.Registry
 	Authenticator chat.Authenticator
 	Model         agentruntime.Model
+	// CredentialHeaders names the inbound request headers (configured through
+	// AGENT_PLATFORM_CREDENTIAL_HEADERS) that Chat copies into a run's
+	// Credential. Empty means no credential is forwarded.
+	CredentialHeaders []string
+	// Directory maps a tenant to a product version and MCP endpoint ID
+	// (AGENT_PLATFORM_TENANT_DIRECTORY). Required.
+	Directory tenantdir.Directory
+	// Endpoints is the deploy-time allowlist from endpoint ID to MCP URL
+	// (AGENT_PLATFORM_MCP_ENDPOINTS); it is the only source of MCP URLs. An
+	// empty allowlist makes every run dependency_unavailable.
+	Endpoints tenantdir.Allowlist
+	// Settings resolves per-tenant and per-user settings
+	// (AGENT_PLATFORM_SETTINGS). Required.
+	Settings settings.Source
+	// CostGate is the cost enforcement and attribution seam
+	// (AGENT_PLATFORM_COST_GATE). Nil admits everything and decorates nothing.
+	CostGate cost.Gate
+	// HistoryBudget is the estimated tokens of history per provider request for the
+	// configured model (AGENT_PLATFORM_HISTORY_BUDGET).
+	HistoryBudget int
 }
 
 type Service struct {
@@ -33,11 +54,12 @@ type Service struct {
 }
 
 func New(deps Dependencies) (*Service, error) {
-	if deps.Pool == nil || deps.Registry == nil || deps.Authenticator == nil || deps.Model == nil {
+	if deps.Pool == nil || deps.Authenticator == nil || deps.Model == nil || deps.Directory == nil || deps.Settings == nil {
 		return nil, errors.New("service dependencies are required")
 	}
-	runner := agentruntime.NewRunner(deps.Registry, platformmcp.NewClient(), deps.Model)
-	service := &Service{platform: platform.New(runner, journal.New(deps.Pool))}
+	store := journal.New(deps.Pool)
+	runner := agentruntime.NewRunner(defstore.NewLoader(store), deps.Model, agentruntime.Tenancy{Directory: deps.Directory, Endpoints: deps.Endpoints, Settings: deps.Settings, Cost: deps.CostGate, HistoryBudget: deps.HistoryBudget})
+	service := &Service{platform: platform.New(runner, store)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
@@ -48,7 +70,7 @@ func New(deps Dependencies) (*Service, error) {
 		}
 		w.WriteHeader(http.StatusOK)
 	})
-	mux.Handle("/", chat.NewHandler(deps.Authenticator, service.platform, deps.Pool))
+	mux.Handle("/", chat.NewHandler(deps.Authenticator, service.platform, deps.Pool, deps.CredentialHeaders))
 	service.handler = mux
 	return service, nil
 }

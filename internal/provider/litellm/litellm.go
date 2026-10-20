@@ -6,16 +6,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/microsoft/agent-framework-go/message"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/responses"
-	platformmcp "github.com/swiftdiaries/az-agent-platform-go/internal/mcp"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/catalog"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/cost"
 	"github.com/swiftdiaries/az-agent-platform-go/internal/runtime"
 )
 
@@ -96,7 +99,7 @@ func (a *Adapter) Complete(ctx context.Context, request runtime.ModelRequest) (r
 	}
 	clientCopy := *client
 	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	dispatch := &dispatchTransport{base: client.Transport, onDispatch: request.OnDispatch}
+	dispatch := &dispatchTransport{base: client.Transport, onDispatch: request.OnDispatch, access: request.Access}
 	clientCopy.Transport = dispatch
 	sdk := openai.NewClient(
 		option.WithBaseURL(a.config.BaseURL), option.WithAPIKey(a.config.APIKey),
@@ -112,7 +115,12 @@ func (a *Adapter) Complete(ctx context.Context, request runtime.ModelRequest) (r
 	if response == nil || response.Status != responses.ResponseStatusCompleted {
 		return runtime.ModelResponse{}, errors.New("LiteLLM model request failed")
 	}
-	result := runtime.ModelResponse{Text: response.OutputText()}
+	result := runtime.ModelResponse{Text: response.OutputText(), Usage: cost.Tokens{
+		Model:  string(response.Model),
+		Input:  response.Usage.InputTokens,
+		Output: response.Usage.OutputTokens,
+		Cached: response.Usage.InputTokensDetails.CachedTokens,
+	}}
 	for _, item := range response.Output {
 		if item.Type == "function_call" {
 			call := item.AsFunctionCall()
@@ -195,15 +203,42 @@ func sanitize(err error) error {
 		return err
 	}
 	var apiErr *openai.Error
-	if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden) {
-		return fmt.Errorf("LiteLLM authentication failed: %w", platformmcp.ErrAuthRequired)
+	if errors.As(err, &apiErr) {
+		if limit, ok := limitError(apiErr); ok {
+			return limit
+		}
+	}
+	if apiErr != nil && (apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden) {
+		return fmt.Errorf("LiteLLM authentication failed: %w", catalog.ErrAuthRequired)
 	}
 	return errors.New("LiteLLM model request failed")
+}
+
+// limitError hands 429 and 400 responses to the shared classifier, which
+// decides whether they are enforcement rejections. It reads only the
+// status, the Retry-After headers and the body's error code, and never copies
+// header or body text into the returned error.
+func limitError(apiErr *openai.Error) (*cost.LimitError, bool) {
+	if apiErr.StatusCode != http.StatusTooManyRequests && apiErr.StatusCode != http.StatusBadRequest {
+		return nil, false
+	}
+	body := []byte(apiErr.RawJSON())
+	var header http.Header
+	if apiErr.Response != nil {
+		header = apiErr.Response.Header
+		if apiErr.Response.Body != nil {
+			if data, err := io.ReadAll(io.LimitReader(apiErr.Response.Body, 1<<16)); err == nil && len(data) > 0 {
+				body = data
+			}
+		}
+	}
+	return cost.ClassifyLimit(apiErr.StatusCode, header, body, time.Now())
 }
 
 type dispatchTransport struct {
 	base       http.RoundTripper
 	onDispatch func(context.Context) error
+	access     cost.Access
 	once       sync.Once
 	err        error
 }
@@ -215,6 +250,9 @@ func (t *dispatchTransport) RoundTrip(request *http.Request) (*http.Response, er
 			return nil, t.err
 		}
 	}
+	// Clone so the caller's request is not mutated; Access decorates the last hop.
+	request = request.Clone(request.Context())
+	t.access.Apply(request)
 	if t.base != nil {
 		return t.base.RoundTrip(request)
 	}

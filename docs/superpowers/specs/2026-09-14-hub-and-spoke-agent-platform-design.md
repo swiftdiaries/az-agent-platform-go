@@ -1,3 +1,5 @@
+> **Superseded.** This document is historical. The current design is [docs/design.md](../../design.md); the migration plan is [docs/migration.md](../../migration.md).
+
 # Hub-and-Spoke Agent Platform Design
 
 Status: **approved design; Q1-Q13 recorded; qualified MAF HITL/retry spike reproduced; implementation plan reduced to six deliverables**

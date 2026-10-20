@@ -3,18 +3,20 @@ package journal
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/jackc/pgx/v5"
 	"github.com/microsoft/agent-framework-go/message"
+	"github.com/swiftdiaries/az-agent-platform-go/internal/settings"
 	"io"
 	"strings"
 	"time"
 )
 
-const InteractionTTL = 24 * time.Hour
+// ErrSuperseded reports that a decided approval no longer matches the call it was given for;
+// the approval is marked superseded and nothing was dispatched.
+var ErrSuperseded = errors.New("approval superseded")
 
 type Option struct {
 	Label       string `json:"label"`
@@ -39,6 +41,13 @@ type Interaction struct {
 	Questions []Question   `json:"questions,omitempty"`
 	Call      ProposedCall `json:"call"`
 	ExpiresAt time.Time    `json:"expiresAt"`
+	// JourneyID is the journey that owns the interaction ("" for the run's journey, or none).
+	// It is stored in its own column and never appears in the artifact.
+	JourneyID string `json:"-"`
+	// OperationKey, NameDigest and SchemaDigest are the binding v2 inputs; own columns, never in the artifact.
+	OperationKey string `json:"-"`
+	NameDigest   string `json:"-"`
+	SchemaDigest string `json:"-"`
 }
 type Answer struct {
 	Option string `json:"option,omitempty"`
@@ -54,6 +63,8 @@ type Continuation struct {
 	Checkpoint  json.RawMessage
 	History     json.RawMessage
 	Reply       Reply
+	// Marker is the approval marker ("" for a clarification).
+	Marker string
 }
 
 func DecodeStrict(data []byte, value any) error {
@@ -69,25 +80,11 @@ func DecodeStrict(data []byte, value any) error {
 	return nil
 }
 
-// JSON numbers remain json.Number, avoiding float64 rounding in exact action binding.
-func ActionBinding(name string, arguments json.RawMessage) (string, error) {
-	var value map[string]any
-	if err := DecodeStrict(arguments, &value); err != nil || value == nil {
-		return "", ErrState
-	}
-	data, err := json.Marshal(value)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(append([]byte(name+"\x00"), data...))
-	return hex.EncodeToString(sum[:]), nil
-}
 func (i Interaction) Validate() error {
 	if i.ID == "" || i.Call.CallID == "" || i.Call.ProviderCallID == "" || i.Call.Name == "" {
 		return ErrState
 	}
-	binding, err := ActionBinding(i.Call.Name, i.Call.Arguments)
-	if err != nil || binding != i.Call.Binding {
+	if i.Call.Binding == "" {
 		return ErrState
 	}
 	if i.Kind == "approval" {
@@ -167,17 +164,42 @@ func (s *Store) Wait(ctx context.Context, o Owner, i Interaction, checkpoint, hi
 		if pending {
 			return ErrPending
 		}
-		if err := tx.QueryRow(ctx, "SELECT clock_timestamp()+$1*interval '1 millisecond'", InteractionTTL.Milliseconds()).Scan(&i.ExpiresAt); err != nil {
+		if i.Kind == "approval" && (i.JourneyID == "" || i.OperationKey == "") {
+			return ErrState
+		}
+		var productVersion, definitionDigest *string
+		var principal string
+		var active, recorded []byte
+		if err := tx.QueryRow(ctx, "SELECT r.product_version,r.definition_digest,c.principal,c.active_journeys,r.settings FROM agent_runs r JOIN agent_conversations c ON c.id=r.thread_id WHERE r.thread_id=$1 AND r.id=$2", c.ThreadID, c.RunID).Scan(&productVersion, &definitionDigest, &principal, &active, &recorded); err != nil {
+			return err
+		}
+		if productVersion == nil || definitionDigest == nil {
+			return ErrState
+		}
+		ttl, err := recordedInteractionTTL(recorded)
+		if err != nil {
+			return err
+		}
+		expected, err := BindCall(CallBinding{JourneyID: i.JourneyID, OperationKey: i.OperationKey, NameDigest: i.NameDigest, SchemaDigest: i.SchemaDigest,
+			Arguments: i.Call.Arguments, ProductVersion: *productVersion, Principal: principal, Conversation: c.ThreadID, DefinitionSet: *definitionDigest})
+		if err != nil || expected != i.Call.Binding {
+			return ErrState
+		}
+		if err := tx.QueryRow(ctx, "SELECT clock_timestamp()+$1*interval '1 millisecond'", ttl.Milliseconds()).Scan(&i.ExpiresAt); err != nil {
 			return err
 		}
 		artifact, err := json.Marshal(i)
 		if err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, "INSERT INTO agent_interactions(id,thread_id,run_id,journey_id,definition_digest,kind,artifact,checkpoint,history,expires_at) SELECT $3,thread_id,id,journey_id,definition_digest,$4,$5,$6,$7,$8 FROM agent_runs WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID, i.ID, i.Kind, artifact, checkpoint, history, i.ExpiresAt); err != nil {
+		var marker any
+		if i.Kind == "approval" {
+			marker = "requested"
+		}
+		if _, err = tx.Exec(ctx, "INSERT INTO agent_interactions(id,thread_id,run_id,journey_id,definition_digest,kind,artifact,checkpoint,history,expires_at,marker,operation_key,name_digest,schema_digest,product_version,catalog_digest,active_journeys) SELECT $3,thread_id,id,COALESCE(NULLIF($9,''),journey_id),definition_digest,$4,$5,$6,$7,$8,$10,$11,$12,$13,product_version,catalog_digest,$14 FROM agent_runs WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID, i.ID, i.Kind, artifact, checkpoint, history, i.ExpiresAt, i.JourneyID, marker, i.OperationKey, i.NameDigest, i.SchemaDigest, active); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, "UPDATE agent_sessions s SET history=$3 FROM agent_runs r WHERE r.thread_id=$1 AND r.id=$2 AND s.thread_id=r.thread_id AND s.journey_id=r.journey_id", c.ThreadID, c.RunID, history); err != nil {
+		if _, err = tx.Exec(ctx, "UPDATE agent_conversations SET history=$2 WHERE id=$1", c.ThreadID, history); err != nil {
 			return err
 		}
 		if _, err = tx.Exec(ctx, "UPDATE agent_runs SET state='awaiting_input',owner_id='',lease_until=clock_timestamp() WHERE thread_id=$1 AND id=$2", c.ThreadID, c.RunID); err != nil {
@@ -186,8 +208,26 @@ func (s *Store) Wait(ctx context.Context, o Owner, i Interaction, checkpoint, hi
 		return appendEvent(ctx, tx, c.ThreadID, Event{RunID: c.RunID, Type: "run.awaiting_input", CallID: i.Call.CallID})
 	})
 }
+
+// recordedInteractionTTL reads the wait cap from the settings recorded on the run; runs recorded
+// before the setting existed (or with no value) get the built-in default.
+func recordedInteractionTTL(recorded []byte) (time.Duration, error) {
+	if len(recorded) == 0 {
+		return settings.DefaultInteractionTTL, nil
+	}
+	var r struct {
+		InteractionTTL time.Duration `json:"interaction_ttl"`
+	}
+	if err := json.Unmarshal(recorded, &r); err != nil {
+		return 0, ErrState
+	}
+	if r.InteractionTTL <= 0 {
+		return settings.DefaultInteractionTTL, nil
+	}
+	return r.InteractionTTL, nil
+}
 func expireInteractions(ctx context.Context, tx pgx.Tx, thread string) error {
-	rows, err := tx.Query(ctx, "UPDATE agent_interactions SET state='expired' WHERE thread_id=$1 AND state='pending' AND expires_at<=clock_timestamp() RETURNING run_id", thread)
+	rows, err := tx.Query(ctx, "UPDATE agent_interactions SET state='expired',marker=CASE WHEN kind='approval' THEN 'denied' END WHERE thread_id=$1 AND state='pending' AND expires_at<=clock_timestamp() RETURNING run_id", thread)
 	if err != nil {
 		return err
 	}
@@ -206,8 +246,7 @@ func expireInteractions(ctx context.Context, tx pgx.Tx, thread string) error {
 	}
 	for _, run := range runs {
 		var artifact, history []byte
-		var journey string
-		if err := tx.QueryRow(ctx, "SELECT artifact,history,journey_id FROM agent_interactions WHERE thread_id=$1 AND run_id=$2 AND state='expired'", thread, run).Scan(&artifact, &history, &journey); err != nil {
+		if err := tx.QueryRow(ctx, "SELECT artifact,history FROM agent_interactions WHERE thread_id=$1 AND run_id=$2 AND state='expired'", thread, run).Scan(&artifact, &history); err != nil {
 			return err
 		}
 		var i Interaction
@@ -220,7 +259,7 @@ func expireInteractions(ctx context.Context, tx pgx.Tx, thread string) error {
 		if err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, "UPDATE agent_sessions SET history=$3 WHERE thread_id=$1 AND journey_id=$2", thread, journey, closed); err != nil {
+		if _, err = tx.Exec(ctx, "UPDATE agent_conversations SET history=$2 WHERE id=$1", thread, closed); err != nil {
 			return err
 		}
 
@@ -228,6 +267,9 @@ func expireInteractions(ctx context.Context, tx pgx.Tx, thread string) error {
 			return err
 		}
 		if err := appendEvent(ctx, tx, thread, Event{RunID: run, Type: "interaction.expired"}); err != nil {
+			return err
+		}
+		if err := appendEvent(ctx, tx, thread, Event{RunID: run, Type: "run.failed", Reason: ReasonInteractionExpired}); err != nil {
 			return err
 		}
 	}
@@ -266,7 +308,7 @@ func (s *Store) reply(ctx context.Context, c Command) (Receipt, bool, error) {
 		var artifact []byte
 		var state, journey, oldRun string
 		var valid bool
-		err = tx.QueryRow(ctx, "SELECT artifact,state,journey_id,run_id FROM agent_interactions WHERE thread_id=$1 AND id=$2 FOR UPDATE", c.ThreadID, c.InteractionID).Scan(&artifact, &state, &journey, &oldRun)
+		err = tx.QueryRow(ctx, "SELECT artifact,state,COALESCE(journey_id,''),run_id FROM agent_interactions WHERE thread_id=$1 AND id=$2 FOR UPDATE", c.ThreadID, c.InteractionID).Scan(&artifact, &state, &journey, &oldRun)
 		if err == pgx.ErrNoRows {
 			return ErrState
 		}
@@ -280,6 +322,9 @@ func (s *Store) reply(ctx context.Context, c Command) (Receipt, bool, error) {
 			expired = true
 			return expireInteractions(ctx, tx, c.ThreadID)
 		}
+		if state == "expired" {
+			return ErrExpired
+		}
 		if !valid || state != "pending" {
 			return ErrConflict
 		}
@@ -287,7 +332,7 @@ func (s *Store) reply(ctx context.Context, c Command) (Receipt, bool, error) {
 		if err = json.Unmarshal(artifact, &i); err != nil {
 			return err
 		}
-		if i.Kind != c.ReplyKind || (c.TargetJourney != "" && c.TargetJourney != journey) {
+		if i.Kind != c.ReplyKind || (c.TargetJourney != "" && journey != "" && c.TargetJourney != journey) {
 			return ErrState
 		}
 		if err = i.ValidateReply(answer); err != nil {
@@ -303,7 +348,14 @@ func (s *Store) reply(ctx context.Context, c Command) (Receipt, bool, error) {
 		if _, err = tx.Exec(ctx, "INSERT INTO agent_runs(id,thread_id,state,journey_id,definition_digest) SELECT $3,thread_id,'pending',journey_id,definition_digest FROM agent_interactions WHERE thread_id=$1 AND id=$2", c.ThreadID, c.InteractionID, c.RunID); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, "UPDATE agent_interactions SET state='consumed',continuation_run_id=$3,reply=$4 WHERE thread_id=$1 AND id=$2", c.ThreadID, c.InteractionID, c.RunID, []byte(c.ReplyJSON)); err != nil {
+		var marker any
+		if i.Kind == "approval" {
+			marker = "denied"
+			if answer.Decision == "approve" {
+				marker = "decided"
+			}
+		}
+		if _, err = tx.Exec(ctx, "UPDATE agent_interactions SET state='consumed',continuation_run_id=$3,reply=$4,marker=$5 WHERE thread_id=$1 AND id=$2", c.ThreadID, c.InteractionID, c.RunID, []byte(c.ReplyJSON), marker); err != nil {
 			return err
 		}
 		if _, err = tx.Exec(ctx, "UPDATE agent_runs SET state='completed' WHERE thread_id=$1 AND id=$2 AND state='awaiting_input'", c.ThreadID, oldRun); err != nil {
@@ -327,7 +379,7 @@ func (s *Store) reply(ctx context.Context, c Command) (Receipt, bool, error) {
 		return nil
 	})
 	if err == nil && expired {
-		err = ErrConflict
+		err = ErrExpired
 	}
 	return receipt, fresh, err
 }
@@ -341,11 +393,13 @@ func (s *Store) Continuation(ctx context.Context, o Owner) (*Continuation, error
 		if err := lockOwner(ctx, tx, o); err != nil {
 			return err
 		}
-		return tx.QueryRow(ctx, "SELECT artifact,checkpoint,history,reply FROM agent_interactions WHERE thread_id=$1 AND id=$2 AND continuation_run_id=$3 AND state='consumed'", o.Command.ThreadID, o.Command.InteractionID, o.Command.RunID).Scan(&artifact, &result.Checkpoint, &result.History, &reply)
+		return tx.QueryRow(ctx, "SELECT artifact,checkpoint,history,reply,COALESCE(journey_id,''),COALESCE(operation_key,''),COALESCE(name_digest,''),COALESCE(schema_digest,''),COALESCE(marker,'') FROM agent_interactions WHERE thread_id=$1 AND id=$2 AND continuation_run_id=$3 AND state='consumed'", o.Command.ThreadID, o.Command.InteractionID, o.Command.RunID).Scan(&artifact, &result.Checkpoint, &result.History, &reply,
+			&result.Interaction.JourneyID, &result.Interaction.OperationKey, &result.Interaction.NameDigest, &result.Interaction.SchemaDigest, &result.Marker)
 	})
 	if err != nil {
 		return nil, err
 	}
+	// the artifact never carries the column-backed fields, so unmarshalling leaves them intact
 	if err = json.Unmarshal(artifact, &result.Interaction); err != nil {
 		return nil, err
 	}
@@ -368,4 +422,36 @@ func (s *Store) Interaction(ctx context.Context, thread, principal, run string) 
 		return nil, fmt.Errorf("interaction: %w", err)
 	}
 	return &i, nil
+}
+
+// Supersede marks an approval consumed by this run with marker 'decided' as superseded and appends
+// interaction.superseded. Fenced. Already superseded -> nil; any other marker -> ErrState.
+func (s *Store) Supersede(ctx context.Context, o Owner, interactionID string) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockOwner(ctx, tx, o); err != nil {
+			return err
+		}
+		return supersede(ctx, tx, o.Command.ThreadID, o.Command.RunID, interactionID)
+	})
+}
+
+func supersede(ctx context.Context, tx pgx.Tx, thread, run, interactionID string) error {
+	var marker, callID string
+	err := tx.QueryRow(ctx, "SELECT marker,COALESCE(artifact->'call'->>'callId','') FROM agent_interactions WHERE id=$1 AND thread_id=$2 AND continuation_run_id=$3 AND kind='approval' AND state='consumed' FOR UPDATE", interactionID, thread, run).Scan(&marker, &callID)
+	if err == pgx.ErrNoRows {
+		return ErrState
+	}
+	if err != nil {
+		return err
+	}
+	if marker == "superseded" {
+		return nil
+	}
+	if marker != "decided" {
+		return ErrState
+	}
+	if _, err = tx.Exec(ctx, "UPDATE agent_interactions SET marker='superseded' WHERE id=$1 AND thread_id=$2", interactionID, thread); err != nil {
+		return err
+	}
+	return appendEvent(ctx, tx, thread, Event{RunID: run, Type: "interaction.superseded", CallID: callID})
 }
